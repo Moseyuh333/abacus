@@ -399,6 +399,7 @@ impl SubagentRuntime {
     ) -> Result<String> {
         let (worker_provider, worker_tokens) = self.provider.with_detached_counter();
         let board_id = self.hive.board.begin(name, "resumed", worker_tokens.clone());
+        self.hive.board.describe(board_id, worker_provider.model(), &message);
         let injections = self.hive.workers.open(name);
         let task = SubagentTask {
             name: name.to_owned(),
@@ -437,6 +438,7 @@ impl SubagentRuntime {
         }
         let role_label = resolve_role(&self.harness, &task).label;
         let board_id = self.hive.board.begin(&name, &role_label, worker_tokens.clone());
+        self.hive.board.describe(board_id, worker_provider.model(), &task.prompt);
         // Register before starting so a message addressed to this worker mid-run
         // reaches the turn that is about to begin.
         let worker_injections = self.hive.workers.open(&name);
@@ -459,6 +461,10 @@ impl SubagentRuntime {
                 // this worker and have it continue where it left off.
                 self.hive.workers.close(&name, transcript);
                 let (structured, error) = match coerced {
+                    // The orchestrator should not read a cut-short answer as a finished one.
+                    _ if self.hive.board.was_stopped(board_id) => {
+                        (None, Some("stopped by the user before it finished".to_owned()))
+                    }
                     Ok(value) => (value, None),
                     Err(error) => (None, Some(format!("result did not match the schema: {error:#}"))),
                 };
@@ -545,6 +551,8 @@ impl SubagentRuntime {
                 allow_mutations: Arc::new(AtomicBool::new(!role.read_only)),
                 web_search: self.web_search.clone(),
                 injections,
+                // The board's stop button reaches the worker through this.
+                cancel: self.hive.board.cancel_flag(board_id),
                 // Everything else stays inert. No trace: subagent work is a
                 // different task shape and would blur the samples. No
                 // papercuts: a worker's snags belong to its delegated task,
@@ -578,15 +586,9 @@ impl SubagentRuntime {
         Ok((response, patch, transcript))
     }
 
-    /// Mirror a worker's visible activity onto the live board.
+    /// Mirror a worker's visible activity and transcript onto the live board.
     fn note_activity(&self, board_id: u64, event: &AgentEvent) {
-        match event {
-            AgentEvent::ToolStarted { name, summary } => {
-                self.hive.board.activity(board_id, &format!("{name} {summary}"));
-            }
-            AgentEvent::Delta(text) => self.hive.board.activity(board_id, text),
-            _ => {}
-        }
+        self.hive.board.record(board_id, event);
     }
 }
 

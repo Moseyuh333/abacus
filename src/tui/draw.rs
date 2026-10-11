@@ -358,6 +358,7 @@ fn worker_mark(worker: &crate::hive::WorkerStatus, animated: bool) -> (&'static 
         }
         crate::hive::WorkerState::Done => (set.ok, success(), "done"),
         crate::hive::WorkerState::Failed => (set.failed, danger(), "failed"),
+        crate::hive::WorkerState::Stopped => (set.failed, muted(), "stopped"),
     }
 }
 

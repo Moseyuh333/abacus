@@ -530,6 +530,7 @@ async fn app_server_completes_commands_and_files_and_expands_what_the_person_typ
 
     let initialize = &replies[&1]["result"]["capabilities"];
     assert_eq!((initialize["commands"].clone(), initialize["fileSearch"].clone()), (true.into(), true.into()));
+    assert_eq!(initialize["tasks"], true);
     let commands = replies[&2]["result"]["commands"].as_array().unwrap();
     let named = |name: &str| commands.iter().find(|command| command["name"] == name).cloned();
     assert_eq!(named("review").unwrap()["kind"], "skill");

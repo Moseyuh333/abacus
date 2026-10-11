@@ -71,7 +71,7 @@ const COMMAND_TOOLS: &[&str] = &["run_command"];
 const FILE_CHANGE_TOOLS: &[&str] =
     &["edit_file", "write_file", "apply_patch", "delete_file", "move_file", "append_file", "create_directory"];
 
-fn item_type(tool: &str) -> &'static str {
+pub(crate) fn item_type(tool: &str) -> &'static str {
     if COMMAND_TOOLS.contains(&tool) {
         "commandExecution"
     } else if FILE_CHANGE_TOOLS.contains(&tool) {
@@ -179,6 +179,10 @@ struct App {
     usage: Option<UsageReporter>,
     /// Sync problems already told to the front end.
     sync_warned: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// One hive for the process, as the TUI keeps one: background workers
+    /// outlive the turn that spawned them, and the next turn (and the front
+    /// end) must still see them.
+    hive: crate::hive::HiveHandle,
 }
 
 /// Run the server until stdin closes.
@@ -196,6 +200,7 @@ pub async fn run(
     let mode = config.mode.unwrap_or(AgentMode::Auto);
     let credentials = crate::config::Credentials::load(&config.paths).unwrap_or_default();
     let usage = UsageReporter::new(&config.paths, &credentials, "app-server");
+    let hive = crate::hive::HiveHandle::load(config.paths.hive_file.clone());
     let mut app = App {
         thread: ThreadState::new(&config, session),
         config,
@@ -214,9 +219,11 @@ pub async fn run(
         counter: 0,
         usage,
         sync_warned: Arc::default(),
+        hive,
     };
     app.thread_opened();
     let usage_task = app.usage.as_ref().map(UsageReporter::spawn_periodic);
+    let tasks_task = watch_tasks(app.hive.board.clone());
     if crate::sync::is_configured(&credentials) {
         // Pull what changed on other devices and upload what an earlier exit
         // left behind, without holding up the first request. The open thread
@@ -301,6 +308,7 @@ pub async fn run(
     if let Some(task) = usage_task {
         task.abort();
     }
+    tasks_task.abort();
     app.close().await;
     Ok(())
 }
@@ -380,6 +388,9 @@ impl App {
                     "fileInput": true,
                     "fileSearch": true,
                     "commands": true,
+                    // Background workers: tasks/list, task/read, task/stop,
+                    // tasks/clear, and tasks/updated as they change.
+                    "tasks": true,
                     "compact": true,
                 },
                 "thread": self.thread_snapshot(),
@@ -484,6 +495,23 @@ impl App {
                     |command| json!({"name": command.name, "description": command.description, "kind": "plugin"}),
                 ));
                 Ok(json!({"commands": commands}))
+            }
+            "tasks/list" => Ok(json!({"tasks": task_summaries(&self.hive.board)})),
+            "task/read" => {
+                let id = params["id"].as_u64().ok_or_else(|| anyhow!("task id required"))?;
+                let task = self.hive.board.all().into_iter().find(|worker| worker.id == id);
+                let (Some(task), Some(items)) = (task, self.hive.board.transcript(id)) else {
+                    return Err(anyhow!("no task {id}"));
+                };
+                Ok(json!({"task": task_summary(&task), "items": items}))
+            }
+            "task/stop" => {
+                let id = params["id"].as_u64().ok_or_else(|| anyhow!("task id required"))?;
+                Ok(json!({"stopping": self.hive.board.stop(id)}))
+            }
+            "tasks/clear" => {
+                self.hive.board.clear_finished();
+                Ok(json!({"tasks": task_summaries(&self.hive.board)}))
             }
             "files/search" => {
                 let query = params["query"].as_str().unwrap_or_default();
@@ -769,6 +797,7 @@ impl App {
             session_id: Some(self.thread_id()),
             trace: self.thread.trace.clone(),
             cancel: self.cancel.clone(),
+            hive: self.hive.clone(),
             ..self.thread.state.turn(&self.config, self.services.clone()).with_workspace_stores(&self.config)
         };
         tokio::spawn(run_turn(self.provider.clone(), self.thread.messages.clone(), options, events.clone()));
@@ -1164,6 +1193,52 @@ fn parse_numstat(line: &str) -> Option<Value> {
         "removed": count(removed),
         "binary": added == "-",
     }))
+}
+
+/// A background worker as a client lists it.
+fn task_summary(worker: &crate::hive::WorkerStatus) -> Value {
+    json!({
+        "id": worker.id,
+        "name": worker.name,
+        "role": worker.role,
+        "model": worker.model,
+        "prompt": crate::text::clip(&worker.prompt, 400, "…"),
+        "state": worker.state.label(),
+        "activity": worker.activity,
+        "tool": worker.tool,
+        "toolUses": worker.tool_uses,
+        "tokens": worker.tokens_used(),
+        "startedAt": worker.started_at.to_rfc3339(),
+        "finishedAt": worker.finished_at.map(|at| at.to_rfc3339()),
+    })
+}
+
+fn task_summaries(board: &crate::hive::SubagentBoard) -> Vec<Value> {
+    board.all().iter().map(task_summary).collect()
+}
+
+/// Tell the front end when background workers change: state, activity, and
+/// (while any run) their token counts. Twice a second at most, and silent
+/// while nothing moves.
+fn watch_tasks(board: crate::hive::SubagentBoard) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last = (board.version(), 0_u64);
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            tick.tick().await;
+            let workers = board.all();
+            let running_tokens = workers
+                .iter()
+                .filter(|worker| worker.state == crate::hive::WorkerState::Running)
+                .map(crate::hive::WorkerStatus::tokens_used)
+                .sum::<u64>();
+            let now = (board.version(), running_tokens);
+            if now != last {
+                last = now;
+                notify("tasks/updated", json!({"tasks": workers.iter().map(task_summary).collect::<Vec<_>>()}));
+            }
+        }
+    })
 }
 
 /// What a leading slash in a prompt turned out to be.

@@ -11,12 +11,15 @@
 //! validation and coordination. The tier guidance is injected as a context
 //! layer, so confidence is earned from recorded outcomes, not assumed.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 /// Individual worker lines shown when a swarm is at most this large;
 /// bigger swarms cluster into a single summary line.
@@ -42,6 +45,19 @@ pub enum WorkerState {
     Running,
     Done,
     Failed,
+    /// Stopped by the person before it finished.
+    Stopped,
+}
+
+impl WorkerState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -57,8 +73,21 @@ pub struct WorkerStatus {
     /// its streamed answer — clipped to one line.
     pub activity: String,
     pub started: Instant,
+    /// Wall-clock start and end, for a front end that shows elapsed time.
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
     /// Live token ledger for this worker's own provider clone.
     pub tokens: Arc<crate::provider::TokenLedger>,
+    /// The model the worker runs on, and what it was asked to do.
+    pub model: String,
+    pub prompt: String,
+    /// The tool running right now, if the worker is in a tool call.
+    pub tool: Option<String>,
+    pub tool_uses: u32,
+    /// Raised to stop the worker; its turn winds down at the next check.
+    pub cancel: Arc<AtomicBool>,
+    /// What the worker has said and done so far, readable while it runs.
+    pub log: Arc<Mutex<WorkerLog>>,
 }
 
 impl WorkerStatus {
@@ -67,9 +96,14 @@ impl WorkerStatus {
     }
 }
 
+/// Finished workers kept after their batch is replaced, for a front end that
+/// lists past work. The TUI strip only ever shows the current batch.
+const HISTORY: usize = 50;
+
 #[derive(Default)]
 struct BoardInner {
     workers: Vec<WorkerStatus>,
+    history: VecDeque<WorkerStatus>,
     next_id: u64,
     /// Bumped on every visible mutation so the UI can redraw the strip when
     /// workers move even though no turn is running (nothing else marks the
@@ -89,7 +123,11 @@ impl SubagentBoard {
     pub fn begin(&self, name: &str, role: &str, tokens: Arc<crate::provider::TokenLedger>) -> u64 {
         let mut inner = self.inner.write().expect("board lock");
         if inner.workers.iter().all(|worker| worker.state != WorkerState::Running) {
-            inner.workers.clear();
+            let settled = std::mem::take(&mut inner.workers);
+            for worker in settled {
+                inner.history.push_front(worker);
+            }
+            inner.history.truncate(HISTORY);
         }
         inner.next_id += 1;
         inner.version = inner.version.wrapping_add(1);
@@ -101,9 +139,110 @@ impl SubagentBoard {
             state: WorkerState::Running,
             activity: "starting".to_owned(),
             started: Instant::now(),
+            started_at: Utc::now(),
+            finished_at: None,
             tokens,
+            model: String::new(),
+            prompt: String::new(),
+            tool: None,
+            tool_uses: 0,
+            cancel: Arc::default(),
+            log: Arc::default(),
         });
         id
+    }
+
+    /// Name the model a worker runs on and the task it was given; its
+    /// transcript opens with the task.
+    pub fn describe(&self, id: u64, model: &str, prompt: &str) {
+        let mut inner = self.inner.write().expect("board lock");
+        if let Some(worker) = inner.workers.iter_mut().find(|worker| worker.id == id) {
+            worker.model = model.to_owned();
+            worker.prompt = prompt.to_owned();
+            worker.log.lock().expect("worker log lock").prompt(prompt);
+            inner.version = inner.version.wrapping_add(1);
+        }
+    }
+
+    /// Fold one of a worker's events into the board: its activity line, the
+    /// tool it is in, and its transcript.
+    pub fn record(&self, id: u64, event: &crate::agent::AgentEvent) {
+        use crate::agent::AgentEvent;
+        let log = {
+            let mut inner = self.inner.write().expect("board lock");
+            let Some(worker) = inner.workers.iter_mut().find(|worker| worker.id == id) else {
+                return;
+            };
+            match event {
+                AgentEvent::ToolStarted { name, .. } => {
+                    worker.tool = Some(name.clone());
+                    worker.tool_uses += 1;
+                    inner.version = inner.version.wrapping_add(1);
+                }
+                AgentEvent::ToolFinished { .. } => {
+                    worker.tool = None;
+                    inner.version = inner.version.wrapping_add(1);
+                }
+                _ => {}
+            }
+            inner.workers.iter().find(|worker| worker.id == id).map(|worker| worker.log.clone())
+        };
+        match event {
+            AgentEvent::ToolStarted { name, summary } => self.activity(id, &format!("{name} {summary}")),
+            AgentEvent::Delta(text) => self.activity(id, text),
+            _ => {}
+        }
+        if let Some(log) = log {
+            log.lock().expect("worker log lock").event(event);
+        }
+    }
+
+    /// Ask a running worker to stop. False when there is no such worker or it
+    /// already finished.
+    pub fn stop(&self, id: u64) -> bool {
+        let inner = self.inner.read().expect("board lock");
+        match inner.workers.iter().find(|worker| worker.id == id && worker.state == WorkerState::Running) {
+            Some(worker) => {
+                worker.cancel.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The flag a worker's turn watches; raised by [`Self::stop`].
+    pub fn cancel_flag(&self, id: u64) -> Arc<AtomicBool> {
+        let inner = self.inner.read().expect("board lock");
+        inner.workers.iter().find(|worker| worker.id == id).map(|worker| worker.cancel.clone()).unwrap_or_default()
+    }
+
+    /// Whether the person stopped this worker.
+    pub fn was_stopped(&self, id: u64) -> bool {
+        self.cancel_flag(id).load(Ordering::Relaxed)
+    }
+
+    /// Every worker this session has kept: the current batch, then earlier
+    /// finished ones, newest first.
+    pub fn all(&self) -> Vec<WorkerStatus> {
+        let inner = self.inner.read().expect("board lock");
+        let mut workers: Vec<WorkerStatus> = inner.workers.iter().rev().cloned().collect();
+        workers.extend(inner.history.iter().cloned());
+        workers
+    }
+
+    /// A worker's transcript as client items, current or past.
+    pub fn transcript(&self, id: u64) -> Option<Vec<Value>> {
+        let inner = self.inner.read().expect("board lock");
+        let worker = inner.workers.iter().chain(inner.history.iter()).find(|worker| worker.id == id)?;
+        Some(worker.log.lock().expect("worker log lock").items())
+    }
+
+    /// Forget finished workers; running ones stay.
+    pub fn clear_finished(&self) {
+        let mut inner = self.inner.write().expect("board lock");
+        inner.history.clear();
+        inner.workers.retain(|worker| worker.state == WorkerState::Running);
+        inner.version = inner.version.wrapping_add(1);
     }
 
     pub fn activity(&self, id: u64, activity: &str) {
@@ -128,7 +267,15 @@ impl SubagentBoard {
     pub fn finish(&self, id: u64, ok: bool) {
         let mut inner = self.inner.write().expect("board lock");
         if let Some(worker) = inner.workers.iter_mut().find(|worker| worker.id == id) {
-            worker.state = if ok { WorkerState::Done } else { WorkerState::Failed };
+            worker.state = if worker.cancel.load(Ordering::Relaxed) {
+                WorkerState::Stopped
+            } else if ok {
+                WorkerState::Done
+            } else {
+                WorkerState::Failed
+            };
+            worker.finished_at = Some(Utc::now());
+            worker.tool = None;
             inner.version = inner.version.wrapping_add(1);
         }
     }
@@ -164,6 +311,93 @@ impl SubagentBoard {
             inner.version = inner.version.wrapping_add(1);
         }
         inner.workers.clear();
+    }
+}
+
+/// Items a worker's transcript keeps (the task stays first); output kept per
+/// tool call. Bounded because a long worker can run hundreds of steps.
+const LOG_ITEMS: usize = 400;
+const LOG_TOOL_OUTPUT: usize = 4_000;
+
+/// A worker's transcript in the app server's item shape, built from its
+/// events so a front end can read it while the worker runs.
+#[derive(Debug, Default)]
+pub struct WorkerLog {
+    items: Vec<Value>,
+    next: u64,
+    /// The text and reasoning items still being streamed into, by id.
+    open_text: Option<String>,
+    open_reasoning: Option<String>,
+}
+
+impl WorkerLog {
+    fn push(&mut self, mut item: Value) -> String {
+        self.next += 1;
+        let id = format!("worker_item_{}", self.next);
+        item["id"] = json!(id);
+        self.items.push(item);
+        if self.items.len() > LOG_ITEMS {
+            // Drop the oldest step, never the task.
+            self.items.remove(1);
+        }
+        id
+    }
+
+    fn find(&mut self, id: &str) -> Option<&mut Value> {
+        self.items.iter_mut().rev().find(|item| item["id"] == id)
+    }
+
+    fn stream(&mut self, kind: &str, piece: &str) {
+        let open = if kind == "agentMessage" { self.open_text.clone() } else { self.open_reasoning.clone() };
+        if let Some(id) = open
+            && let Some(item) = self.find(&id)
+        {
+            let text = format!("{}{piece}", item["text"].as_str().unwrap_or_default());
+            item["text"] = json!(text);
+            return;
+        }
+        let id = self.push(json!({"type": kind, "text": piece}));
+        if kind == "agentMessage" {
+            self.open_text = Some(id);
+        } else {
+            self.open_reasoning = Some(id);
+        }
+    }
+
+    pub fn prompt(&mut self, text: &str) {
+        self.push(json!({"type": "userMessage", "text": text}));
+    }
+
+    pub fn event(&mut self, event: &crate::agent::AgentEvent) {
+        use crate::agent::AgentEvent;
+        match event {
+            AgentEvent::Delta(text) => self.stream("agentMessage", text),
+            AgentEvent::Reasoning(text) => self.stream("reasoning", text),
+            AgentEvent::ToolStarted { name, summary } => {
+                // A tool call ends whatever was streaming.
+                self.open_text = None;
+                self.open_reasoning = None;
+                self.push(json!({
+                    "type": crate::app_server::item_type(name),
+                    "name": name,
+                    "command": summary,
+                    "status": "inProgress",
+                }));
+            }
+            AgentEvent::ToolFinished { name, output } => {
+                if let Some(item) =
+                    self.items.iter_mut().rev().find(|item| item["name"] == *name && item["status"] == "inProgress")
+                {
+                    item["status"] = json!("completed");
+                    item["output"] = json!(crate::text::clip(output, LOG_TOOL_OUTPUT, "\n…"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn items(&self) -> Vec<Value> {
+        self.items.clone()
     }
 }
 
@@ -574,6 +808,55 @@ mod tests {
             matches!(registry.channel("long-runner"), Some(WorkerChannel::Live(_))),
             "eviction only takes finished workers"
         );
+    }
+
+    #[test]
+    fn a_workers_transcript_and_counts_follow_its_events() {
+        use crate::agent::AgentEvent;
+        let board = SubagentBoard::default();
+        let id = board.begin("recon", "scout", Arc::default());
+        board.describe(id, "kimi-k3", "find the balancing loss");
+        board.record(id, &AgentEvent::Reasoning("look at the router".into()));
+        board.record(id, &AgentEvent::ToolStarted { name: "grep".into(), summary: "aux_loss in src".into() });
+        assert_eq!(board.all()[0].tool.as_deref(), Some("grep"), "the tool it is in");
+        board.record(id, &AgentEvent::ToolFinished { name: "grep".into(), output: "src/moe.rs:12".into() });
+        board.record(id, &AgentEvent::Delta("Found it ".into()));
+        board.record(id, &AgentEvent::Delta("in src/moe.rs.".into()));
+
+        let worker = &board.all()[0];
+        assert_eq!((worker.model.as_str(), worker.tool_uses, worker.tool.is_none()), ("kimi-k3", 1, true));
+        let items = board.transcript(id).unwrap();
+        let kinds: Vec<&str> = items.iter().map(|item| item["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["userMessage", "reasoning", "functionCall", "agentMessage"]);
+        assert_eq!(items[0]["text"], "find the balancing loss");
+        assert_eq!(items[2]["status"], "completed");
+        assert_eq!(items[2]["output"], "src/moe.rs:12");
+        assert_eq!(items[3]["text"], "Found it in src/moe.rs.", "streamed text joins into one item");
+    }
+
+    #[test]
+    fn stopped_workers_say_so_and_finished_ones_outlive_their_batch() {
+        let board = SubagentBoard::default();
+        let first = board.begin("alpha", "worker", Arc::default());
+        assert!(board.stop(first));
+        assert!(board.cancel_flag(first).load(Ordering::Relaxed), "the worker's turn sees the stop");
+        board.finish(first, true);
+        assert_eq!(board.all()[0].state, WorkerState::Stopped);
+        assert!(board.all()[0].finished_at.is_some());
+        assert!(!board.stop(first), "a finished worker cannot be stopped");
+
+        // A new batch replaces the strip's workers, but the list keeps the old ones.
+        let second = board.begin("beta", "worker", Arc::default());
+        assert_eq!(board.snapshot().len(), 1);
+        let names: Vec<String> = board.all().into_iter().map(|worker| worker.name).collect();
+        assert_eq!(names, ["beta", "alpha"]);
+        assert!(board.transcript(first).is_some(), "a past worker's transcript is still readable");
+
+        board.clear_finished();
+        let names: Vec<String> = board.all().into_iter().map(|worker| worker.name).collect();
+        assert_eq!(names, ["beta"], "clearing keeps what still runs");
+        board.finish(second, false);
+        assert_eq!(board.all()[0].state, WorkerState::Failed);
     }
 
     #[test]
