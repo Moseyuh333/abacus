@@ -160,6 +160,13 @@ impl ToolCall {
                 format!("{} file(s)", args["paths"].as_array().map(Vec::len).unwrap_or(0))
             }
             "tool_search" => args["query"].as_str().unwrap_or("all tools").to_owned(),
+            // The workers by name, not the whole request with its prompts.
+            "spawn_subagents" => {
+                let names: Vec<&str> =
+                    args["tasks"].as_array().into_iter().flatten().filter_map(|task| task["name"].as_str()).collect();
+                if names.is_empty() { "subagents".to_owned() } else { names.join(", ") }
+            }
+            "message_subagent" => args["name"].as_str().unwrap_or("subagent").to_owned(),
             _ => self.arguments.clone(),
         }
     }
@@ -987,13 +994,19 @@ impl ToolExecutor {
         let sleep_floor = declared_sleep_seconds(&args.command).map(|seconds| (seconds + 30).min(600)).unwrap_or(0);
         let duration = Duration::from_secs(requested.max(sleep_floor));
         let mut child = command.spawn().context("could not start command")?;
+        let mut group = ProcessGroup(child.id());
         let stdout = child.stdout.take().context("could not capture stdout")?;
         let stderr = child.stderr.take().context("could not capture stderr")?;
         let per_stream_limit = self.output_limit.max(2_000) / 2;
         let stdout_task = tokio::spawn(read_capped(stdout, per_stream_limit));
         let stderr_task = tokio::spawn(read_capped(stderr, per_stream_limit));
         let status = match timeout(duration, child.wait()).await {
-            Ok(status) => status?,
+            Ok(status) => {
+                // Finished on its own: anything it left running in the
+                // background was its own business, as before.
+                group.disarm();
+                status?
+            }
             Err(_) => {
                 let _ = child.kill().await;
                 stdout_task.abort();
@@ -1008,7 +1021,39 @@ impl ToolExecutor {
         let stderr = String::from_utf8_lossy(&stderr);
         Ok(format!("exit: {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"))
     }
+}
 
+/// A command's process group, killed whole if the command is abandoned before
+/// it finishes: an interrupted turn, a stopped subagent, a timeout. The command
+/// runs in its own session (setsid above), so its pid is also its group id.
+/// `kill_on_drop` alone only reaches the shell, and what the shell started
+/// (`sleep 45`, a build) would keep running with nobody waiting on it.
+struct ProcessGroup(Option<u32>);
+
+impl ProcessGroup {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(id) = self.0.and_then(|id| i32::try_from(id).ok()) {
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+            const SIGKILL: i32 = 9;
+            // SAFETY: kill(2) only sends a signal; a negative pid addresses the
+            // group this command leads, and nothing else.
+            unsafe {
+                kill(-id, SIGKILL);
+            }
+        }
+    }
+}
+
+impl ToolExecutor {
     /// Resolve a path for *reading*. Unlike the write resolvers this may leave
     /// the workspace, but only for a path the safety layer has already
     /// approved. Banning outside reads outright did not stop the agent seeing
@@ -1649,6 +1694,21 @@ fn validate_branch(value: &str) -> Result<String> {
 mod tests {
 
     #[test]
+    fn subagent_calls_are_summarised_by_worker_name() {
+        let call = |name: &str, arguments: &str| {
+            super::ToolCall { id: "1".into(), name: name.into(), arguments: arguments.into() }.summary()
+        };
+        assert_eq!(
+            call(
+                "spawn_subagents",
+                r#"{"tasks":[{"name":"Readme survey","prompt":"long"},{"name":"FizzBuzz audit","prompt":"long"}]}"#
+            ),
+            "Readme survey, FizzBuzz audit"
+        );
+        assert_eq!(call("message_subagent", r#"{"name":"Readme survey","message":"and the tests?"}"#), "Readme survey");
+    }
+
+    #[test]
     fn declared_sleep_raises_the_command_timeout_floor() {
         assert_eq!(declared_sleep_seconds("sleep 180 && cargo test"), Some(180));
         assert_eq!(declared_sleep_seconds("sleep 2m; echo done"), Some(120));
@@ -1988,6 +2048,31 @@ mod tests {
         let output = tools.execute(&tool_call("git_blame", r#"{"path":"file.txt"}"#)).await;
         assert!(!output.contains("Error:"));
         assert!(output.contains("first"));
+    }
+
+    /// Dropping a command that has not finished (an interrupted turn, a
+    /// stopped subagent) kills what it started, not just its shell.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_abandoned_command_takes_its_children_with_it() {
+        let dir = tempdir().unwrap();
+        let tools = ToolExecutor::new(dir.path().canonicalize().unwrap());
+        let pidfile = dir.path().join("pid");
+        let command = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let call = tool_call("run_command", serde_json::json!({ "command": command }).to_string());
+        let run = tools.execute(&call);
+        // Long enough to start the sleep, far short of it finishing.
+        assert!(tokio::time::timeout(Duration::from_millis(1500), run).await.is_err());
+
+        let pid = fs::read_to_string(&pidfile).unwrap().trim().to_owned();
+        let alive = || StdCommand::new("kill").args(["-0", &pid]).status().is_ok_and(|status| status.success());
+        for _ in 0..40 {
+            if !alive() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the background sleep {pid} outlived its abandoned command");
     }
 
     #[tokio::test]

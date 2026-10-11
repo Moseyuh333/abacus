@@ -2,7 +2,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -563,6 +567,12 @@ impl SubagentRuntime {
         );
         let mut final_messages = None;
         let mut failure = None;
+        // A stop from the board ends the worker now, mid-tool if need be:
+        // its turn would otherwise only notice after the running tool call,
+        // and a long command can take minutes. Dropping the turn kills the
+        // command (kill_on_drop) and the worktree is removed below.
+        let stop = self.hive.board.cancel_flag(board_id);
+        let mut check = tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
                 () = &mut turn => break,
@@ -570,6 +580,11 @@ impl SubagentRuntime {
                     if let Some(event) = event {
                         self.note_activity(board_id, &event);
                         capture_event(event, &mut final_messages, &mut failure);
+                    }
+                }
+                _ = check.tick() => {
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok((String::new(), String::new(), Vec::new()));
                     }
                 }
             }

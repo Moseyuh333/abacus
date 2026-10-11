@@ -276,6 +276,8 @@ impl SubagentBoard {
             };
             worker.finished_at = Some(Utc::now());
             worker.tool = None;
+            // A tool cut off by the end of the worker never reports back.
+            worker.log.lock().expect("worker log lock").settle();
             inner.version = inner.version.wrapping_add(1);
         }
     }
@@ -398,6 +400,17 @@ impl WorkerLog {
 
     pub fn items(&self) -> Vec<Value> {
         self.items.clone()
+    }
+
+    /// Mark tool calls that never finished as aborted.
+    fn settle(&mut self) {
+        for item in &mut self.items {
+            if item["status"] == "inProgress" {
+                item["status"] = json!("aborted");
+            }
+        }
+        self.open_text = None;
+        self.open_reasoning = None;
     }
 }
 
@@ -840,8 +853,13 @@ mod tests {
         let first = board.begin("alpha", "worker", Arc::default());
         assert!(board.stop(first));
         assert!(board.cancel_flag(first).load(Ordering::Relaxed), "the worker's turn sees the stop");
+        board.record(
+            first,
+            &crate::agent::AgentEvent::ToolStarted { name: "run_command".into(), summary: "sleep 45".into() },
+        );
         board.finish(first, true);
         assert_eq!(board.all()[0].state, WorkerState::Stopped);
+        assert_eq!(board.transcript(first).unwrap()[0]["status"], "aborted", "the cut-off command shows as such");
         assert!(board.all()[0].finished_at.is_some());
         assert!(!board.stop(first), "a finished worker cannot be stopped");
 
