@@ -89,10 +89,12 @@ enum Incoming {
         method: String,
         params: Value,
     },
-    /// The client answering a request *we* sent — an approval or a question.
+    /// The client answering a request *we* sent — an approval, a question,
+    /// or a front-end tool call.
     Response {
         id: Value,
         result: Value,
+        error: Option<Value>,
     },
     Notification {
         method: String,
@@ -174,6 +176,9 @@ struct App {
     /// Server-initiated requests waiting on the client, by request id.
     pending_approvals: HashMap<String, oneshot::Sender<ApprovalDecision>>,
     pending_questions: HashMap<String, oneshot::Sender<UserAnswer>>,
+    /// Front-end tool calls waiting on their answer: the tool, and who waits.
+    pending_client_calls: HashMap<String, (String, oneshot::Sender<crate::client_tools::ClientResult>)>,
+    client_calls: Option<mpsc::UnboundedSender<crate::client_tools::ClientCall>>,
     counter: u64,
     /// Account-tied usage, present only while signed in to Abacus Sync.
     usage: Option<UsageReporter>,
@@ -216,6 +221,8 @@ pub async fn run(
         open_items: HashMap::new(),
         pending_approvals: HashMap::new(),
         pending_questions: HashMap::new(),
+        pending_client_calls: HashMap::new(),
+        client_calls: None,
         counter: 0,
         usage,
         sync_warned: Arc::default(),
@@ -246,6 +253,11 @@ pub async fn run(
     // land after the front end has already asked for the next one, and a
     // channel that dies with the turn would drop them.
     let (events, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    // Calls to tools the front end registered come back through here, so the
+    // request goes out on the one stdout writer and its answer is matched in
+    // `resolve` like an approval's.
+    let (client_calls, mut client_call_rx) = mpsc::unbounded_channel::<crate::client_tools::ClientCall>();
+    app.client_calls = Some(client_calls);
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
 
     // stdin on its own task: a blocking read must never stall event delivery,
@@ -287,7 +299,7 @@ pub async fn run(
                             break;
                         }
                     }
-                    Ok(Incoming::Response { id, result }) => app.resolve(&id, &result),
+                    Ok(Incoming::Response { id, result, error }) => app.resolve(&id, &result, error.as_ref()),
                     Ok(Incoming::Notification { method }) => {
                         if method == "shutdown" {
                             break;
@@ -302,6 +314,10 @@ pub async fn run(
             event = event_rx.recv() => {
                 let Some(event) = event else { continue };
                 app.handle_event(event);
+            }
+            call = client_call_rx.recv() => {
+                let Some(call) = call else { continue };
+                app.forward_client_call(call);
             }
         }
     }
@@ -321,6 +337,7 @@ fn parse(line: &str) -> Result<Incoming> {
         return Ok(Incoming::Response {
             id: value["id"].clone(),
             result: value.get("result").cloned().unwrap_or(Value::Null),
+            error: value.get("error").cloned(),
         });
     }
     let method = value["method"].as_str().ok_or_else(|| anyhow!("frame has no method"))?.to_owned();
@@ -391,6 +408,9 @@ impl App {
                     // Background workers: tasks/list, task/read, task/stop,
                     // tasks/clear, and tasks/updated as they change.
                     "tasks": true,
+                    // tools/register: the front end lends the agent tools of
+                    // its own (the desktop's browser), called back as tool/call.
+                    "clientTools": true,
                     "compact": true,
                 },
                 "thread": self.thread_snapshot(),
@@ -495,6 +515,20 @@ impl App {
                     |command| json!({"name": command.name, "description": command.description, "kind": "plugin"}),
                 ));
                 Ok(json!({"commands": commands}))
+            }
+            "tools/register" => {
+                let calls = self.client_calls.clone().ok_or_else(|| anyhow!("front-end tools are not available"))?;
+                // Measured without any earlier front-end tools, which this replaces.
+                let without_client = self.services.with_client_tools(None);
+                let taken: Vec<String> = without_client
+                    .tool_specs()
+                    .iter()
+                    .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_owned))
+                    .collect();
+                let tools = crate::client_tools::ClientTools::from_params(&params, &taken, calls)?;
+                let names: Vec<String> = tools.names().cloned().collect();
+                self.services = Arc::new(without_client.with_client_tools(Some(Arc::new(tools))));
+                Ok(json!({"registered": names}))
             }
             "tasks/list" => Ok(json!({"tasks": task_summaries(&self.hive.board)})),
             "task/read" => {
@@ -1025,8 +1059,38 @@ impl App {
     }
 
     /// Match a client's answer to the server request that is waiting on it.
-    fn resolve(&mut self, id: &Value, result: &Value) {
+    /// Send a front-end tool call out as a `tool/call` request.
+    fn forward_client_call(&mut self, call: crate::client_tools::ClientCall) {
+        let id = self.next("srv");
+        emit(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tool/call",
+            "params": {
+                "threadId": self.thread_id(),
+                "turnId": self.turn_id(),
+                "name": call.name,
+                "arguments": call.arguments,
+            }
+        }));
+        self.pending_client_calls.insert(id, (call.name, call.respond));
+    }
+
+    fn resolve(&mut self, id: &Value, result: &Value, error: Option<&Value>) {
         let Some(id) = id.as_str() else { return };
+        if let Some((name, responder)) = self.pending_client_calls.remove(id) {
+            let mut answer = crate::client_tools::read_result(result, error);
+            // Tool results are text; a screenshot reaches the model as an image
+            // in the message that follows the call, the way steering does.
+            let images = std::mem::take(&mut answer.images);
+            if !images.is_empty() {
+                let text = format!("[{name}: {} image(s) attached]", images.len());
+                let content = crate::context::with_images(json!(format!("The image(s) {name} returned:")), images);
+                self.thread.state.injections.push(crate::agent::Injection::UserContent { text, content });
+            }
+            let _ = responder.send(answer);
+            return;
+        }
         if let Some(responder) = self.pending_approvals.remove(id) {
             let decision = match result["decision"].as_str().unwrap_or("decline") {
                 "accept" => ApprovalDecision::Once,
@@ -1448,7 +1512,7 @@ mod tests {
         // A reply to a server-initiated request carries a result, not a method.
         let response = parse(r#"{"jsonrpc":"2.0","id":"srv_1","result":{"decision":"accept"}}"#).unwrap();
         match response {
-            Incoming::Response { id, result } => {
+            Incoming::Response { id, result, .. } => {
                 assert_eq!(id, json!("srv_1"));
                 assert_eq!(result["decision"], "accept");
             }

@@ -549,3 +549,121 @@ async fn app_server_completes_commands_and_files_and_expands_what_the_person_typ
     drop(input);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
 }
+
+/// A model endpoint whose reply to each chat request `answer` picks from the
+/// request itself, and that keeps every request.
+fn scripted_model_endpoint(answer: fn(&str) -> String) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = seen.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let request = read_request(&mut stream);
+            let response = if request.starts_with("GET /v1/models") {
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+            } else {
+                let body = answer(&request);
+                record.lock().unwrap().push(request);
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{address}/v1"), seen)
+}
+
+/// The desktop lends the agent its browser: the tool it registers reaches the
+/// model, a call comes back to it as `tool/call`, and its answer (a screenshot
+/// included) goes on to the model.
+#[tokio::test]
+async fn app_server_lets_the_front_end_provide_tools() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // The turn's own request is the one offered the browser tool; until the
+    // tool has answered, the model calls it. Anything else (the app server's
+    // side requests, the turn after the tool) gets a plain answer.
+    fn answer(request: &str) -> String {
+        if request.contains("browser_navigate") && !request.contains("Loaded Example Domain") {
+            let call = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"browser_navigate","arguments":"{\"url\":\"https://example.com\"}"}}]}}]}"#;
+            let finish = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+            return format!("data: {call}\n\ndata: {finish}\n\ndata: {MODEL_USAGE}\n\ndata: [DONE]\n\n");
+        }
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"It is Example Domain.\"}}}}]}}\n\ndata: {MODEL_USAGE}\n\ndata: [DONE]\n\n"
+        )
+    }
+    let (model, requests) = scripted_model_endpoint(answer);
+    let sync = sync_server::SyncServer::start("secret-token").await;
+    let device = SignedIn::new(&sync, "secret-token");
+    let mut child = device
+        .command(&model, &["app-server"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let frame = |value: serde_json::Value| format!("{value}\n");
+    let tools = serde_json::json!({"tools": [{
+        "name": "browser_navigate",
+        "description": "Open a URL in the desktop's browser",
+        "needsApproval": false,
+        "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+    }]});
+    for request in [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/register", "params": tools}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "turn/start", "params": {"text": "what is example.com?"}}),
+    ] {
+        input.write_all(frame(request).as_bytes()).await.unwrap();
+    }
+
+    let mut registered = serde_json::Value::Null;
+    let mut asked = serde_json::Value::Null;
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if message["id"] == 2 {
+                registered = message["result"].clone();
+            }
+            if message["method"] == "tool/call" {
+                asked = message["params"].clone();
+                let answer = serde_json::json!({"jsonrpc": "2.0", "id": message["id"], "result": {
+                    "content": "Loaded Example Domain (https://example.com/)",
+                    "images": ["data:image/png;base64,QUJD"],
+                }});
+                input.write_all(frame(answer).as_bytes()).await.unwrap();
+            }
+            if message["method"] == "turn/completed" {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(finished, Ok(true), "the turn should complete");
+    assert_eq!(registered["registered"], serde_json::json!(["browser_navigate"]));
+    assert_eq!(
+        (asked["name"].clone(), asked["arguments"]["url"].clone()),
+        ("browser_navigate".into(), "https://example.com".into())
+    );
+
+    let sent = requests.lock().unwrap().clone();
+    let after = sent.iter().find(|request| request.contains("Loaded Example Domain"));
+    let after = after.expect("the tool's answer reaches the model");
+    assert!(after.contains("data:image/png;base64,QUJD"), "and so does its screenshot");
+
+    input
+        .write_all(frame(serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown"})).as_bytes())
+        .await
+        .unwrap();
+    drop(input);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
+}

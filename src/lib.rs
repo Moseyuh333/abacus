@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod agent;
 pub mod app_server;
+pub mod client_tools;
 pub mod clipboard;
 pub mod compaction;
 pub mod config;

@@ -34,6 +34,8 @@ pub struct AgentServices {
     pub skills: Arc<RwLock<SkillRegistry>>,
     pub plugins: Arc<PluginRegistry>,
     pub mcp: Arc<McpManager>,
+    /// Tools the front end provides (the desktop's browser), when it registered any.
+    pub client_tools: Option<Arc<crate::client_tools::ClientTools>>,
     skill_discovery: SkillDiscovery,
     workspace: PathBuf,
     project_trusted: bool,
@@ -76,6 +78,7 @@ impl AgentServices {
             },
             plugins: Arc::new(plugins),
             mcp: Arc::new(mcp),
+            client_tools: None,
             workspace: workspace.to_owned(),
             project_trusted,
         })
@@ -87,13 +90,22 @@ impl AgentServices {
             skill_discovery: SkillDiscovery::default(),
             plugins: Arc::new(PluginRegistry::default()),
             mcp: Arc::new(McpManager::default()),
+            client_tools: None,
             workspace,
             project_trusted: false,
         }
     }
 
+    /// The same services with these front-end tools (or none) in place of any
+    /// registered before.
+    pub fn with_client_tools(&self, client_tools: Option<Arc<crate::client_tools::ClientTools>>) -> Self {
+        Self { client_tools, ..self.clone() }
+    }
+
+    /// The same services for a subagent's worktree. Front-end tools stay
+    /// with the main agent: two agents driving one browser would fight.
     pub fn for_workspace(&self, workspace: PathBuf) -> Self {
-        Self { workspace, ..self.clone() }
+        Self { workspace, client_tools: None, ..self.clone() }
     }
 
     /// Rediscover skills in place, so a skill the agent just wrote is callable
@@ -133,6 +145,9 @@ impl AgentServices {
             specs.extend(SkillRegistry::author_tool_specs());
         }
         specs.extend(self.mcp.tool_specs());
+        if let Some(client) = &self.client_tools {
+            specs.extend(client.tool_specs());
+        }
         specs
     }
 
@@ -164,10 +179,20 @@ impl AgentServices {
     }
 
     pub fn needs_approval(&self, call: &ToolCall) -> bool {
+        if let Some(needs) = self.client_tools.as_ref().and_then(|client| client.needs_approval(&call.name)) {
+            return needs;
+        }
         self.mcp.needs_approval(&call.name).unwrap_or_else(|| call.needs_approval())
     }
 
     pub fn approval_details(&self, call: &ToolCall) -> Option<String> {
+        if self.client_tools.as_ref().is_some_and(|client| client.needs_approval(&call.name).is_some()) {
+            let pretty = serde_json::from_str::<Value>(&call.arguments)
+                .ok()
+                .and_then(|value| serde_json::to_string_pretty(&value).ok())
+                .unwrap_or_else(|| call.arguments.clone());
+            return Some(format!("Tool: {}\nArguments:\n{pretty}", call.name));
+        }
         self.mcp.approval_details(&call.name, &call.arguments)
     }
 
@@ -177,6 +202,11 @@ impl AgentServices {
         }
         if let Some(result) = self.skills.read().expect("skill registry lock").execute(&call.name, &call.arguments) {
             return Some(result);
+        }
+        if let Some(client) = &self.client_tools
+            && let Some(result) = client.execute(&call.name, &call.arguments).await
+        {
+            return Some(result.text);
         }
         self.mcp.execute(&call.name, &call.arguments).await
     }

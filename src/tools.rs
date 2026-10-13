@@ -167,6 +167,14 @@ impl ToolCall {
                 if names.is_empty() { "subagents".to_owned() } else { names.join(", ") }
             }
             "message_subagent" => args["name"].as_str().unwrap_or("subagent").to_owned(),
+            // The desktop's browser tools: what was visited, clicked or typed.
+            name if name.starts_with("browser_") => ["url", "element", "text", "key", "direction"]
+                .iter()
+                .find_map(|key| {
+                    args[key].as_str().map(str::to_owned).or_else(|| args[key].as_u64().map(|n| n.to_string()))
+                })
+                .or_else(|| args["ref"].as_u64().map(|r| format!("element {r}")))
+                .unwrap_or_default(),
             _ => self.arguments.clone(),
         }
     }
@@ -1706,6 +1714,10 @@ mod tests {
             "Readme survey, FizzBuzz audit"
         );
         assert_eq!(call("message_subagent", r#"{"name":"Readme survey","message":"and the tests?"}"#), "Readme survey");
+        assert_eq!(call("browser_navigate", r#"{"url":"https://example.com"}"#), "https://example.com");
+        assert_eq!(call("browser_click", r#"{"ref":7,"element":"Sign in button"}"#), "Sign in button");
+        assert_eq!(call("browser_click", r#"{"ref":7}"#), "element 7");
+        assert_eq!(call("browser_read_page", "{}"), "");
     }
 
     #[test]
