@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.7.0 — 2026-10-14
+
+This release goes with the first release of
+[Abacus Desktop](https://github.com/empero-org/abacus-desktop), 0.1.0, which
+needs it.
+
+- **`abacus update`.** Installs the newest release with the official installer
+  and replaces the running binary where it is (a binary cargo installed or
+  built is left to cargo). It updates the desktop app too when that is
+  installed; `--desktop` installs it if not, and `--check` only says whether a
+  newer release exists. The notice about a new release now points here instead
+  of at `git pull && cargo build`.
+
+- **One installer for the CLI and the desktop app, on every platform.**
+  `curl -fsSL https://abacus.empero.org/install.sh | sh` on macOS and Linux and
+  `irm https://abacus.empero.org/install.ps1 | iex` in PowerShell on Windows
+  ask whether to install the desktop app as well (`--cli` or `--desktop`, or
+  `ABACUS_INSTALL=cli|desktop`, skip the question). Both verify downloads
+  against the release's checksums.
+
+- **Background tasks for a front end.** The app server keeps one worker board
+  for the process, as the terminal does, so subagents spawned in one turn are
+  still there (and can be messaged) in the next. Each worker's model, task,
+  current tool, tool count, timing and a live transcript are on the board, and
+  `tasks/list`, `task/read`, `task/stop` and `tasks/clear` expose them;
+  `tasks/updated` announces changes. The desktop app shows them in its
+  background tasks panel.
+
+- **Stopping a subagent stops it now.** A stop no longer waits for the
+  worker's current tool call: the turn is dropped at once and the cut-off tool
+  shows as aborted. An abandoned command (stopped, interrupted or timed out)
+  now takes its whole process group with it, so a build or a `sleep` its shell
+  started no longer keeps running.
+
+- **Tools a front end provides.** `tools/register` lets a front end lend the
+  agent tools of its own; a call becomes a `tool/call` request to the front
+  end, and images in the answer reach the model. Approval is asked unless the
+  tool says otherwise, a built-in name cannot be shadowed, and a front end
+  that does not answer within two minutes fails the call. The desktop app
+  lends its browser this way: abacus can open pages, read them, click, type and
+  take screenshots there while you watch.
+
 ## 0.6.6 — 2026-10-06
 
 - **`abacus sessions --all` and `--json`.** `--all` lists the sessions of every

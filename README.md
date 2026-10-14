@@ -14,7 +14,25 @@ macOS, Linux and Windows.
 
 ## Install
 
-You need Rust 1.88 or newer and git.
+On macOS and Linux:
+
+```sh
+curl -fsSL https://abacus.empero.org/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://abacus.empero.org/install.ps1 | iex
+```
+
+The installer puts `abacus` in `~/.local/bin` and asks whether to install
+[Abacus Desktop](https://github.com/empero-org/abacus-desktop) as well, the
+app that drives the same agent in a window. `--cli` or `--desktop` (on
+Windows, `$env:ABACUS_INSTALL="cli"` or `"desktop"` before the command) skips
+the question. `abacus update` installs the newest release later.
+
+From source, with Rust 1.88 or newer and git:
 
 ```sh
 git clone https://github.com/empero-org/abacus
