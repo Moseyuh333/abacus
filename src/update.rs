@@ -1,20 +1,21 @@
-//! Release check: notice a newer version tag and say so, once.
+//! Release check: notice a newer version tag and say so, once; and
+//! `abacus update`, which installs it.
 //!
-//! Abacus is usually installed from source, so nothing tells you a release
-//! happened. A background check on startup compares the running version with
-//! the newest tag on GitHub and, when it is behind, leaves one line in the
-//! transcript. It never downloads or installs anything — updating stays the
-//! user's decision and the user's command.
+//! Nothing else tells you a release happened. A background check on startup
+//! compares the running version with the newest tag on GitHub and, when it is
+//! behind, leaves one line in the transcript. The check never downloads or
+//! installs anything — updating stays the user's decision and the user's
+//! command, `abacus update`.
 //!
 //! It is deliberately quiet: a cached result means at most one request a day,
 //! a failure is silent (offline, rate-limited, or behind a firewall is not
 //! something to nag about), and the whole thing is off when
 //! `check_updates = false`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// Public tag list. Tags, not releases: a repository that tags without
@@ -26,6 +27,9 @@ const CACHE_HOURS: i64 = 24;
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Only the newest handful of tags matter, and this bounds the response.
 const TAGS_PER_PAGE: usize = 20;
+/// Where the installers live. `abacus update` runs the one a fresh install
+/// runs, so an update is exactly a new install of the newest release.
+const INSTALLER_HOST: &str = "https://abacus.empero.org";
 
 /// A version that is newer than the one running.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,10 +42,7 @@ impl Available {
     /// The one line the user sees.
     pub fn message(&self) -> String {
         // Kept short enough to sit on one line of the transcript.
-        format!(
-            "Abacus {} is available (you are on {}) — git pull && cargo build --release",
-            self.version, self.current
-        )
+        format!("Abacus {} is available (you are on {}) — run `abacus update`", self.version, self.current)
     }
 }
 
@@ -128,6 +129,89 @@ async fn newest_tag(tags_url: &str) -> Result<String> {
         .context("no version tags")
 }
 
+/// `abacus update`: run the official installer for the newest release. It
+/// replaces this binary, and updates the desktop app when that is installed
+/// (or installs it, with `desktop`). `check` only reports.
+pub async fn run(desktop: bool, check: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    if check {
+        let latest = newest_tag(TAGS_URL).await?;
+        if is_newer(&latest, current) {
+            println!(
+                "Abacus {} is available (you are on {current}). Run `abacus update`.",
+                latest.trim_start_matches('v')
+            );
+        } else {
+            println!("Abacus {current} is the newest release.");
+        }
+        return Ok(());
+    }
+
+    let windows = cfg!(windows);
+    let name = if windows { "install.ps1" } else { "install.sh" };
+    let script = fetch_installer(&format!("{INSTALLER_HOST}/{name}")).await?;
+    let path = std::env::temp_dir().join(format!("abacus-{}-{name}", std::process::id()));
+    std::fs::write(&path, script).with_context(|| format!("write {}", path.display()))?;
+
+    let mut command = if windows {
+        let mut command = std::process::Command::new("powershell");
+        command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&path);
+        command.arg(if desktop { "-Desktop" } else { "-Update" });
+        command
+    } else {
+        let mut command = std::process::Command::new("sh");
+        command.arg(&path).arg(if desktop { "--desktop" } else { "--update" });
+        command
+    };
+    // Replace this binary where it is, unless cargo or a build put it there:
+    // those stay cargo's, and the release goes where the installer puts it.
+    if let Some(directory) = install_dir() {
+        command.env("ABACUS_INSTALL_DIR", directory);
+    }
+    let status = command.status().with_context(|| format!("run the installer ({name})"));
+    let _ = std::fs::remove_file(&path);
+    let status = status?;
+    if !status.success() {
+        bail!("the installer did not finish ({status})");
+    }
+    Ok(())
+}
+
+async fn fetch_installer(url: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent(concat!("abacus-agent/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("build http client")?;
+    client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("download {url}"))?
+        .error_for_status()
+        .with_context(|| format!("download {url}"))?
+        .text()
+        .await
+        .with_context(|| format!("read {url}"))
+}
+
+/// The directory of the running binary, when an update should land there.
+fn install_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // Through a symlink to the real file. Not on Windows, where this gives a
+    // `\\?\` path the installer would have to unpick.
+    #[cfg(not(windows))]
+    let exe = exe.canonicalize().ok()?;
+    let directory = exe.parent()?.to_path_buf();
+    (!managed_elsewhere(&directory)).then_some(directory)
+}
+
+/// A binary cargo installed or built: `cargo install` owns `~/.cargo/bin`, and
+/// a `target/` directory is a build tree.
+fn managed_elsewhere(directory: &Path) -> bool {
+    directory.ends_with(".cargo/bin") || directory.components().any(|component| component.as_os_str() == "target")
+}
+
 /// `v1.2.3`, `1.2.3`, `abacus-1.2.3` — anything with three dotted numbers in
 /// it. Trailing pre-release text is ignored, and so is a tag without numbers.
 fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
@@ -194,6 +278,14 @@ mod tests {
     fn a_stale_cache_is_not_trusted() {
         let checked = chrono::Utc::now() - chrono::Duration::hours(CACHE_HOURS + 1);
         assert!(!Cache::seen("v9.9.9", checked).fresh(), "a day-old check is asked again");
+    }
+
+    #[test]
+    fn an_update_leaves_cargo_builds_to_cargo() {
+        assert!(managed_elsewhere(Path::new("/home/me/.cargo/bin")));
+        assert!(managed_elsewhere(Path::new("/home/me/abacus/target/release")));
+        assert!(!managed_elsewhere(Path::new("/home/me/.local/bin")));
+        assert!(!managed_elsewhere(Path::new("/usr/local/bin")));
     }
 
     #[test]

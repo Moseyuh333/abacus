@@ -205,6 +205,15 @@ pub enum Command {
     /// Serve a session over newline-delimited JSON on stdin/stdout, for a
     /// desktop front end. One process, one workspace, one active session.
     AppServer,
+    /// Install the newest release, and update the desktop app if it is installed
+    Update {
+        /// Also install the desktop app if it is not installed yet
+        #[arg(long)]
+        desktop: bool,
+        /// Only say whether a newer release exists
+        #[arg(long, conflicts_with = "desktop")]
+        check: bool,
+    },
     /// Run the eval suite in `examples/evals` and score it
     Eval {
         /// Only run tasks whose directory name contains this substring

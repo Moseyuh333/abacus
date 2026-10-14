@@ -44,6 +44,7 @@ async fn main() -> Result<()> {
             let workspace = workspace_from_cli(&cli)?;
             return abacus_agent::sync::handle(action.clone(), &paths, workspace).await;
         }
+        Some(Command::Update { desktop, check }) => return abacus_agent::update::run(*desktop, *check).await,
         Some(Command::Sessions { all, json }) => {
             return print_sessions(&paths, workspace_from_cli(&cli)?, *all, *json);
         }
