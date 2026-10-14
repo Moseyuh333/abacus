@@ -27,6 +27,8 @@ const CACHE_HOURS: i64 = 24;
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Only the newest handful of tags matter, and this bounds the response.
 const TAGS_PER_PAGE: usize = 20;
+/// Redirects to the newest release's page, whose URL ends in its tag.
+const RELEASES_URL: &str = "https://github.com/empero-org/abacus/releases/latest";
 /// Where the installers live. `abacus update` runs the one a fresh install
 /// runs, so an update is exactly a new install of the newest release.
 const INSTALLER_HOST: &str = "https://abacus.empero.org";
@@ -135,7 +137,10 @@ async fn newest_tag(tags_url: &str) -> Result<String> {
 pub async fn run(desktop: bool, check: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     if check {
-        let latest = newest_tag(TAGS_URL).await?;
+        let latest = match latest_release().await {
+            Ok(tag) => tag,
+            Err(_) => newest_tag(TAGS_URL).await?,
+        };
         if is_newer(&latest, current) {
             println!(
                 "Abacus {} is available (you are on {current}). Run `abacus update`.",
@@ -175,6 +180,30 @@ pub async fn run(desktop: bool, check: bool) -> Result<()> {
         bail!("the installer did not finish ({status})");
     }
     Ok(())
+}
+
+/// The newest release's tag, from where github.com/…/releases/latest
+/// redirects: unlike the API, that has no hourly allowance to run out of.
+async fn latest_release() -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(TIMEOUT)
+        .user_agent(concat!("abacus-agent/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("build http client")?;
+    let response = client
+        .head(RELEASES_URL)
+        .send()
+        .await
+        .context("fetch the latest release")?
+        .error_for_status()
+        .context("latest release")?;
+    tag_from_release_url(response.url().as_str()).context("no release tag in the redirect")
+}
+
+fn tag_from_release_url(url: &str) -> Option<String> {
+    let (_, tag) = url.rsplit_once("/releases/tag/")?;
+    let tag = tag.trim_end_matches('/');
+    (!tag.is_empty() && !tag.contains('/')).then(|| tag.to_owned())
 }
 
 async fn fetch_installer(url: &str) -> Result<String> {
@@ -278,6 +307,14 @@ mod tests {
     fn a_stale_cache_is_not_trusted() {
         let checked = chrono::Utc::now() - chrono::Duration::hours(CACHE_HOURS + 1);
         assert!(!Cache::seen("v9.9.9", checked).fresh(), "a day-old check is asked again");
+    }
+
+    #[test]
+    fn the_release_redirect_names_the_tag() {
+        let tag = tag_from_release_url("https://github.com/empero-org/abacus/releases/tag/v0.7.0");
+        assert_eq!(tag.as_deref(), Some("v0.7.0"));
+        // No release yet: GitHub answers with the releases list instead.
+        assert_eq!(tag_from_release_url("https://github.com/empero-org/abacus/releases"), None);
     }
 
     #[test]
