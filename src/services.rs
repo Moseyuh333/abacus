@@ -178,6 +178,11 @@ impl AgentServices {
         sections.join("\n\n")
     }
 
+    /// Whether the front end provides `name`.
+    pub fn is_client_tool(&self, name: &str) -> bool {
+        self.client_tools.as_ref().is_some_and(|client| client.needs_approval(name).is_some())
+    }
+
     pub fn needs_approval(&self, call: &ToolCall) -> bool {
         if let Some(needs) = self.client_tools.as_ref().and_then(|client| client.needs_approval(&call.name)) {
             return needs;
@@ -186,7 +191,7 @@ impl AgentServices {
     }
 
     pub fn approval_details(&self, call: &ToolCall) -> Option<String> {
-        if self.client_tools.as_ref().is_some_and(|client| client.needs_approval(&call.name).is_some()) {
+        if self.is_client_tool(&call.name) {
             let pretty = serde_json::from_str::<Value>(&call.arguments)
                 .ok()
                 .and_then(|value| serde_json::to_string_pretty(&value).ok())

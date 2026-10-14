@@ -667,3 +667,91 @@ async fn app_server_lets_the_front_end_provide_tools() {
     drop(input);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
 }
+
+/// A front end's tool acts on state that moves between calls: reading the page
+/// after each click repeats `browser_read_page {}` exactly, and every one of
+/// those reads has to reach the front end rather than be blocked as a loop.
+#[tokio::test]
+async fn front_end_tools_may_repeat_their_arguments() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // The turn reads the page until it has three snapshots, then answers. A
+    // blocked call ends it early, so the test fails rather than spinning.
+    fn answer(request: &str) -> String {
+        let reads = request.matches("Page snapshot").count();
+        if request.contains("browser_read_page") && !request.contains("Blocked: the same tool call") && reads < 3 {
+            let call = format!(
+                r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"id":"call_{}","type":"function","function":{{"name":"browser_read_page","arguments":"{{}}"}}}}]}}}}]}}"#,
+                reads + 1
+            );
+            let finish = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+            return format!("data: {call}\n\ndata: {finish}\n\ndata: {MODEL_USAGE}\n\ndata: [DONE]\n\n");
+        }
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"The page settled.\"}}}}]}}\n\ndata: {MODEL_USAGE}\n\ndata: [DONE]\n\n"
+        )
+    }
+    let (model, requests) = scripted_model_endpoint(answer);
+    let sync = sync_server::SyncServer::start("secret-token").await;
+    let device = SignedIn::new(&sync, "secret-token");
+    let mut child = device
+        .command(&model, &["app-server"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let frame = |value: serde_json::Value| format!("{value}\n");
+    let tools = serde_json::json!({"tools": [{
+        "name": "browser_read_page",
+        "description": "Read the page in the desktop's browser",
+        "needsApproval": false,
+        "parameters": {"type": "object", "properties": {}},
+    }]});
+    for request in [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/register", "params": tools}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "turn/start", "params": {"text": "watch the page"}}),
+    ] {
+        input.write_all(frame(request).as_bytes()).await.unwrap();
+    }
+
+    let mut asked = Vec::new();
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if message["method"] == "tool/call" {
+                asked.push(message["params"].clone());
+                let answer = serde_json::json!({"jsonrpc": "2.0", "id": message["id"], "result": {
+                    "content": format!("Page snapshot {}", asked.len()),
+                }});
+                input.write_all(frame(answer).as_bytes()).await.unwrap();
+            }
+            if message["method"] == "turn/completed" {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(finished, Ok(true), "the turn should complete");
+    let calls: Vec<_> = asked.iter().map(|call| (call["name"].clone(), call["arguments"].clone())).collect();
+    assert_eq!(
+        calls,
+        vec![(serde_json::Value::from("browser_read_page"), serde_json::json!({})); 3],
+        "every read reaches the front end"
+    );
+
+    let sent = requests.lock().unwrap().clone();
+    assert!(sent.iter().all(|request| !request.contains("Blocked: the same tool call")), "no read is blocked");
+    assert!(sent.iter().any(|request| request.contains("Page snapshot 3")), "the third read reaches the model");
+
+    input
+        .write_all(frame(serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown"})).as_bytes())
+        .await
+        .unwrap();
+    drop(input);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
+}

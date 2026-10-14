@@ -655,12 +655,15 @@ async fn run_turn_inner(
 
             // The repeat-blocker exists to break mutation loops. Inspection is
             // exempt: re-reading a file after editing it uses identical
-            // arguments and is exactly the right thing to do. Runaway reads
-            // are still bounded by `max_steps`.
+            // arguments and is exactly the right thing to do. So are the front
+            // end's tools: they act on state that moves between calls, so
+            // reading the page again after a click, or clicking ref 4 on the
+            // next page, repeats the arguments without repeating the call.
+            // Runaway calls are still bounded by `max_steps`.
             let repeated = repeated_calls.entry(format!("{}\0{}", call.name, call.arguments));
             let repeated = repeated.or_default();
             *repeated += 1;
-            let loop_blocked = *repeated >= 3 && !is_read_only(&call);
+            let loop_blocked = *repeated >= 3 && !is_read_only(&call) && !options.services.is_client_tool(&call.name);
             let requires_approval = tool_requires_approval(&call, &options.services);
             let judge = Judge { model: &safety_model, cache: &safety, workspace: &options.workspace };
             // PLAN and AUTO block a shell command only when it actually changes
