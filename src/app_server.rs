@@ -164,6 +164,9 @@ struct App {
     thread: ThreadState,
     provider: Provider,
     tokens: Arc<crate::provider::TokenLedger>,
+    /// The provider's prompt count at the last usage report, so a reply with
+    /// several tool calls reports once.
+    reported_context: u64,
     mode: AgentMode,
     /// Whether tools may mutate without asking. `acceptForSession` latches it,
     /// the same way the TUI's `/yes` does.
@@ -214,6 +217,7 @@ pub async fn run(
         store,
         provider,
         tokens,
+        reported_context: 0,
         mode,
         allow,
         cancel: Arc::new(AtomicBool::new(false)),
@@ -747,6 +751,38 @@ impl App {
         Ok(())
     }
 
+    /// How full the context window is, as the terminal's meter reckons it:
+    /// the provider's count of the last prompt when it reported one, else an
+    /// estimate from the messages, and the larger of the two, since the
+    /// messages can have grown since that prompt was sent. `tokensUsed` is a
+    /// different quantity, every token the session has spent, and outgrows
+    /// the window on any long session.
+    fn context_tokens(&self) -> u64 {
+        let estimated = (crate::agent::message_chars(&self.thread.messages) / 4) as u64;
+        match self.provider.context_tokens() {
+            0 => estimated,
+            reported => reported.max(estimated),
+        }
+    }
+
+    fn report_usage(&mut self) {
+        self.reported_context = self.provider.context_tokens();
+        notify(
+            "thread/tokenUsage/updated",
+            json!({
+                "threadId": self.thread_id(),
+                "tokensUsed": self.tokens.total(),
+                "contextTokens": self.context_tokens(),
+                "contextWindow": self.config.model_limits.context_window,
+                // The split behind the total: input and output are priced
+                // differently, and cached input an order of magnitude below
+                // uncached, so a client that only renders `tokensUsed` cannot
+                // tell an expensive session from a cheap one.
+                "usage": token_usage(&self.tokens.snapshot()),
+            }),
+        );
+    }
+
     fn thread_snapshot(&self) -> Value {
         json!({
             "threadId": self.thread_id(),
@@ -758,6 +794,7 @@ impl App {
             "reasoningEffort": self.config.reasoning_effort.map(|effort| effort.label()),
             "workspace": self.config.workspace,
             "contextWindow": self.config.model_limits.context_window,
+            "contextTokens": self.context_tokens(),
             "tokensUsed": self.tokens.total(),
             "usage": token_usage(&self.tokens.snapshot()),
             "items": history_items(&self.thread.messages),
@@ -890,6 +927,12 @@ impl App {
                 // A tool call ends whatever text was streaming: the model has
                 // stopped talking and started doing.
                 self.flush_streaming();
+                // It also means a reply just came back, with the size of the
+                // prompt it answered: the context meter moves during a long
+                // turn instead of only at its end.
+                if self.provider.context_tokens() != self.reported_context {
+                    self.report_usage();
+                }
                 // An approval for this tool already opened the item, so that
                 // the prompt could name the call it was about. Reuse it rather
                 // than announcing the same call twice.
@@ -1006,19 +1049,7 @@ impl App {
         if let Some(usage) = &self.usage {
             usage.spawn_report(false);
         }
-        notify(
-            "thread/tokenUsage/updated",
-            json!({
-                "threadId": self.thread_id(),
-                "tokensUsed": self.tokens.total(),
-                "contextWindow": self.config.model_limits.context_window,
-                // The split behind the total: input and output are priced
-                // differently, and cached input an order of magnitude below
-                // uncached, so a client that only renders `tokensUsed` cannot
-                // tell an expensive session from a cheap one.
-                "usage": token_usage(&self.tokens.snapshot()),
-            }),
-        );
+        self.report_usage();
         notify(
             "turn/completed",
             json!({

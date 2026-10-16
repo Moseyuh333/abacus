@@ -668,6 +668,77 @@ async fn app_server_lets_the_front_end_provide_tools() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
 }
 
+/// The meter a front end draws is how full the context is, which stays put
+/// while the session's spending grows with every turn. Reporting the running
+/// total as the context put every long session at 100%.
+#[tokio::test]
+async fn app_server_reports_how_full_the_context_is() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // A prompt far larger than the estimate from the messages, so the
+    // provider's own count is what the meter shows.
+    const PROMPT: u64 = 50_000;
+    fn answer(_request: &str) -> String {
+        let usage = r#"{"choices":[],"usage":{"prompt_tokens":50000,"completion_tokens":34,"total_tokens":50034}}"#;
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"Done.\"}}}}]}}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
+    }
+    let (model, _requests) = scripted_model_endpoint(answer);
+    let sync = sync_server::SyncServer::start("secret-token").await;
+    let device = SignedIn::new(&sync, "secret-token");
+    let mut child = device
+        .command(&model, &["app-server"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let frame = |value: serde_json::Value| format!("{value}\n");
+    input
+        .write_all(
+            frame(serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})).as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let mut reports = Vec::new();
+    for (id, text) in [(2, "first"), (3, "second")] {
+        let start = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "turn/start", "params": {"text": text}});
+        input.write_all(frame(start).as_bytes()).await.unwrap();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut last = serde_json::Value::Null;
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if message["method"] == "thread/tokenUsage/updated" {
+                    last = message["params"].clone();
+                }
+                if message["method"] == "turn/completed" {
+                    return last;
+                }
+            }
+            serde_json::Value::Null
+        })
+        .await
+        .expect("the turn should complete");
+        reports.push(report);
+    }
+
+    for report in &reports {
+        assert_eq!(report["contextTokens"], PROMPT, "the last prompt's size: {report}");
+    }
+    let spent = |report: &serde_json::Value| report["tokensUsed"].as_u64().unwrap();
+    assert!(spent(&reports[0]) > PROMPT, "spending counts the reply as well");
+    assert!(spent(&reports[1]) >= spent(&reports[0]) + PROMPT, "and grows with every turn, unlike the context");
+
+    input
+        .write_all(frame(serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown"})).as_bytes())
+        .await
+        .unwrap();
+    drop(input);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
+}
+
 /// A front end's tool acts on state that moves between calls: reading the page
 /// after each click repeats `browser_read_page {}` exactly, and every one of
 /// those reads has to reach the front end rather than be blocked as a loop.
