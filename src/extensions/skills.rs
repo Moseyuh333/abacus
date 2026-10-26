@@ -213,10 +213,13 @@ impl SkillRegistry {
         };
         for entry in entries.flatten() {
             let candidate = entry.path();
+            // A skill directory may be a symlink to one kept elsewhere — skill
+            // managers install that way — so it is followed here. What the
+            // skill can read stays confined to the directory it resolves to.
             let Ok(candidate) = candidate.canonicalize() else {
                 continue;
             };
-            if !candidate.starts_with(&canonical_root) || !candidate.is_dir() {
+            if !candidate.is_dir() {
                 continue;
             }
             match load_skill(&candidate, source) {
@@ -390,5 +393,28 @@ mod tests {
         let resource =
             registry.execute("skill_read", r#"{"name":"review-helper","path":"references/checks.md"}"#).unwrap();
         assert_eq!(resource, "Check errors.");
+    }
+
+    /// Skill managers keep one copy of a skill and symlink it into each
+    /// agent's skills directory; the link used to resolve outside the root and
+    /// was dropped without a word.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_skill_directory_is_discovered() {
+        let dir = tempdir().unwrap();
+        let home = AbacusPaths::under(dir.path().join("home"));
+        let store = dir.path().join("store/linked-helper");
+        fs::create_dir_all(store.join("references")).unwrap();
+        fs::write(store.join("SKILL.md"), "---\nname: linked-helper\ndescription: Lives elsewhere.\n---\nBody.\n")
+            .unwrap();
+        fs::write(store.join("references/notes.md"), "Notes.").unwrap();
+        fs::create_dir_all(home.root.join("skills")).unwrap();
+        std::os::unix::fs::symlink(&store, home.root.join("skills/linked-helper")).unwrap();
+
+        let registry = SkillRegistry::discover(&home, dir.path(), &[], &[]);
+        assert!(registry.prompt_index().contains("Lives elsewhere"), "{:?}", registry.diagnostics);
+        let resource =
+            registry.execute("skill_read", r#"{"name":"linked-helper","path":"references/notes.md"}"#).unwrap();
+        assert_eq!(resource, "Notes.");
     }
 }
