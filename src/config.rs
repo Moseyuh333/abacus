@@ -942,6 +942,18 @@ pub struct UiSettings {
     /// always-on behaviour.
     #[serde(default = "default_true")]
     pub draft_replies: bool,
+    /// The widest the transcript and composer are drawn, in columns; a wider
+    /// terminal centres them. 0 uses the whole terminal.
+    pub content_width: u16,
+    /// How many lines the composer grows to before it scrolls.
+    pub composer_rows: u16,
+}
+
+impl UiSettings {
+    /// The column cap to centre content at, with 0 meaning no cap.
+    pub fn content_columns(&self) -> u16 {
+        if self.content_width == 0 { u16::MAX } else { self.content_width }
+    }
 }
 
 fn default_true() -> bool {
@@ -1015,6 +1027,8 @@ impl Default for UiSettings {
             safety_uses_main: false,
             show_token_rate: false,
             draft_replies: true,
+            content_width: 112,
+            composer_rows: 10,
         }
     }
 }

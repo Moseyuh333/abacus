@@ -12,12 +12,18 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // Measuring the frame instead counted fewer wrapped rows than were
     // rendered, so past a certain draft length the box stopped growing and the
     // earlier lines scrolled out of sight.
-    let composer_text_width = area.width.min(CONTENT_COLUMNS).saturating_sub(6).max(1) as usize;
+    let columns = app.settings.ui.content_columns();
+    let composer_text_width = area.width.min(columns).saturating_sub(6).max(1) as usize;
     app.composer_width = composer_text_width as u16;
-    let input_height = (app.input.wrapped_line_count(composer_text_width) as u16 + 2).clamp(3, 12);
     let task_height = u16::from(app.state.goal.snapshot().is_some() || app.ralph_loop.is_some()) * 2
         + u16::from(!app.state.tasks.is_empty())
         + app.hive.board.strip_rows();
+    // The composer grows to its configured height, but never so far that the
+    // transcript loses its last three rows.
+    let most = (app.settings.ui.composer_rows.saturating_add(2))
+        .min(area.height.saturating_sub(2 + 3 + task_height + 1))
+        .max(3);
+    let input_height = (app.input.wrapped_line_count(composer_text_width) as u16 + 2).clamp(3, most);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -30,14 +36,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .split(area);
 
     draw_header(frame, chunks[0], app);
-    let transcript = ui::measure(chunks[1], CONTENT_COLUMNS);
+    let transcript = ui::measure(chunks[1], columns);
     draw_transcript(frame, transcript, app);
     if task_height > 0 {
-        draw_task_bar(frame, ui::measure(chunks[2], CONTENT_COLUMNS), app);
+        draw_task_bar(frame, ui::measure(chunks[2], columns), app);
     }
-    let input = ui::measure(chunks[3], CONTENT_COLUMNS);
+    let input = ui::measure(chunks[3], columns);
     draw_input(frame, input, app);
-    draw_footer(frame, ui::measure(chunks[4], CONTENT_COLUMNS), app);
+    draw_footer(frame, ui::measure(chunks[4], columns), app);
     draw_completion_popup(frame, input, app);
     // The picker is checked first because it can be opened *from* the config
     // panel; behind it, the panel would be drawn over its own child and the

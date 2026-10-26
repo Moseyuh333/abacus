@@ -75,14 +75,18 @@ fn restoring_the_terminal_is_idempotent_and_claim_gated() {
 /// of sight — 320 characters rendered into a box with room for 214.
 #[test]
 fn composer_height_is_measured_at_the_width_it_is_drawn_at() {
-    // The two must agree for every terminal width, narrow or wide.
-    for frame_width in [40_u16, 80, 112, 150, 300] {
-        let measured = frame_width.min(CONTENT_COLUMNS).saturating_sub(6).max(1);
-        let drawn = ui::measure(Rect { x: 0, y: 0, width: frame_width, height: 10 }, CONTENT_COLUMNS)
-            .width
-            .saturating_sub(6)
-            .max(1);
-        assert_eq!(measured, drawn, "at {frame_width} columns the composer measures {measured} but draws {drawn}");
+    // The two must agree for every terminal width, narrow or wide, with the
+    // default cap and with none.
+    for content_width in [112_u16, 0] {
+        let columns = crate::config::UiSettings { content_width, ..Default::default() }.content_columns();
+        for frame_width in [40_u16, 80, 112, 150, 300] {
+            let measured = frame_width.min(columns).saturating_sub(6).max(1);
+            let drawn = ui::measure(Rect { x: 0, y: 0, width: frame_width, height: 10 }, columns)
+                .width
+                .saturating_sub(6)
+                .max(1);
+            assert_eq!(measured, drawn, "at {frame_width} columns the composer measures {measured} but draws {drawn}");
+        }
     }
 }
 
@@ -2881,4 +2885,43 @@ async fn read_http_request(stream: &mut TcpStream) -> String {
         }
     }
     String::from_utf8(buffer).unwrap()
+}
+
+/// Content width and composer height are settings: `full` drops the centred
+/// cap, and a taller composer shows more of a long draft at once.
+#[test]
+fn content_width_and_composer_height_follow_the_settings() {
+    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
+    let edit = |app: &mut App, key, text: &str| {
+        let mut input = InputBuffer::new();
+        input.insert_str(text);
+        app.config_panel = Some(ConfigPanel { selected: 0, editing: Some((key, input)) });
+        app.commit_config_edit();
+    };
+    edit(&mut app, ConfigKey::ContentWidth, "full");
+    assert_eq!(app.settings.ui.content_width, 0);
+    assert_eq!(app.config_value(ConfigKey::ContentWidth), "full");
+    edit(&mut app, ConfigKey::ContentWidth, "10");
+    assert_eq!(app.settings.ui.content_width, 0, "too narrow is refused");
+    edit(&mut app, ConfigKey::ComposerRows, "20");
+    assert_eq!(app.settings.ui.composer_rows, 20);
+    edit(&mut app, ConfigKey::ComposerRows, "0");
+    assert_eq!(app.settings.ui.composer_rows, 20, "out of range is refused");
+    app.config_panel = None;
+
+    // Thirty lines and the cursor on the empty one after them: twenty rows
+    // show nineteen of the lines, where the default ten showed nine.
+    app.input.insert_str(&"zq\n".repeat(30));
+    let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert_eq!(app.composer_width, 194, "the whole terminal, less the composer's frame");
+    let rendered = buffer_text(terminal.backend().buffer(), 200, 40);
+    assert_eq!(rendered.lines().filter(|row| row.contains("zq")).count(), 19, "{rendered}");
+
+    // A composer taller than the terminal still leaves the transcript room.
+    app.settings.ui.composer_rows = 100;
+    let mut short = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    short.draw(|frame| draw(frame, &mut app)).unwrap();
+    let rendered = buffer_text(short.backend().buffer(), 80, 16);
+    assert_eq!(rendered.lines().filter(|row| row.contains("zq")).count(), 7, "{rendered}");
 }

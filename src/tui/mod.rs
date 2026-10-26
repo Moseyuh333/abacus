@@ -319,6 +319,8 @@ enum ConfigKey {
     MaxOutput,
     Theme,
     Glyphs,
+    ContentWidth,
+    ComposerRows,
     VimMode,
     ShowThinking,
     TokenRate,
@@ -1016,9 +1018,6 @@ fn git_branch(workspace: &std::path::Path) -> Option<String> {
 
 /// Columns held back for the scrollbar: one blank gap, one track.
 const SCROLLBAR_COLUMNS: u16 = 2;
-
-/// Content is centred and capped at this width on wide terminals.
-const CONTENT_COLUMNS: u16 = 112;
 
 /// The slice of a tool result kept for expansion, bounded so one enormous
 /// result cannot grow the session's footprint without limit.

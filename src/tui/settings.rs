@@ -130,6 +130,16 @@ pub(super) const SETTINGS: &[(&str, &[Setting])] = &[
                 "Glyphs",
                 "Which glyph set to draw with. `nerd` needs a patched font installed, so it is never chosen for you.",
             ),
+            typed(
+                ConfigKey::ContentWidth,
+                "Content width",
+                "The widest the transcript and composer are drawn, in columns; a wider terminal centres them. `full` uses the whole terminal.",
+            ),
+            typed(
+                ConfigKey::ComposerRows,
+                "Input box height",
+                "How many lines the composer grows to before it scrolls.",
+            ),
             toggled(
                 ConfigKey::VimMode,
                 "Vim keybindings",
@@ -668,6 +678,32 @@ impl App {
                     Ok(())
                 })
             }
+            ConfigKey::ContentWidth => {
+                let trimmed = value.trim();
+                if matches!(trimmed.to_ascii_lowercase().as_str(), "full" | "0") {
+                    self.settings.ui.content_width = 0;
+                    Ok(())
+                } else {
+                    trimmed.parse::<u16>().context("content width must be a number of columns, or full").and_then(
+                        |columns| {
+                            if !(40..=1000).contains(&columns) {
+                                bail!("content width must be between 40 and 1000 columns, or full");
+                            }
+                            self.settings.ui.content_width = columns;
+                            Ok(())
+                        },
+                    )
+                }
+            }
+            ConfigKey::ComposerRows => {
+                value.trim().parse::<u16>().context("input box height must be a number of lines").and_then(|rows| {
+                    if !(1..=100).contains(&rows) {
+                        bail!("input box height must be between 1 and 100 lines");
+                    }
+                    self.settings.ui.composer_rows = rows;
+                    Ok(())
+                })
+            }
             ConfigKey::FeedbackEndpoint => crate::feedback::FeedbackClient::new(value.trim()).map(|_| {
                 self.settings.feedback.endpoint = value.trim().to_owned();
             }),
@@ -760,6 +796,11 @@ impl App {
                     choice.label().to_owned()
                 }
             }
+            ConfigKey::ContentWidth => match self.settings.ui.content_width {
+                0 => "full".to_owned(),
+                columns => columns.to_string(),
+            },
+            ConfigKey::ComposerRows => self.settings.ui.composer_rows.to_string(),
             ConfigKey::VimMode => on_off(self.settings.ui.vim_mode),
             ConfigKey::ShowThinking => on_off(self.settings.ui.show_thinking),
             ConfigKey::TokenRate => on_off(self.settings.ui.show_token_rate),
