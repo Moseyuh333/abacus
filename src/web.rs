@@ -186,6 +186,29 @@ impl WebConfig {
             .map_err(|error| anyhow!("could not build HTTP client: {error}"))
     }
 
+    /// The client for a page the model asked for. Each connection resolves
+    /// through `PublicOnly` and each redirect is checked before it is
+    /// followed, so neither a name that points at a private address nor a hop
+    /// to one reaches the local network. Searching keeps the plain client: a
+    /// SearXNG instance on localhost is an ordinary setup.
+    fn page_client(&self) -> Result<reqwest::Client> {
+        reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(REQUEST_TIMEOUT)
+            .dns_resolver(std::sync::Arc::new(PublicOnly))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= MAX_REDIRECTS {
+                    attempt.error("too many redirects")
+                } else if let Err(error) = validate_public_url(attempt.url().as_str()) {
+                    attempt.error(error.to_string())
+                } else {
+                    attempt.follow()
+                }
+            }))
+            .build()
+            .map_err(|error| anyhow!("could not build HTTP client: {error}"))
+    }
+
     /// Search, and with `extract` also open the top results and answer from
     /// them. Without it the behaviour is unchanged: a list to follow up on.
     ///
@@ -396,8 +419,14 @@ impl WebConfig {
 
     async fn fetch_page(&self, url: &str, max_chars: usize) -> Result<String> {
         let url = validate_public_url(url)?;
+        // The check above reads the name; this one looks at where it points,
+        // and fails fast with a clear reason. The resolver repeats it for every
+        // connection, so a lookup that changes in between gains nothing.
+        if let Some(domain) = url.domain() {
+            public_addrs(domain).await?;
+        }
         let max_chars = if max_chars == 0 { MAX_PAGE_CHARS } else { max_chars.clamp(1_000, 200_000) };
-        let client = self.client()?;
+        let client = self.page_client()?;
         let response = send_with_retry(
             client
                 .get(url.clone())
@@ -731,11 +760,12 @@ fn validate_public_url(raw: &str) -> Result<reqwest::Url> {
 }
 
 fn is_private_host(host: &str) -> bool {
-    use std::net::IpAddr;
     let candidate = host.trim_start_matches('[').trim_end_matches(']');
-    let Ok(ip) = candidate.parse::<IpAddr>() else {
-        return false;
-    };
+    candidate.parse::<std::net::IpAddr>().is_ok_and(is_private_ip)
+}
+
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
     match ip {
         IpAddr::V4(v4) => {
             v4.is_loopback()
@@ -752,7 +782,39 @@ fn is_private_host(host: &str) -> bool {
                 // Unique-local (fc00::/7) and link-local (fe80::/10).
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // ::ffff:127.0.0.1 reaches 127.0.0.1.
+                || v6.to_ipv4_mapped().is_some_and(|v4| is_private_ip(IpAddr::V4(v4)))
         }
+    }
+}
+
+/// Redirects a page fetch follows before giving up, as many as reqwest's own
+/// default.
+const MAX_REDIRECTS: usize = 10;
+
+/// Resolve `host`, refusing it when any of its addresses is private.
+async fn public_addrs(host: &str) -> Result<Vec<std::net::SocketAddr>> {
+    let addrs: Vec<_> = tokio::net::lookup_host((host, 0))
+        .await
+        .map_err(|error| anyhow!("could not resolve {host}: {error}"))?
+        .collect();
+    if addrs.iter().any(|addr| is_private_ip(addr.ip())) {
+        bail!("refusing to fetch a private or loopback address: {host} resolves to one");
+    }
+    Ok(addrs)
+}
+
+/// The page client's resolver. A name check alone let a public-looking host
+/// that resolves to 127.0.0.1 or 169.254.169.254 straight through.
+struct PublicOnly;
+
+impl reqwest::dns::Resolve for PublicOnly {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs = public_addrs(&host).await?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
@@ -1086,6 +1148,31 @@ mod tests {
         assert!(validate_public_url("http://10.0.0.5").is_err());
         assert!(validate_public_url("file:///etc/passwd").is_err());
         assert!(validate_public_url("https://metadata.google.internal/").is_err());
+        assert!(validate_public_url("http://[::ffff:127.0.0.1]/").is_err());
+    }
+
+    #[test]
+    fn private_addresses_are_recognised_in_every_spelling() {
+        for private in [
+            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.0.1", "169.254.169.254", "0.0.0.0", "::1", "fc00::1",
+            "fe80::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+        ] {
+            assert!(is_private_ip(private.parse().unwrap()), "{private}");
+        }
+        for public in ["8.8.8.8", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
+            assert!(!is_private_ip(public.parse().unwrap()), "{public}");
+        }
+    }
+
+    /// `localhost` resolves without a network. The URL check stops it by name;
+    /// here it is stopped by the address it resolves to, which is what catches
+    /// a public-looking name pointed at a private one.
+    #[tokio::test]
+    async fn a_name_that_resolves_to_a_private_address_is_refused() {
+        let error = public_addrs("localhost").await.unwrap_err();
+        assert!(error.to_string().contains("private or loopback"), "{error}");
+        let resolved = reqwest::dns::Resolve::resolve(&PublicOnly, "localhost".parse().unwrap()).await;
+        assert!(resolved.is_err());
     }
 
     #[test]
