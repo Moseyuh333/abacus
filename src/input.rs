@@ -1,3 +1,5 @@
+use unicode_width::UnicodeWidthChar;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Insert,
@@ -225,13 +227,25 @@ impl InputBuffer {
         }
         let mut start = 0;
         while start < line.len() {
-            if line.len() - start <= width {
+            // Fill the row by terminal cells, not chars: a CJK character takes
+            // two, so counting chars overfilled each row and the drawn text was
+            // cut off at the right edge. Every row takes at least one char.
+            let mut cells = 0;
+            let mut hard = start;
+            while hard < line.len() {
+                let next = line[hard].width().unwrap_or(0);
+                if cells + next > width && hard > start {
+                    break;
+                }
+                cells += next;
+                hard += 1;
+            }
+            if hard == line.len() {
                 rows.push((offset + start, offset + line.len()));
                 return;
             }
             // Break at the last space inside the window, so words stay whole;
             // a single long token is cut at the edge rather than overflowing.
-            let hard = start + width;
             let split = line[start..hard]
                 .iter()
                 .rposition(|&ch| ch == ' ')
@@ -399,6 +413,23 @@ mod tests {
         buffer.insert_str(&"x".repeat(25));
         let rows = buffer.wrapped_rows(10);
         assert_eq!(rows.len(), 3, "hard-broken when there is no space");
+    }
+
+    /// Wide characters fill a row twice as fast; wrapping by char count let a
+    /// row of Chinese run past the composer's edge, where it was cut off.
+    #[test]
+    fn wide_characters_wrap_by_display_width() {
+        use unicode_width::UnicodeWidthStr;
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str(&"中文".repeat(10));
+        let rows = buffer.wrapped_rows(10);
+        assert_eq!(rows.len(), 4, "20 wide chars are 40 cells: four rows of 10");
+        for &(start, end) in &rows {
+            let row: String = buffer.chars[start..end].iter().collect();
+            assert!(row.width() <= 10, "row {row:?} is wider than the composer");
+        }
+        // A width narrower than one wide char still makes progress.
+        assert_eq!(buffer.wrapped_rows(1).len(), 20);
     }
 
     #[test]
