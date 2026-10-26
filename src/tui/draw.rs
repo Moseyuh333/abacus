@@ -967,6 +967,7 @@ pub(super) fn draw_help(frame: &mut Frame<'_>, area: Rect) {
             "SESSION",
             &[
                 ("Shift+Tab", "cycle AUTO / PLAN / BUILD"),
+                ("Ctrl+T", "cycle reasoning effort: auto, low, medium, high"),
                 ("Ctrl+C", "interrupt the turn; twice to exit"),
                 ("Ctrl+Q", "quit"),
             ],

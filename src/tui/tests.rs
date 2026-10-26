@@ -2925,3 +2925,24 @@ fn content_width_and_composer_height_follow_the_settings() {
     let rendered = buffer_text(short.backend().buffer(), 80, 16);
     assert_eq!(rendered.lines().filter(|row| row.contains("zq")).count(), 7, "{rendered}");
 }
+
+/// Ctrl+T steps the effort without typing /effort: up the ladder from auto,
+/// back to auto after high, and a level set off the ladder rejoins it.
+#[tokio::test]
+async fn ctrl_t_cycles_the_reasoning_effort() {
+    use crate::config::ReasoningEffort;
+    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        seen.push(app.config.reasoning_effort);
+    }
+    use ReasoningEffort::{High, Low, Medium};
+    assert_eq!(seen, [Some(Low), Some(Medium), Some(High), None]);
+    assert!(app.status.contains("auto"), "{}", app.status);
+    assert_eq!(app.config_value(ConfigKey::Effort), "auto", "saved to the profile");
+
+    assert!(app.slash_command("/effort max"));
+    handle_key(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    assert_eq!(app.config.reasoning_effort, None);
+}

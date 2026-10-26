@@ -85,6 +85,9 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) {
             app.hive_scroll = 0;
             return;
         }
+        // Ctrl+T steps the reasoning effort, so trying a harder or cheaper
+        // setting does not mean typing /effort each time.
+        KeyCode::Char('t') if ctrl(key, 't') && !dialog_open && !editing_form => return app.cycle_effort(),
         _ => {}
     }
 

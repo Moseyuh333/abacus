@@ -293,6 +293,24 @@ impl App {
         }
     }
 
+    /// Ctrl+T: step the effort through auto → low → medium → high and back to
+    /// auto. A level off that ladder, set with /effort, steps to the next rung.
+    pub(super) fn cycle_effort(&mut self) {
+        use crate::config::ReasoningEffort;
+        let next = match self.config.reasoning_effort {
+            None | Some(ReasoningEffort::Minimal) => Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Low) => Some(ReasoningEffort::Medium),
+            Some(ReasoningEffort::Medium) => Some(ReasoningEffort::High),
+            Some(ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max) => None,
+        };
+        if let Ok(profile) = self.active_profile_mut() {
+            profile.reasoning_effort = next;
+        }
+        let result = self.save_and_apply_settings();
+        let label = next.map_or("auto", ReasoningEffort::label);
+        self.report(result, format!("effort {label}"), "configuration error");
+    }
+
     pub(super) fn model_command(&mut self, model: &str) {
         if model.is_empty() {
             return self.say(format!(
