@@ -17,6 +17,7 @@ use tokio::{
 
 use crate::{
     config::{Config, ProviderProtocol},
+    providers::Connection,
     tool_format::{self, ToolFormat},
     tools::ToolCall,
 };
@@ -24,9 +25,13 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Provider {
     client: Client,
+    /// The provider: auth, extra headers and body overrides, applied per
+    /// request.
+    connection: Connection,
+    /// Where completions are posted, from `connection`.
     endpoint: String,
-    api_key: Option<String>,
     model: String,
+    /// The wire format, from `connection`.
     protocol: ProviderProtocol,
     max_output_tokens: Option<usize>,
     tool_format: ToolFormat,
@@ -56,9 +61,6 @@ pub struct Provider {
     /// Prompt tokens from the most recent reply — how full the window actually
     /// was, as measured by the provider rather than estimated from characters.
     context_tokens: Arc<AtomicU64>,
-    /// A custom endpoint definition (URL already folded into `endpoint`): its
-    /// auth, extra headers, and body overrides are applied per request.
-    scripted: Option<crate::endpoint::ScriptedEndpoint>,
     /// `max_tokens` for the Anthropic protocol, which requires it and has no
     /// default. The configured/detected cap when set, else a safe fallback.
     anthropic_max_tokens: usize,
@@ -173,10 +175,10 @@ impl Provider {
             .context("could not create HTTP client")?;
         Ok(Self {
             client,
-            endpoint: config.endpoint(),
-            api_key: config.api_key.clone(),
+            endpoint: config.connection.request_url(),
+            connection: config.connection.clone(),
             model: config.model.clone(),
-            protocol: config.protocol,
+            protocol: config.connection.protocol,
             max_output_tokens: config.model_limits.configured_output_tokens,
             tool_format: config.tool_format,
             ledger,
@@ -185,7 +187,6 @@ impl Provider {
             learned_output_cap: Arc::new(AtomicU64::new(0)),
             strips_reasoning: Arc::new(AtomicBool::new(false)),
             context_tokens: Arc::new(AtomicU64::new(0)),
-            scripted: config.endpoint.clone(),
             // A configured/detected cap when there is one, else a value that is
             // safe on every current Claude model without a beta output header.
             anthropic_max_tokens: config
@@ -281,7 +282,7 @@ impl Provider {
     }
 
     /// A sibling provider that differs only in the model — same endpoint,
-    /// auth, protocol, and scripted config. For the auxiliary model used by
+    /// auth, protocol, and provider settings. For the auxiliary model used by
     /// secondary calls (refine, drafts, tether, compaction). The billing
     /// counter is shared so aux calls count toward the session total; the
     /// context-size gauge is fresh so an aux call over the whole history does
@@ -290,19 +291,52 @@ impl Provider {
         Provider { model: model.to_owned(), context_tokens: Arc::new(AtomicU64::new(0)), ..self.clone() }
     }
 
-    /// This provider for a role: on the role's model when one is assigned and
-    /// differs from the current one, otherwise as it is.
-    pub fn for_role(&self, assigned: Option<&str>) -> Provider {
+    /// This provider for a role: on the role's model when one is assigned —
+    /// on whichever provider it is — otherwise as it is.
+    pub fn for_role(&self, assigned: Option<&crate::config::Target>) -> Provider {
         match assigned {
-            Some(model) if !model.trim().is_empty() && model != self.model => self.with_model(model),
-            _ => self.clone(),
+            None => self.clone(),
+            Some(target) if target.connection.same_endpoint(&self.connection) => {
+                if target.model == self.model {
+                    self.clone()
+                } else {
+                    self.with_model(&target.model)
+                }
+            }
+            Some(target) => self.on_connection(&target.connection, &target.model),
+        }
+    }
+
+    /// A sibling on another provider. The ledger, session id and stream gate
+    /// carry over — it is the same session — but everything learned about
+    /// what the endpoint accepts starts over, since it was learned about this
+    /// one. The output cap is left to the server: the configured one belongs
+    /// to the main model.
+    fn on_connection(&self, connection: &Connection, model: &str) -> Provider {
+        Provider {
+            endpoint: connection.request_url(),
+            protocol: connection.protocol,
+            connection: connection.clone(),
+            model: model.to_owned(),
+            max_output_tokens: None,
+            tool_format: ToolFormat::default(),
+            routing: crate::config::Routing::default(),
+            prefers_max_completion_tokens: Arc::new(AtomicBool::new(false)),
+            learned_output_cap: Arc::new(AtomicU64::new(0)),
+            strips_reasoning: Arc::new(AtomicBool::new(false)),
+            context_tokens: Arc::new(AtomicU64::new(0)),
+            anthropic_max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            prefers_adaptive_thinking: Arc::new(AtomicBool::new(false)),
+            prefers_leading_system: Arc::new(AtomicBool::new(false)),
+            caches_prompt: Arc::new(AtomicBool::new(self.caches_prompt.load(Ordering::Relaxed))),
+            ..self.clone()
         }
     }
 
     /// Carry `previous`'s session id onto this freshly built provider.
     ///
     /// The id is what hosts that route by conversation are told (see
-    /// `opencode_session`, and `{uuid}` in a scripted endpoint's headers), so
+    /// `opencode_session`, and `{session}` in a provider's headers), so
     /// a mid-session model or settings change — which rebuilds the provider —
     /// must not make the same conversation look like a new one.
     pub fn adopt_session(&mut self, previous: &Provider) {
@@ -362,10 +396,10 @@ impl Provider {
                 (self.anthropic_body(messages, tools), Assembly::anthropic_event, self.tool_format)
             }
         };
-        // Scripted overrides win over everything Abacus put in the body, and
-        // its removals fire last — a required `store: false` or a rejected
-        // `parallel_tool_calls` is honoured no matter what was built above.
-        self.apply_scripted_body(&mut body);
+        // The provider's overrides win over everything Abacus put in the
+        // body, and its removals fire last — a required `store: false` or a
+        // rejected `parallel_tool_calls` is honoured whatever was built above.
+        self.connection.apply_to_body(&mut body);
         let Some(response) = self.send(&mut body, messages, cancel).await? else {
             return Ok(Completion::cancelled());
         };
@@ -475,7 +509,7 @@ impl Provider {
         } else if anthropic && is_manual_thinking_rejection(error) && first(&self.prefers_adaptive_thinking) {
             if let Some(effort) = self.reasoning_effort {
                 self.apply_anthropic_thinking(body, effort);
-                self.apply_scripted_body(body);
+                self.connection.apply_to_body(body);
             }
         // "max_tokens is too large: N. This model supports at most M…" —
         // detection over-reported (an upstream echoing its context window as
@@ -569,7 +603,7 @@ impl Provider {
         let (system, converted) = self.anthropic_messages(messages);
         let mut body = json!({
             "model": self.model,
-            // Required, no default; scripted body may override it.
+            // Required, no default; a provider's body may override it.
             "max_tokens": self.effective_output_tokens().unwrap_or(self.anthropic_max_tokens),
             "system": system,
             "messages": converted,
@@ -589,7 +623,7 @@ impl Provider {
     fn anthropic_messages(&self, messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
         anthropic_messages(
             &self.sanitized_messages(messages),
-            self.scripted.as_ref().and_then(|scripted| scripted.system_prefix.as_deref()),
+            self.connection.system_prefix.as_deref(),
             self.caches_prompt.load(Ordering::Relaxed),
         )
     }
@@ -622,16 +656,11 @@ impl Provider {
     /// reject a request that carries no session id with
     /// `400 MissingSessionID`. Matched on the host, like `routes_upstream`, so
     /// a profile simply pointed at the gateway works without extra setup.
-    /// A scripted endpoint that sets the header itself stays authoritative —
-    /// reqwest appends repeated headers, so sending ours too would put two
-    /// values on the wire.
+    /// A provider that sets the header itself stays authoritative — reqwest
+    /// appends repeated headers, so sending ours too would put two values on
+    /// the wire.
     fn opencode_session(&self) -> Option<&str> {
-        if !self.endpoint.contains("opencode.ai") {
-            return None;
-        }
-        if let Some(scripted) = &self.scripted
-            && scripted.sets_header(OPENCODE_SESSION_HEADER)
-        {
+        if !self.endpoint.contains("opencode.ai") || self.connection.sets_header(OPENCODE_SESSION_HEADER) {
             return None;
         }
         Some(&self.session_id)
@@ -685,48 +714,30 @@ impl Provider {
         self.prefers_adaptive_thinking.load(Ordering::Relaxed) || !is_legacy_thinking_model(&self.model)
     }
 
-    /// Fold in a scripted endpoint's body overrides and removals, if any.
-    fn apply_scripted_body(&self, body: &mut Value) {
-        if let Some(scripted) = &self.scripted {
-            scripted.apply_to_body(body);
-        }
-    }
-
     async fn post_stream(&self, body: &Value) -> Result<reqwest::Response> {
         let mut attempt = 0_u32;
         let response = loop {
             attempt += 1;
             let mut request = self.client.post(&self.endpoint).header(header::ACCEPT, "text/event-stream").json(&body);
             // The Messages API requires a version header on every request.
-            if self.protocol == ProviderProtocol::Anthropic {
-                request = request.header("anthropic-version", "2023-06-01");
+            if self.protocol == ProviderProtocol::Anthropic && !self.connection.sets_header("anthropic-version") {
+                request = request.header("anthropic-version", crate::providers::ANTHROPIC_VERSION);
             }
             // OpenCode's gateways want the conversation named on every request.
             if let Some(session) = self.opencode_session() {
                 request = request.header(OPENCODE_SESSION_HEADER, session);
             }
-            let mut scripted_auth = false;
-            if let Some(scripted) = &self.scripted {
-                for (name, value) in scripted.resolved_headers(&self.session_id) {
-                    request = request.header(name.as_str(), value);
-                }
-                match scripted.auth_header() {
-                    Ok(Some((name, value))) => {
-                        request = request.header(name.as_str(), value);
-                        scripted_auth = true;
-                    }
-                    Ok(None) => {}
-                    Err(error) => return Err(error).context("scripted endpoint auth"),
-                }
+            for (name, value) in self.connection.resolved_headers(&self.session_id) {
+                request = request.header(name.as_str(), value);
             }
-            if !scripted_auth && let Some(key) = &self.api_key {
-                // Anthropic authenticates an API key with `x-api-key`, not a
-                // bearer; a scripted OAuth endpoint provides its own header.
-                if self.protocol == ProviderProtocol::Anthropic {
-                    request = request.header("x-api-key", key.as_str());
-                } else {
-                    request = request.bearer_auth(key);
-                }
+            // Resolved per request: a token command or file is how a token
+            // that refreshes stays current. Which header carries it, and how,
+            // is the provider's — `x-api-key` for an Anthropic key, a bearer
+            // for everything else unless it says otherwise.
+            match self.connection.auth() {
+                Ok(Some((name, value))) => request = request.header(name.as_str(), value),
+                Ok(None) => {}
+                Err(error) => return Err(error).context("provider auth"),
             }
             match request.send().await {
                 Ok(response)
@@ -1975,14 +1986,9 @@ mod tests {
         // Every other endpoint is left alone.
         assert_eq!(provider_for("https://api.openai.com/v1").opencode_session(), None);
 
-        // A scripted endpoint that sets the header itself stays authoritative,
-        // so the request carries one value rather than two.
-        provider.scripted = Some(
-            serde_yaml::from_str(
-                "url: https://opencode.ai/zen/go/v1/chat/completions\nheaders:\n  X-OpenCode-Session: mine\n",
-            )
-            .unwrap(),
-        );
+        // A provider that sets the header itself stays authoritative, so the
+        // request carries one value rather than two.
+        provider.connection.headers = vec![("X-OpenCode-Session".to_owned(), "mine".to_owned())];
         assert_eq!(provider.opencode_session(), None);
     }
 
@@ -1992,9 +1998,8 @@ mod tests {
     fn anthropic_thinking_body_matches_the_model_generation() {
         fn provider_for(model: &str) -> Provider {
             let directory = tempfile::tempdir().unwrap();
-            let config = Config {
+            let mut config = Config {
                 profile: "test".into(),
-                protocol: ProviderProtocol::Anthropic,
                 max_steps: 8,
                 no_session: true,
                 ..Config::for_endpoint(
@@ -2004,6 +2009,7 @@ mod tests {
                     crate::config::AbacusPaths::under(directory.path().join("home")),
                 )
             };
+            config.connection.protocol = ProviderProtocol::Anthropic;
             Provider::new(&config).unwrap()
         }
 

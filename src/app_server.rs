@@ -40,8 +40,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    agent::{AgentEvent, AgentMode, ApprovalDecision, DoneReason, TurnOptions, UserAnswer, initial_messages, run_turn},
-    config::{Config, Settings},
+    agent::{AgentEvent, ApprovalDecision, DoneReason, TurnOptions, UserAnswer, initial_messages, run_turn},
+    config::{Config, Credentials, Permission, Settings},
     provider::Provider,
     services::AgentServices,
     session::{Session, SessionState, SessionStore},
@@ -121,7 +121,7 @@ impl ThreadState {
             Session::new(
                 config.workspace.clone(),
                 config.profile.clone(),
-                config.model.clone(),
+                config.model_ref(),
                 initial_messages(&config.workspace),
             )
         });
@@ -159,6 +159,8 @@ impl OpenItem {
 struct App {
     config: Config,
     settings: Settings,
+    /// Read when a provider or profile changes, written when a key is pasted.
+    credentials: Credentials,
     services: Arc<AgentServices>,
     store: Option<SessionStore>,
     thread: ThreadState,
@@ -167,10 +169,9 @@ struct App {
     /// The provider's prompt count at the last usage report, so a reply with
     /// several tool calls reports once.
     reported_context: u64,
-    mode: AgentMode,
-    /// Whether tools may mutate without asking. `acceptForSession` latches it,
-    /// the same way the TUI's `/yes` does.
-    allow: Arc<AtomicBool>,
+    /// YOLO when set, AUTO otherwise. Shared with the running turn, so a
+    /// switch applies from its next tool call.
+    yolo: Arc<AtomicBool>,
     /// Raised to ask the running turn to wind down. Replaced per turn.
     cancel: Arc<AtomicBool>,
     turn_id: Option<String>,
@@ -204,22 +205,21 @@ pub async fn run(
     let tokens =
         Arc::new(crate::provider::TokenLedger::new(session.as_ref().map(|value| value.tokens_used).unwrap_or(0)));
     let provider = Provider::with_tokens(&config, tokens.clone())?;
-    let allow = Arc::new(AtomicBool::new(config.yes));
-    let mode = config.mode.unwrap_or(AgentMode::Auto);
-    let credentials = crate::config::Credentials::load(&config.paths).unwrap_or_default();
+    let yolo = Arc::new(AtomicBool::new(config.permission == Permission::Yolo));
+    let credentials = Credentials::load(&config.paths).unwrap_or_default();
     let usage = UsageReporter::new(&config.paths, &credentials, "app-server");
     let hive = crate::hive::HiveHandle::load(config.paths.hive_file.clone());
     let mut app = App {
         thread: ThreadState::new(&config, session),
         config,
         settings,
+        credentials: credentials.clone(),
         services,
         store,
         provider,
         tokens,
         reported_context: 0,
-        mode,
-        allow,
+        yolo,
         cancel: Arc::new(AtomicBool::new(false)),
         turn_id: None,
         open_items: HashMap::new(),
@@ -395,6 +395,11 @@ impl App {
                 "protocolVersion": PROTOCOL_VERSION,
                 "serverInfo": {"name": "abacus", "version": env!("CARGO_PKG_VERSION")},
                 "workspace": self.config.workspace,
+                // No provider yet: the front end walks the person through
+                // `presets/list`, `provider/save` and `profile/save` before
+                // the first turn.
+                "needsSetup": !self.config.is_configured(),
+                "modes": ["auto", "yolo"],
                 "capabilities": {
                     "threads": true,
                     "approvals": true,
@@ -416,6 +421,13 @@ impl App {
                     // its own (the desktop's browser), called back as tool/call.
                     "clientTools": true,
                     "compact": true,
+                    // providers/list, provider/save, provider/remove,
+                    // provider/models, presets/list.
+                    "providers": true,
+                    // profiles/list, profile/select, profile/save,
+                    // profile/remove; the profile picker replaces the
+                    // model picker.
+                    "profiles": true,
                 },
                 "thread": self.thread_snapshot(),
             })),
@@ -470,6 +482,9 @@ impl App {
 
             // ---- turns ------------------------------------------------------
             "turn/start" | "turn/steer" => {
+                if !self.config.is_configured() {
+                    return Err(anyhow!("connect a provider and choose a model first"));
+                }
                 let TurnInput { text, images, files } = turn_input(&params, &self.config.workspace)?;
                 let typed = text.clone();
                 // A slash command means what it means in the TUI: a skill or
@@ -569,12 +584,85 @@ impl App {
                 Ok(json!({"interrupting": self.turn_id.is_some()}))
             }
 
+            // ---- providers and profiles --------------------------------------
+            "presets/list" => Ok(json!({"presets": crate::providers::PRESETS.iter().map(|preset| json!({
+                "id": preset.id,
+                "name": preset.name,
+                "baseUrl": preset.base_url,
+                "protocol": preset.protocol,
+                "keyVariable": preset.env_key,
+                "keyFound": crate::providers::key_in_env(preset),
+                "local": crate::providers::is_local_url(preset.base_url),
+                "hint": preset.hint,
+            })).collect::<Vec<_>>()})),
+            "providers/list" => Ok(json!({"providers": self.provider_rows()})),
+            "provider/save" => self.save_provider(&params),
+            "provider/remove" => {
+                self.require_idle()?;
+                let id = params["id"].as_str().ok_or_else(|| anyhow!("id required"))?;
+                if !self.settings.providers.contains_key(id) {
+                    return Err(anyhow!("no provider named `{id}`"));
+                }
+                if self.settings.profiles.get(&self.settings.default_profile).is_some_and(|p| p.provider() == id)
+                    && self.settings.profiles_on(id).len() == self.settings.profiles.len()
+                {
+                    return Err(anyhow!("every profile runs on {id}; add another provider before removing this one"));
+                }
+                let removed = self.settings.remove_provider(id);
+                crate::providers::drop_catalog(&self.config.paths, id);
+                if self.credentials.keys.remove(id).is_some() {
+                    self.credentials.save(&self.config.paths)?;
+                }
+                self.settings.save(&self.config.paths)?;
+                self.reapply_profile()?;
+                Ok(json!({"removedProfiles": removed, "providers": self.provider_rows()}))
+            }
+            "provider/models" => {
+                let id = params["id"].as_str().ok_or_else(|| anyhow!("id required"))?;
+                let provider = self.settings.providers.get(id).ok_or_else(|| anyhow!("no provider named `{id}`"))?;
+                let connection = crate::providers::Connection::resolve(id, provider, &self.credentials);
+                let refresh = params["refresh"].as_bool().unwrap_or(false);
+                let catalog = crate::providers::catalog(&self.config.paths, &connection, refresh).await?;
+                Ok(json!({
+                    "models": catalog.models.iter().map(|card| model_card(id, card)).collect::<Vec<_>>(),
+                    "fetchedAt": catalog.fetched_at.to_rfc3339(),
+                }))
+            }
+            "profiles/list" => Ok(json!({"profiles": self.profile_rows(), "active": self.config.profile})),
+            "profile/select" => {
+                let name = params["name"].as_str().ok_or_else(|| anyhow!("name required"))?;
+                self.select_profile(name)?;
+                Ok(self.config_state())
+            }
+            "profile/save" => self.save_profile(&params),
+            "profile/remove" => {
+                self.require_idle()?;
+                let name = params["name"].as_str().ok_or_else(|| anyhow!("name required"))?;
+                self.settings.remove_profile(name)?;
+                self.settings.save(&self.config.paths)?;
+                if self.config.profile == name {
+                    self.reapply_profile()?;
+                }
+                Ok(json!({"profiles": self.profile_rows(), "active": self.config.profile}))
+            }
+
             // ---- models and config -----------------------------------------
+            // The active provider's models, as profiles name them. Kept for
+            // front ends that pick a model rather than a profile.
             "model/list" => {
-                let models =
-                    crate::setup::discover_models(&self.config.base_url, self.config.api_key.as_deref()).await?;
-                let models: Vec<Value> =
-                    models.into_iter().map(|id| json!({"id": id, "selected": id == self.config.model})).collect();
+                if !self.config.is_configured() {
+                    return Ok(json!({"models": []}));
+                }
+                let catalog = crate::providers::catalog(&self.config.paths, &self.config.connection, false).await?;
+                let current = self.config.model_ref();
+                let models: Vec<Value> = catalog
+                    .models
+                    .iter()
+                    .map(|card| {
+                        let id = crate::providers::join_ref(&self.config.connection.provider, &card.id);
+                        json!({"id": id, "selected": id == current})
+                    })
+                    .collect();
                 Ok(json!({"models": models}))
             }
             "config/read" => Ok(json!({
@@ -584,11 +672,11 @@ impl App {
                 // validate. Keyed by dotted path into `settings`.
                 "choices": settings_choices(),
                 "profile": self.config.profile,
-                "model": self.config.model,
-                "baseUrl": self.config.base_url,
+                "model": self.config.model_ref(),
+                "baseUrl": self.config.connection.base_url,
                 "workspace": self.config.workspace,
-                "mode": self.mode.label().to_ascii_lowercase(),
-                "autoApprove": self.allow.load(Ordering::Relaxed),
+                "mode": self.mode().label().to_ascii_lowercase(),
+                "autoApprove": self.yolo.load(Ordering::Relaxed),
                 "reasoningEffort": self.config.reasoning_effort.map(|effort| effort.label()),
                 "contextWindow": self.config.model_limits.context_window,
             })),
@@ -601,9 +689,11 @@ impl App {
                 self.write_config_value(key, value)
             }
             "config/write" => {
+                self.require_idle()?;
                 let settings: Settings = serde_json::from_value(params["settings"].clone())?;
                 settings.save(&self.config.paths)?;
                 self.settings = settings;
+                self.reapply_profile()?;
                 Ok(json!({"saved": true}))
             }
 
@@ -683,18 +773,24 @@ impl App {
 
     fn write_config_value(&mut self, key: &str, value: Value) -> Result<Value> {
         match key {
+            "profile" => {
+                let name = value.as_str().ok_or_else(|| anyhow!("profile must be a name"))?;
+                self.select_profile(name)?;
+            }
+            // A model for the active profile, as `provider/model` or an id on
+            // its own provider. The profile picker is the newer way.
             "model" => {
                 self.require_idle()?;
                 let model = value.as_str().ok_or_else(|| anyhow!("model must be a string"))?;
-                // What the old model spent so far is credited to it before the
-                // ledger starts counting for the new one.
-                if let Some(usage) = &self.usage {
-                    usage.note_model(model);
+                let name = self.config.profile.clone();
+                let profile = self.settings.profiles.get(&name).ok_or_else(|| anyhow!("no active profile"))?;
+                let reference = self.settings.qualify(model, profile);
+                self.settings.target(&reference, &self.credentials)?;
+                if let Some(profile) = self.settings.profiles.get_mut(&name) {
+                    profile.model = reference;
                 }
-                self.config.model = model.to_owned();
-                self.provider = Provider::with_tokens(&self.config, self.tokens.clone())?;
-                let model = model.to_owned();
-                self.update_profile(|profile| profile.model = model)?;
+                self.settings.save(&self.config.paths)?;
+                self.reapply_profile()?;
             }
             // Reasoning effort rides the profile, the way `/effort` writes it
             // in the TUI: the two front ends are one install, and a level set
@@ -711,34 +807,308 @@ impl App {
                     _ => return Err(anyhow!("effort must be a string or null")),
                 };
                 self.config.reasoning_effort = effort;
-                self.update_profile(|profile| profile.reasoning_effort = effort)?;
+                self.provider = Provider::with_tokens(&self.config, self.tokens.clone())?;
+                if let Some(profile) = self.settings.profiles.get_mut(&self.config.profile) {
+                    profile.reasoning_effort = effort;
+                    self.settings.save(&self.config.paths)?;
+                }
             }
+            // AUTO or YOLO for this session; the older names still parse.
             "mode" => {
-                let named = value.as_str().and_then(AgentMode::parse);
-                self.mode = named.unwrap_or(AgentMode::Auto);
+                let mode = value.as_str().and_then(Permission::parse).unwrap_or_default();
+                self.set_mode(mode);
             }
-            "autoApprove" => self.allow.store(value.as_bool().unwrap_or(false), Ordering::Relaxed),
+            "autoApprove" => {
+                self.set_mode(if value.as_bool().unwrap_or(false) { Permission::Yolo } else { Permission::Auto });
+            }
             other => return Err(anyhow!("`{other}` is not a writable key")),
         }
-        Ok(json!({
-            "model": self.config.model,
-            "mode": self.mode.label().to_ascii_lowercase(),
-            "autoApprove": self.allow.load(Ordering::Relaxed),
-            "reasoningEffort": self.config.reasoning_effort.map(|effort| effort.label()),
-        }))
+        Ok(self.config_state())
     }
 
-    /// Edit the active profile and write the settings file, so a change made
-    /// here is the same change `/config` would have made.
-    fn update_profile(&mut self, edit: impl FnOnce(&mut crate::config::ProviderProfile)) -> Result<()> {
-        let Some(profile) = self.settings.profiles.get_mut(&self.config.profile) else {
-            // No stored profile (an env-only or one-off configuration): the
-            // change still applies to this session, there is just nowhere to
-            // persist it, and failing here would be worse than not saving.
+    fn mode(&self) -> Permission {
+        if self.yolo.load(Ordering::Relaxed) { Permission::Yolo } else { Permission::Auto }
+    }
+
+    fn set_mode(&mut self, mode: Permission) {
+        self.yolo.store(mode == Permission::Yolo, Ordering::Relaxed);
+        notify("thread/mode/updated", json!({"threadId": self.thread_id(), "mode": mode.label().to_ascii_lowercase()}));
+    }
+
+    /// What `config/value/write` and the profile methods answer with.
+    fn config_state(&self) -> Value {
+        json!({
+            "profile": self.config.profile,
+            "model": self.config.model_ref(),
+            "mode": self.mode().label().to_ascii_lowercase(),
+            "autoApprove": self.yolo.load(Ordering::Relaxed),
+            "reasoningEffort": self.config.reasoning_effort.map(|effort| effort.label()),
+            "contextWindow": self.config.model_limits.context_window,
+            "needsSetup": !self.config.is_configured(),
+        })
+    }
+
+    /// Make `name` the active profile, for this session and as the default.
+    fn select_profile(&mut self, name: &str) -> Result<()> {
+        self.require_idle()?;
+        if !self.settings.profiles.contains_key(name) {
+            return Err(anyhow!("no profile named `{name}`"));
+        }
+        self.settings.default_profile = name.to_owned();
+        self.settings.save(&self.config.paths)?;
+        self.reapply_profile()
+    }
+
+    /// Point the session at the default profile as it now stands, after a
+    /// change to it, its provider, or which profile is the default.
+    fn reapply_profile(&mut self) -> Result<()> {
+        let name = self.settings.default_profile.clone();
+        if !self.settings.profiles.contains_key(&name) {
             return Ok(());
+        }
+        let previous = self.config.model_ref();
+        self.config.use_profile(&self.settings, &self.credentials, &name)?;
+        // What the old model spent so far is credited to it before the
+        // ledger starts counting for the new one.
+        if let Some(usage) = &self.usage
+            && previous != self.config.model_ref()
+        {
+            usage.note_model(&self.config.model);
+        }
+        let mut provider = Provider::with_tokens(&self.config, self.tokens.clone())?;
+        provider.adopt_session(&self.provider);
+        self.provider = provider;
+        notify("thread/profile/updated", self.config_state());
+        Ok(())
+    }
+
+    fn provider_rows(&self) -> Vec<Value> {
+        self.settings
+            .providers
+            .iter()
+            .map(|(id, provider)| {
+                let catalog = crate::providers::cached_catalog(&self.config.paths, id);
+                json!({
+                    "id": id,
+                    "name": provider.display_name(id),
+                    "baseUrl": provider.base_url,
+                    "protocol": provider.protocol,
+                    "apiKeyEnv": provider.api_key_env,
+                    "key": provider.key_status(id, &self.credentials).label(),
+                    "keyMissing": provider.key_status(id, &self.credentials).is_missing(),
+                    "hasStoredKey": self.credentials.keys.get(id).is_some_and(|key| !key.is_empty()),
+                    "authHeader": provider.auth_header,
+                    "authFormat": provider.auth_format,
+                    "tokenCommand": crate::providers::command_line(&provider.token_command),
+                    "headers": provider.headers,
+                    "body": crate::providers::body_line(&provider.body),
+                    "remove": provider.remove,
+                    "systemPrefix": provider.system_prefix,
+                    "requestUrl": provider.request_url,
+                    "modelsUrl": provider.models_url,
+                    "models": provider.models,
+                    "local": provider.is_local(),
+                    "modelCount": catalog.as_ref().map(|catalog| catalog.models.len()),
+                    "profiles": self.settings.profiles_on(id),
+                })
+            })
+            .collect()
+    }
+
+    fn profile_rows(&self) -> Vec<Value> {
+        self.settings
+            .profiles
+            .iter()
+            .map(|(name, profile)| {
+                json!({
+                    "name": name,
+                    "model": profile.model,
+                    "provider": profile.provider(),
+                    "active": *name == self.config.profile,
+                    "contextWindow": profile.context_window,
+                    "maxOutputTokens": profile.max_output_tokens,
+                    "reasoningEffort": profile.reasoning_effort,
+                    "toolFormat": profile.tool_format,
+                    "roles": profile.roles,
+                })
+            })
+            .collect()
+    }
+
+    /// Add or change a provider. Only the fields present change, so a front
+    /// end can send a whole form or a single edit; `apiKey` goes to
+    /// `credentials.toml`, never to the settings, and `""` removes it.
+    fn save_provider(&mut self, params: &Value) -> Result<Value> {
+        self.require_idle()?;
+        let preset = params["preset"].as_str().and_then(crate::providers::preset);
+        let id = match params["id"].as_str().filter(|id| !id.is_empty()) {
+            Some(id) => crate::providers::validate_provider_id(id)?.to_owned(),
+            None => {
+                let base = preset.map(|preset| preset.id.to_owned()).unwrap_or_else(|| {
+                    Some(crate::providers::slug(params["name"].as_str().unwrap_or_default()))
+                        .filter(|slug| !slug.is_empty())
+                        .unwrap_or_else(|| "custom".to_owned())
+                });
+                crate::providers::unused_id(&base, |candidate| self.settings.providers.contains_key(candidate))
+            }
         };
-        edit(profile);
-        self.settings.save(&self.config.paths)
+        let mut provider = self
+            .settings
+            .providers
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| preset.map(crate::providers::ProviderConfig::from_preset).unwrap_or_default());
+        let text = |key: &str| {
+            params
+                .get(key)
+                .filter(|value| !value.is_null())
+                .map(|value| value.as_str().unwrap_or_default().trim().to_owned())
+        };
+        let optional = |value: String| Some(value).filter(|value| !value.is_empty());
+        if let Some(name) = text("name") {
+            provider.name = name;
+        }
+        if let Some(url) = text("baseUrl") {
+            provider.base_url = crate::providers::normalise_base_url(&url)?;
+        }
+        if let Some(protocol) = params.get("protocol").filter(|value| !value.is_null()) {
+            provider.protocol = serde_json::from_value(protocol.clone())
+                .map_err(|_| anyhow!("protocol is chat-completions, responses, or anthropic"))?;
+        }
+        if let Some(env) = text("apiKeyEnv") {
+            provider.api_key_env = optional(env);
+        }
+        if let Some(header) = text("authHeader") {
+            provider.auth_header = optional(header);
+        }
+        if let Some(format) = text("authFormat") {
+            provider.auth_format = optional(format);
+        }
+        if let Some(command) = text("tokenCommand") {
+            provider.token_command = crate::providers::parse_command_line(&command);
+        }
+        if let Some(headers) = params.get("headers").filter(|value| !value.is_null()) {
+            provider.headers = match headers {
+                Value::String(line) => crate::providers::parse_headers_line(line)?,
+                other => serde_json::from_value(other.clone()).map_err(|_| anyhow!("headers are name: value pairs"))?,
+            };
+        }
+        if let Some(body) = text("body") {
+            provider.body = crate::providers::parse_body_line(&body)?;
+        }
+        if let Some(remove) = params.get("remove").filter(|value| !value.is_null()) {
+            provider.remove = string_list(remove);
+        }
+        if let Some(prefix) = text("systemPrefix") {
+            provider.system_prefix = optional(prefix);
+        }
+        if let Some(url) = text("requestUrl") {
+            provider.request_url = optional(url);
+        }
+        if let Some(url) = text("modelsUrl") {
+            provider.models_url = optional(url);
+        }
+        if let Some(models) = params.get("models").filter(|value| !value.is_null()) {
+            provider.models = string_list(models);
+        }
+        if provider.base_url.is_empty() {
+            return Err(anyhow!("a provider needs a base URL"));
+        }
+        if let Some(key) = text("apiKey") {
+            if key.is_empty() {
+                self.credentials.keys.remove(&id);
+            } else {
+                self.credentials.keys.insert(id.clone(), key);
+            }
+            self.credentials.save(&self.config.paths)?;
+        }
+        self.settings.providers.insert(id.clone(), provider);
+        self.settings.save(&self.config.paths)?;
+        crate::providers::drop_catalog(&self.config.paths, &id);
+        if self.settings.profiles.get(&self.config.profile).is_some_and(|profile| profile.provider() == id) {
+            self.reapply_profile()?;
+        }
+        let row = self.provider_rows().into_iter().find(|row| row["id"] == id.as_str()).unwrap_or(Value::Null);
+        Ok(json!({"id": id, "provider": row}))
+    }
+
+    /// Add or change a profile. A new one needs a `model` (`provider/model`)
+    /// and is named after it unless a `name` is given; `previousName` renames.
+    /// Limits and effort take `null` for "detect / provider default". The
+    /// first profile there is, or one saved with `select`, becomes active.
+    fn save_profile(&mut self, params: &Value) -> Result<Value> {
+        self.require_idle()?;
+        let previous = params["previousName"].as_str().filter(|name| self.settings.profiles.contains_key(*name));
+        let mut profile = previous.and_then(|name| self.settings.profiles.get(name).cloned()).unwrap_or_default();
+        if let Some(model) = params["model"].as_str().filter(|model| !model.trim().is_empty()) {
+            self.settings.target(model.trim(), &self.credentials)?;
+            profile.model = model.trim().to_owned();
+        }
+        if profile.model.is_empty() {
+            return Err(anyhow!("a profile needs a model, as provider/model"));
+        }
+        let tokens = |key: &str| -> Result<Option<Option<usize>>> {
+            match params.get(key) {
+                None => Ok(None),
+                Some(Value::Null) => Ok(Some(None)),
+                Some(Value::Number(number)) => Ok(Some(number.as_u64().map(|value| value as usize))),
+                Some(Value::String(text)) if text.trim().is_empty() => Ok(Some(None)),
+                Some(Value::String(text)) => Ok(Some(Some(crate::model_info::parse_tokens(text)?))),
+                Some(_) => Err(anyhow!("{key} must be a number of tokens")),
+            }
+        };
+        if let Some(context) = tokens("contextWindow")? {
+            profile.context_window = context;
+        }
+        if let Some(output) = tokens("maxOutputTokens")? {
+            profile.max_output_tokens = output;
+        }
+        match params.get("reasoningEffort") {
+            Some(Value::Null) => profile.reasoning_effort = None,
+            Some(Value::String(text)) if text.is_empty() || text == "auto" => profile.reasoning_effort = None,
+            Some(Value::String(text)) => {
+                profile.reasoning_effort = Some(
+                    crate::config::ReasoningEffort::parse(text).ok_or_else(|| anyhow!("unknown effort `{text}`"))?,
+                )
+            }
+            _ => {}
+        }
+        if let Some(format) = params.get("toolFormat") {
+            profile.tool_format = format.as_str().map(str::to_owned).filter(|format| !format.is_empty());
+        }
+        if let Some(roles) = params.get("roles").and_then(Value::as_object) {
+            for (role, model) in roles {
+                if crate::roles::role(role).is_none() || role == "default" {
+                    return Err(anyhow!("unknown role `{role}`"));
+                }
+                let model = model.as_str().map(str::trim).filter(|model| !model.is_empty()).map(str::to_owned);
+                if let Some(model) = &model {
+                    self.settings.target(model, &self.credentials)?;
+                }
+                profile.set_role_model(role, model);
+            }
+        }
+        let name = match params["name"].as_str().filter(|name| !name.trim().is_empty()) {
+            Some(name) => crate::config::validate_profile_name(name)?.to_owned(),
+            None => previous.map(str::to_owned).unwrap_or_else(|| self.settings.unused_profile_name(&profile.model)),
+        };
+        if let Some(previous) = previous
+            && previous != name
+        {
+            self.settings.rename_profile(previous, &name)?;
+        } else if previous.is_none() && self.settings.profiles.contains_key(&name) {
+            return Err(anyhow!("a profile named `{name}` already exists"));
+        }
+        self.settings.profiles.insert(name.clone(), profile);
+        let select = params["select"].as_bool().unwrap_or(false) || !self.config.is_configured();
+        if select {
+            self.settings.default_profile = name.clone();
+        }
+        self.settings.save(&self.config.paths)?;
+        if select || self.settings.default_profile == name {
+            self.reapply_profile()?;
+        }
+        Ok(json!({"name": name, "profiles": self.profile_rows(), "state": self.config_state()}))
     }
 
     /// Refuse state swaps while a turn is in flight. Replacing the history
@@ -787,10 +1157,10 @@ impl App {
         json!({
             "threadId": self.thread_id(),
             "name": self.thread.session.title,
-            "model": self.config.model,
+            "model": self.config.model_ref(),
             "profile": self.config.profile,
-            "mode": self.mode.label().to_ascii_lowercase(),
-            "autoApprove": self.allow.load(Ordering::Relaxed),
+            "mode": self.mode().label().to_ascii_lowercase(),
+            "autoApprove": self.yolo.load(Ordering::Relaxed),
             "reasoningEffort": self.config.reasoning_effort.map(|effort| effort.label()),
             "workspace": self.config.workspace,
             "contextWindow": self.config.model_limits.context_window,
@@ -863,8 +1233,7 @@ impl App {
         self.item("completed", item);
 
         let options = TurnOptions {
-            mode: self.mode,
-            allow_mutations: self.allow.clone(),
+            yolo: self.yolo.clone(),
             session_id: Some(self.thread_id()),
             trace: self.thread.trace.clone(),
             cancel: self.cancel.clone(),
@@ -948,14 +1317,6 @@ impl App {
                     self.item("completed", item);
                 }
             }
-            AgentEvent::ModeChanged { mode, reason } => notify(
-                "thread/mode/updated",
-                json!({
-                    "threadId": self.thread_id(),
-                    "mode": mode.label().to_ascii_lowercase(),
-                    "reason": reason,
-                }),
-            ),
             AgentEvent::Notice(text) => notify("warning", json!({"message": text})),
             AgentEvent::TraceFailed { error } => {
                 notify("warning", json!({"message": format!("training trace off — {error}")}))
@@ -987,7 +1348,7 @@ impl App {
                         "command": request.summary,
                         "cwd": self.config.workspace,
                         "reason": request.details,
-                        "availableDecisions": ["accept", "acceptForSession", "decline", "cancel"],
+                        "availableDecisions": ["accept", "decline", "cancel"],
                     }
                 }));
                 self.pending_approvals.insert(id, request.respond);
@@ -1123,12 +1484,10 @@ impl App {
             return;
         }
         if let Some(responder) = self.pending_approvals.remove(id) {
+            // `acceptForSession` came from the days of asking about every
+            // change; a window that still sends it means this one.
             let decision = match result["decision"].as_str().unwrap_or("decline") {
-                "accept" => ApprovalDecision::Once,
-                "acceptForSession" => {
-                    self.allow.store(true, Ordering::Relaxed);
-                    ApprovalDecision::Always
-                }
+                "accept" | "acceptForSession" => ApprovalDecision::Once,
                 "cancel" => {
                     self.cancel.store(true, Ordering::Relaxed);
                     ApprovalDecision::Reject
@@ -1161,7 +1520,7 @@ impl App {
         session.update_messages(self.thread.messages.clone());
         self.thread.state.save(session);
         session.tokens_used = self.tokens.total();
-        session.model = self.config.model.clone();
+        session.model = self.config.model_ref();
         if let Err(error) = store.save(session) {
             eprintln!("app-server: session save failed — {error:#}");
             return;
@@ -1254,12 +1613,13 @@ fn settings_choices() -> Value {
         // Closed sets: exactly these values parse, so a client should present
         // them as the only options. `null` where the setting is optional.
         "closed": {
-            "ui.permission_mode": ["ask", "always-approve"],
+            "agent.mode": ["auto", "yolo"],
             "ui.glyphs": ["auto", "unicode", "nerd", "ascii"],
-            "agent.tool_format": [
+            "profiles.*.tool_format": [
                 null, "auto", "none", "hermes", "qwen", "llama3_json",
                 "mistral", "glm", "kimi", "deepseek", "json",
             ],
+            "providers.*.protocol": ["chat-completions", "responses", "anthropic"],
             "search.backend": ["auto", "bing", "searxng", "brave"],
             "reasoning_effort": [
                 null, "minimal", "low", "medium", "high", "xhigh", "max",
@@ -1271,6 +1631,38 @@ fn settings_choices() -> Value {
         "open": {
             "ui.theme": ["auto", "dark", "light"],
         },
+    })
+}
+
+/// A list of strings sent either as an array or as one comma-separated line.
+fn string_list(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Value::String(line) => {
+            line.split(',').map(str::trim).filter(|item| !item.is_empty()).map(str::to_owned).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// A discovered model as a front end lists it.
+fn model_card(provider: &str, card: &crate::model_info::ModelCard) -> Value {
+    json!({
+        "id": crate::providers::join_ref(provider, &card.id),
+        "model": card.id,
+        "name": card.name,
+        "contextLength": card.context_length,
+        "maxOutputTokens": card.max_output_tokens,
+        "inputCost": card.input_cost,
+        "outputCost": card.output_cost,
+        "vision": card.vision,
+        "reasoning": card.reasoning,
     })
 }
 

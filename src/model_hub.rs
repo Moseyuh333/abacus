@@ -1,29 +1,29 @@
-//! The `/models` surface: a fullscreen two-column browser over every model the
-//! configured endpoints report, and the roles those models are assigned to.
+//! The `/profile` surface: a fullscreen two-column browser over the profiles
+//! and every model the configured providers serve.
 //!
 //! This module owns the hub's state and the pure parts of turning it into
 //! rows. The frame, the hit regions, and the catalog fetches live in
 //! [`crate::tui`], which is where everything else that touches an `App` lives
 //! — so what is here stays testable without standing one up.
 //!
-//! The layout is a sidebar of scopes beside a body:
+//! The sidebar lists the profiles first, then each provider:
 //!
 //! ```text
-//! ╭─ MODELS ─────────────┬───────────────────────────────────────────────╮
-//! │ ❯ roles         2/4  │ ❯ sonnet                                      │
-//! │ ─────────────────────│                                               │
-//! │   [x] openrouter 501 │ ❯ anthropic/claude-sonnet-4.5  200k ctx  $3/15 │
-//! │   [/] local        — │   anthropic/claude-opus-4.1    200k ctx $15/75 │
-//! ╰──────────────────────┴───────────────────────────────────────────────╯
+//! ╭─ PROFILES ───────────┬──────────────────────────────────────────────╮
+//! │ ❯ profiles         3 │ ● kojo/kojo                  1m ctx · high   │
+//! │ ─────────────────────│   llama/qwen-3-4b             32k ctx        │
+//! │   Kojo            12 │   review (openrouter/…/gpt-6)                │
+//! │   OpenRouter     501 │                                              │
+//! │   + add provider     │                                              │
+//! ╰──────────────────────┴──────────────────────────────────────────────╯
 //! ```
 //!
-//! One box, not two: the columns are joined by `┬`/`┴` junctions punched into
-//! the border, so the sidebar reads as part of the surface rather than as a
-//! panel parked beside it.
+//! Picking a model in a provider's list switches to the profile that runs it,
+//! and makes one — named after the model — when none does. So "use this
+//! model" is one keypress, and a profile is only ever made by asking for it.
 
 use crate::config::Settings;
 use crate::model_info::ModelCard;
-use crate::roles::ROLES;
 
 /// Which column has the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,19 +35,22 @@ pub enum Pane {
 /// A sidebar entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
-    /// Role assignments for the active profile.
-    Roles,
-    /// A rule between the roles entry and the profile list. Never selectable.
+    /// Every profile.
+    Profiles,
+    /// A rule between the profiles entry and the providers. Never selectable.
     Separator,
-    /// One configured profile's catalog.
-    Profile { id: String, name: String },
+    /// One provider's model list.
+    Provider { id: String, name: String },
+    /// Opens the provider form, so a model that is nowhere yet is one step
+    /// away rather than a trip through the config file.
+    AddProvider,
 }
 
-/// What a profile's model list is currently doing.
+/// What a provider's model list is currently doing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Catalog {
     /// Never asked for. The hub fetches on first visit rather than at startup:
-    /// a profile you never open should not cost a request.
+    /// a provider you never open should not cost a request.
     Idle,
     Loading,
     Ready(Vec<ModelCard>),
@@ -75,57 +78,89 @@ impl Catalog {
     }
 }
 
+/// What Enter on a model does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pick {
+    /// Switch to the profile that runs the model, making one when none does.
+    Use,
+    /// Give the model to a role of the active profile — `default` being the
+    /// profile's own model. Opened from `/config`.
+    Assign(String),
+}
+
+/// A question the hub is asking about the profile under the cursor.
+#[derive(Debug, Clone)]
+pub enum HubPrompt {
+    Rename { name: String, input: crate::input::InputBuffer },
+    ConfirmDelete { name: String },
+}
+
 /// The hub's state.
 #[derive(Debug, Clone)]
 pub struct ModelHub {
     pub scopes: Vec<Scope>,
     pub scope: usize,
     pub pane: Pane,
-    /// Filter over the body list. Typing goes straight here — the search is
-    /// always live, so there is no mode to enter and none to forget to leave.
+    /// Filter over a provider's model list. Typing goes straight here — the
+    /// search is always live, so there is no mode to enter and none to forget
+    /// to leave.
     pub search: String,
     /// Cursor within the *filtered* body list.
     pub selected: usize,
     /// First visible body row, so a long list scrolls rather than jumping.
     pub window: usize,
-    /// The role a model is being picked for. `Some` means the body is a model
-    /// list opened from the roles view, and picking assigns rather than
-    /// switches.
-    pub assigning: Option<String>,
+    pub pick: Pick,
+    pub prompt: Option<HubPrompt>,
 }
 
 impl ModelHub {
-    /// Open the hub for `settings`, with a scope per configured profile.
+    /// Open the hub for `settings`, on the profiles list.
     pub fn new(settings: &Settings) -> Self {
-        let mut scopes = vec![Scope::Roles];
-        if !settings.profiles.is_empty() {
-            scopes.push(Scope::Separator);
+        let mut scopes = vec![Scope::Profiles, Scope::Separator];
+        for (id, provider) in &settings.providers {
+            scopes.push(Scope::Provider { id: id.clone(), name: provider.display_name(id).to_owned() });
         }
-        for (id, profile) in &settings.profiles {
-            scopes.push(Scope::Profile {
-                id: id.clone(),
-                name: if profile.name.trim().is_empty() { id.clone() } else { profile.name.clone() },
-            });
-        }
+        scopes.push(Scope::AddProvider);
         ModelHub {
             scopes,
             scope: 0,
-            pane: Pane::Sidebar,
+            pane: Pane::Body,
             search: String::new(),
             selected: 0,
             window: 0,
-            assigning: None,
+            pick: Pick::Use,
+            prompt: None,
         }
     }
 
-    pub fn current_scope(&self) -> &Scope {
-        self.scopes.get(self.scope).unwrap_or(&Scope::Roles)
+    /// Open the hub to choose a model for `role` of the active profile,
+    /// landing on the provider the role's model is on now.
+    pub fn assigning(settings: &Settings, role: &str) -> Self {
+        let mut hub = Self::new(settings);
+        hub.pick = Pick::Assign(role.to_owned());
+        let current = settings
+            .active_profile()
+            .and_then(|profile| profile.resolve_role(role))
+            .map(|resolved| resolved.model)
+            .unwrap_or_default();
+        let provider = crate::providers::split_ref(&current).map_or("", |(provider, _)| provider);
+        hub.scope = hub
+            .scopes
+            .iter()
+            .position(|scope| matches!(scope, Scope::Provider { id, .. } if id == provider))
+            .or_else(|| hub.scopes.iter().position(|scope| matches!(scope, Scope::Provider { .. })))
+            .unwrap_or(0);
+        hub
     }
 
-    /// The profile whose catalog the body is showing, if the scope names one.
-    pub fn scoped_profile(&self) -> Option<&str> {
+    pub fn current_scope(&self) -> &Scope {
+        self.scopes.get(self.scope).unwrap_or(&Scope::Profiles)
+    }
+
+    /// The provider whose models the body is showing, if the scope names one.
+    pub fn scoped_provider(&self) -> Option<&str> {
         match self.current_scope() {
-            Scope::Profile { id, .. } => Some(id),
+            Scope::Provider { id, .. } => Some(id),
             _ => None,
         }
     }
@@ -149,6 +184,7 @@ impl ModelHub {
         }
         if self.scope != next as usize {
             self.scope = next as usize;
+            self.search.clear();
             self.reset_body();
         }
     }
@@ -189,31 +225,41 @@ impl ModelHub {
     }
 }
 
-/// One row of the roles view.
+/// One row of the profiles list.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RoleRow {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub help: &'static str,
-    /// The model this role resolves to.
+pub struct ProfileRow {
+    pub name: String,
+    /// `provider/model`.
     pub model: String,
-    /// True when no assignment was found and the model came from a fallback.
-    pub inherited: bool,
+    pub active: bool,
+    /// What sets it apart from the defaults: `1m ctx · high`.
+    pub settings: String,
 }
 
-/// The roles view for a profile, in [`ROLES`] order.
-pub fn role_rows(settings: &Settings, profile_id: &str) -> Vec<RoleRow> {
-    let profile = settings.profiles.get(profile_id);
-    ROLES
+/// The profiles, in name order, with what each one changes from the defaults.
+pub fn profile_rows(settings: &Settings) -> Vec<ProfileRow> {
+    settings
+        .profiles
         .iter()
-        .map(|role| {
-            let resolved = profile.and_then(|profile| profile.resolve_role(role.id));
-            RoleRow {
-                id: role.id,
-                label: role.label,
-                help: role.help,
-                model: resolved.as_ref().map(|resolved| resolved.model.clone()).unwrap_or_default(),
-                inherited: resolved.is_none_or(|resolved| resolved.inherited),
+        .map(|(name, profile)| {
+            let mut facts = Vec::new();
+            if let Some(context) = profile.context_window {
+                facts.push(format!("{} ctx", crate::model_info::compact_count(context)));
+            }
+            if let Some(output) = profile.max_output_tokens {
+                facts.push(format!("{} out", crate::model_info::compact_count(output)));
+            }
+            if let Some(effort) = profile.reasoning_effort {
+                facts.push(effort.label().to_owned());
+            }
+            if !profile.roles.is_empty() {
+                facts.push(format!("{} role(s)", profile.roles.len()));
+            }
+            ProfileRow {
+                name: name.clone(),
+                model: profile.model.clone(),
+                active: *name == settings.default_profile,
+                settings: facts.join(" · "),
             }
         })
         .collect()
@@ -257,15 +303,24 @@ fn score(haystack: &str, needle: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProviderProfile;
+    use crate::config::Profile;
+    use crate::providers::ProviderConfig;
 
     fn settings() -> Settings {
         let mut settings = Settings::default();
-        settings.profiles.insert(
-            "main".to_owned(),
-            ProviderProfile { name: "OpenRouter".to_owned(), model: "big/model".to_owned(), ..Default::default() },
+        settings
+            .providers
+            .insert("kojo".to_owned(), ProviderConfig::from_preset(crate::providers::preset("kojo").unwrap()));
+        settings.providers.insert(
+            "llama".to_owned(),
+            ProviderConfig { name: String::new(), base_url: "http://localhost:8080/v1".into(), ..Default::default() },
         );
-        settings.default_profile = "main".to_owned();
+        settings.profiles.insert(
+            "kojo/kojo".to_owned(),
+            Profile { context_window: Some(1_000_000), ..Profile::for_model("kojo/kojo") },
+        );
+        settings.profiles.insert("llama/qwen-3-4b".to_owned(), Profile::for_model("llama/qwen-3-4b"));
+        settings.default_profile = "kojo/kojo".to_owned();
         settings
     }
 
@@ -274,18 +329,26 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_lists_roles_then_the_profiles() {
+    fn the_sidebar_lists_profiles_then_providers_then_a_way_to_add_one() {
         let hub = ModelHub::new(&settings());
-        assert_eq!(hub.scopes[0], Scope::Roles);
+        assert_eq!(hub.scopes[0], Scope::Profiles);
         assert_eq!(hub.scopes[1], Scope::Separator);
-        assert!(matches!(&hub.scopes[2], Scope::Profile { id, name }
-            if id == "main" && name == "OpenRouter"));
-        // A profile with no display name falls back to its id rather than
+        assert!(matches!(&hub.scopes[2], Scope::Provider { id, name } if id == "kojo" && name == "Kojo"));
+        // A provider with no display name falls back to its id rather than
         // rendering a blank row.
-        let mut bare = settings();
-        bare.profiles.get_mut("main").unwrap().name = "  ".to_owned();
-        let hub = ModelHub::new(&bare);
-        assert!(matches!(&hub.scopes[2], Scope::Profile { name, .. } if name == "main"));
+        assert!(matches!(&hub.scopes[3], Scope::Provider { name, .. } if name == "llama"));
+        assert_eq!(hub.scopes.last(), Some(&Scope::AddProvider));
+    }
+
+    #[test]
+    fn assigning_a_role_opens_on_the_provider_it_uses_now() {
+        let mut settings = settings();
+        settings.profiles.get_mut("kojo/kojo").unwrap().roles.insert("aux".into(), "llama/qwen-3-4b".into());
+        let hub = ModelHub::assigning(&settings, "aux");
+        assert_eq!(hub.pick, Pick::Assign("aux".to_owned()));
+        assert_eq!(hub.scoped_provider(), Some("llama"));
+        // An unassigned role inherits, and opens where its model is.
+        assert_eq!(ModelHub::assigning(&settings, "compaction").scoped_provider(), Some("kojo"));
     }
 
     #[test]
@@ -300,18 +363,12 @@ mod tests {
     }
 
     #[test]
-    fn roles_report_what_they_inherit() {
-        let mut settings = settings();
-        settings.profiles.get_mut("main").unwrap().set_role_model("aux", Some("small/model".to_owned()));
-        let rows = role_rows(&settings, "main");
-        let by_id = |id: &str| rows.iter().find(|row| row.id == id).unwrap().clone();
-        assert_eq!(by_id("default").model, "big/model");
-        assert!(!by_id("default").inherited);
-        assert_eq!(by_id("aux").model, "small/model");
-        assert!(!by_id("aux").inherited);
-        // Untouched roles resolve to the default and say so.
-        assert_eq!(by_id("subagent").model, "big/model");
-        assert!(by_id("subagent").inherited);
+    fn profile_rows_say_what_differs_from_the_defaults() {
+        let rows = profile_rows(&settings());
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].active && rows[0].name == "kojo/kojo");
+        assert_eq!(rows[0].settings, "1m ctx");
+        assert_eq!(rows[1].settings, "", "a profile at its defaults says nothing");
     }
 
     #[test]

@@ -1344,10 +1344,10 @@ pub fn welcome(info: &Welcome<'_>, width: usize) -> Vec<Line<'static>> {
     if info.tips {
         lines.push(Line::from(""));
         for (key, label, color) in [
-            ("Build", "Describe a change; Abacus inspects, edits, verifies.", success()),
-            ("Plan", "AUTO picks the workflow — shift+tab pins a mode.", warning()),
-            ("Goal", "/goal sets a persistent definition of done.", primary()),
-            ("Loop", "/loop runs promise-driven iteration.", secondary()),
+            ("Ask", "Describe a change; Abacus inspects, edits, verifies.", success()),
+            ("Mode", "AUTO reviews risky actions first — shift+tab for YOLO.", warning()),
+            ("Model", "/profile switches model; /providers adds one.", primary()),
+            ("Goal", "/goal sets a persistent definition of done.", secondary()),
         ] {
             lines.push(Line::from(vec![bold(format!("{key:<7}"), color), fg(label.to_owned(), muted())]));
         }

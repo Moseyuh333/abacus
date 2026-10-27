@@ -27,42 +27,33 @@ impl App {
     pub(super) fn slash_command(&mut self, input: &str) -> bool {
         let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
         let argument = argument.trim();
+        // The names older versions used are kept as quiet aliases: they do
+        // what they always did, and only the current names are offered.
         match command {
             "/help" => self.show_help = true,
-            "/clear" | "/new" => self.new_session(),
+            "/new" | "/clear" => self.new_session(),
             "/fork" => self.fork_session(),
             "/quit" | "/q" | "/exit" => self.quit = true,
             "/btw" => self.btw_command(argument),
             "/effort" => self.effort_command(argument),
-            "/profile" => self.profile_command(argument),
-            "/models" => self.open_model_hub(),
-            "/model" => self.model_command(argument),
-            "/providers" => self.providers_command(argument),
-            "/sessions" => self.list_sessions(),
-            "/usage" => self.open_usage(),
-            "/resume" => self.resume_session(argument),
-            "/rename" => self.rename_session(argument),
-            "/tools" | "/skills" | "/plugins" | "/mcps" => self.list_extensions(command),
-            "/plan" => self.set_agent_mode(match self.agent_mode {
-                AgentMode::Plan => AgentMode::Auto,
-                _ => AgentMode::Plan,
-            }),
-            "/thinking" => self.thinking_command(argument),
+            "/profile" | "/model" | "/models" => self.profile_command(argument),
+            "/providers" => self.open_config_tab(PROVIDERS_TAB),
             "/mode" => self.mode_command(argument),
+            "/resume" | "/sessions" => self.resume_session(argument),
+            "/rename" => self.rename_session(argument),
+            "/usage" => self.open_usage(),
+            "/tools" | "/skills" | "/plugins" | "/mcps" => self.list_extensions(),
             "/goal" => self.goal_command(argument),
             "/loop" => self.loop_command(argument),
-            "/swarm" => self.swarm_command(argument),
-            "/cancel-loop" | "/cancel-ralph" => self.cancel_ralph_loop(),
+            "/cancel-loop" => self.cancel_ralph_loop(),
             "/config" => self.open_config(argument),
             "/theme" => self.theme_command(argument),
             "/feedback" => self.open_feedback(),
             "/remote" => self.remote_command(argument),
             "/compact" => self.compact_command(),
             "/repair" => self.repair_command(),
-            "/papercuts" => self.papercuts_command(argument),
-            "/memories" => self.memories_command(argument),
-            "/refine" => self.start_refine(argument),
-            "/harness" => self.harness_command(argument),
+            "/memory" | "/memories" | "/papercuts" | "/harness" => self.memory_command(argument),
+            "/refine" => self.memory_command(&format!("refine {argument}")),
             // A `/name` that is a skill or a plugin command is not a slash
             // command; the caller resolves it into a prompt.
             _ if command.starts_with('/') && !self.has_extension(&command[1..]) => {
@@ -91,9 +82,14 @@ impl App {
         saved
     }
 
-    pub(super) fn set_agent_mode(&mut self, mode: AgentMode) {
-        self.agent_mode = mode;
-        self.status = format!("{} mode", mode.label().to_ascii_lowercase());
+    /// Switch this session to `mode`. A running turn follows from its next
+    /// tool call.
+    pub(super) fn set_mode(&mut self, mode: Permission) {
+        self.yolo.store(mode == Permission::Yolo, Ordering::Relaxed);
+        self.status = match mode {
+            Permission::Auto => "AUTO — risky actions are reviewed first".to_owned(),
+            Permission::Yolo => "YOLO — every action runs unreviewed".to_owned(),
+        };
         if let Some(remote) = &mut self.remote {
             remote.mode_changed(mode, "set in the terminal");
         }
@@ -239,7 +235,9 @@ impl App {
     pub(super) fn set_show_thinking(&mut self, show: bool) -> bool {
         let previous = std::mem::replace(&mut self.settings.ui.show_thinking, show);
         let result = self.save_and_apply_settings();
-        let done = if show { "thinking shown" } else { "thinking hidden" };
+        // Say where it went, so hiding it does not look like the reasoning
+        // stopped being captured.
+        let done = if show { "thinking shown" } else { "thinking hidden (still recorded in traces)" };
         let saved = self.report(result, done, "configuration error");
         if !saved {
             self.settings.ui.show_thinking = previous;
@@ -311,144 +309,54 @@ impl App {
         self.report(result, format!("effort {label}"), "configuration error");
     }
 
-    pub(super) fn model_command(&mut self, model: &str) {
-        if model.is_empty() {
-            return self.say(format!(
-                "Model: {}\nEndpoint: {}\n\nSwitch with /model <id>; discover IDs with `abacus models`.",
-                self.config.model, self.config.base_url
-            ));
-        }
-        let result = self
-            .active_profile_mut()
-            .map(|profile| profile.model = model.to_owned())
-            .and_then(|()| self.save_and_apply_settings());
-        self.report(result, format!("model: {model} · saved"), "model switch failed");
-    }
-
-    /// OpenRouter fronts many suppliers for one model and they differ in
-    /// context length and quantization, so which one serves a request is a
-    /// decision worth making rather than accepting by default.
-    pub(super) fn providers_command(&mut self, argument: &str) {
-        if argument.is_empty() {
-            let profile = self.settings.profiles.get(&self.settings.default_profile);
-            let pinned = profile.map(|profile| profile.providers.clone()).unwrap_or_default();
-            let body = if pinned.is_empty() {
-                "No providers pinned — the endpoint chooses.".to_owned()
-            } else {
-                format!(
-                    "Pinned, in order: {}\nFallbacks: {}",
-                    pinned.join(", "),
-                    on_off(profile.is_none_or(|profile| profile.allow_fallbacks)).to_ascii_lowercase()
-                )
-            };
-            return self.say(format!(
-                "{body}\n\nSet with /providers <name, name>; \
-                 /providers clear removes the pin; \
-                 /providers strict|fallback controls whether anything else may serve it. \
-                 List what is available with `abacus providers`."
-            ));
-        }
-        let change = self.active_profile_mut().map(|profile| match argument.to_ascii_lowercase().as_str() {
-            "clear" | "none" | "off" => {
-                profile.providers.clear();
-                "providers unpinned".to_owned()
-            }
-            "strict" => {
-                profile.allow_fallbacks = false;
-                "strict: only pinned providers may serve this model".to_owned()
-            }
-            "fallback" | "fallbacks" => {
-                profile.allow_fallbacks = true;
-                "fallbacks allowed".to_owned()
-            }
-            _ => {
-                profile.providers = crate::config::Routing::parse_order(argument);
-                format!("pinned to {}", profile.providers.join(", "))
-            }
-        });
-        match change {
-            Ok(summary) => {
-                let result = self.save_and_apply_settings();
-                self.report(result, summary, "routing error");
-            }
-            Err(error) => self.status = format!("routing error: {error:#}"),
-        }
-    }
-
-    /// `/tools`, `/skills`, `/plugins`, `/mcps`: what the agent can reach.
-    pub(super) fn list_extensions(&mut self, command: &str) {
+    /// `/tools`: everything the agent can reach — its tools, then what
+    /// extensions add: skills, plugin commands, MCP tools.
+    pub(super) fn list_extensions(&mut self) {
         let services = self.services.clone();
-        let (title, empty, rows): (_, _, Vec<String>) = match command {
-            "/tools" => {
-                let mut names: Vec<String> = services
-                    .tool_specs()
-                    .iter()
-                    .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_owned))
-                    .collect();
-                names.extend(["goal_status", "goal_update", "spawn_subagents"].map(str::to_owned));
-                return self.say(format!("Tools: {}", names.join(", ")));
-            }
-            "/skills" => (
-                "Skills",
-                "No skills discovered.",
-                services
-                    .skills
-                    .read()
-                    .expect("skill registry lock")
-                    .list()
-                    .map(|skill| format!("/{}  {}", skill.name, skill.description))
-                    .collect(),
-            ),
-            "/plugins" => (
-                "Plugins",
-                "No plugins enabled.",
-                services
-                    .plugins
-                    .list()
-                    .map(|plugin| format!("{} {}  {}", plugin.name, plugin.version, plugin.description))
-                    .collect(),
-            ),
-            _ => (
-                "MCP tools",
-                "No MCP tools connected.",
-                services.mcp.tools().map(|tool| format!("{}  {}", tool.exposed_name, tool.description)).collect(),
-            ),
-        };
-        if rows.is_empty() {
-            self.say(empty);
-        } else {
-            self.say(format!("{title}\n{}", rows.join("\n")));
+        let mut names: Vec<String> = services
+            .tool_specs()
+            .iter()
+            .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_owned))
+            .collect();
+        names.extend(["goal_status", "goal_update", "spawn_subagents"].map(str::to_owned));
+        let mut sections = vec![format!("Tools: {}", names.join(", "))];
+        let skills: Vec<String> = services
+            .skills
+            .read()
+            .expect("skill registry lock")
+            .list()
+            .map(|skill| format!("  /{}  {}", skill.name, skill.description))
+            .collect();
+        if !skills.is_empty() {
+            sections.push(format!("Skills (run one with /<name>):\n{}", skills.join("\n")));
         }
-    }
-
-    /// Worth a command of its own rather than only a /config row: whether you
-    /// want to watch a model reason changes from task to task.
-    pub(super) fn thinking_command(&mut self, argument: &str) {
-        let show = match argument.to_ascii_lowercase().as_str() {
-            "" => !self.settings.ui.show_thinking,
-            "on" | "show" | "yes" => true,
-            "off" | "hide" | "no" => false,
-            _ => return self.fail("Usage: /thinking [on|off]"),
-        };
-        if self.set_show_thinking(show) {
-            // Say where it went, so hiding it does not look like the reasoning
-            // stopped being captured.
-            self.say(if show {
-                "Reasoning will be shown above each reply."
-            } else {
-                "Reasoning hidden. It is still recorded in training traces."
-            });
+        let plugins: Vec<String> = services
+            .plugins
+            .list()
+            .map(|plugin| format!("  {} {}  {}", plugin.name, plugin.version, plugin.description))
+            .collect();
+        if !plugins.is_empty() {
+            sections.push(format!("Plugins:\n{}", plugins.join("\n")));
         }
+        let mcp: Vec<String> =
+            services.mcp.tools().map(|tool| format!("  {}  {}", tool.exposed_name, tool.description)).collect();
+        if !mcp.is_empty() {
+            sections.push(format!("MCP tools:\n{}", mcp.join("\n")));
+        }
+        self.say(sections.join("\n\n"));
     }
 
     pub(super) fn mode_command(&mut self, argument: &str) {
-        match AgentMode::parse(argument) {
-            Some(mode) => self.set_agent_mode(mode),
-            None if argument.is_empty() => self.say(format!(
-                "Mode: {}\nAUTO lets the model choose PLAN or BUILD per turn; pinned modes enforce your choice.",
-                self.agent_mode.label()
+        match argument.trim().to_ascii_lowercase().as_str() {
+            "" => self.say(format!(
+                "Mode: {}\nAUTO runs reading and workspace edits at once and puts anything riskier to the safety \
+                 reviewer, which blocks what you did not ask for. YOLO runs everything without review.\n\
+                 Switch with /mode auto, /mode yolo, or Shift+Tab; the default for new sessions is in /config → Agent.",
+                self.mode().label()
             )),
-            None => self.fail("Usage: /mode auto|plan|build"),
+            "auto" => self.set_mode(Permission::Auto),
+            "yolo" => self.set_mode(Permission::Yolo),
+            _ => self.fail("Usage: /mode auto|yolo"),
         }
     }
 
@@ -486,117 +394,73 @@ impl App {
         self.say(format!("Repaired the session history: {}.", fixes.join("; ")));
     }
 
-    pub(super) fn papercuts_command(&mut self, argument: &str) {
-        let snapshot = self.papercuts.snapshot();
-        if let Some(number) = argument.strip_prefix("delete") {
-            return match numbered(&snapshot, number).filter(|cut| self.papercuts.remove(cut.id)) {
-                Some(cut) => self.say(format!("Papercut \"{}\" deleted.", cut.title)),
-                None => self.fail("Usage: /papercuts delete <number> — numbers from /papercuts"),
-            };
-        }
-        if snapshot.is_empty() {
-            return self.say(
-                "No papercuts yet. When Abacus works through a snag it records the lesson \
-                 here and recalls it the next time a tripwire matches.",
-            );
-        }
-        let now = chrono::Utc::now();
-        let mut lines = vec![format!("{} papercut(s) for this workspace:", snapshot.len())];
-        lines.extend(snapshot.iter().enumerate().map(|(index, cut)| {
-            format!(
-                "{}. {} — tripped {}x, recalled {}x, strength {:.1}\n   fix: {}\n   tripwires: {}",
-                index + 1,
-                cut.title,
-                cut.trip_count,
-                cut.recall_count,
-                cut.decayed_strength(now),
-                cut.fix,
-                cut.tripwires.join(" · "),
-            )
-        }));
-        lines.push("Delete one with /papercuts delete <number>.".to_owned());
-        self.say(lines.join("\n"));
-    }
-
-    pub(super) fn memories_command(&mut self, argument: &str) {
-        use crate::harness::EntryKind::Memory;
-        // One ordering for display and delete alike, or the numbers the user
-        // sees would target different entries.
-        let snapshot = self.state.harness.snapshot_of(Memory);
-        if let Some(number) = argument.strip_prefix("delete") {
-            let removed = numbered(&snapshot, number).filter(|memory| self.state.harness.remove(Memory, &memory.id));
-            return match removed {
-                Some(memory) => self.say(format!("Memory \"{}\" deleted.", memory.title)),
-                None => self.fail("Usage: /memories delete <number> — numbers from /memories"),
-            };
-        }
-        if snapshot.is_empty() {
-            return self.say(
-                "No memories yet. Abacus records durable knowledge here — on its own after \
-                 long turns (refine), or whenever the model calls memory_record — and injects \
-                 it into future sessions.",
-            );
-        }
-        let mut lines = vec![format!("{} memori(es) for this workspace, newest first:", snapshot.len())];
-        // The lifetime is the part a user needs to see: a session memory
-        // disappears when the session ends.
-        lines.extend(snapshot.iter().enumerate().map(|(index, memory)| {
-            format!(
-                "{}. [{}] {} — {}",
-                index + 1,
-                memory.lifetime_label(),
-                memory.title,
-                ui::truncate(&memory.content, 120),
-            )
-        }));
-        lines.push("Delete one with /memories delete <number>.".to_owned());
-        self.say(lines.join("\n"));
-    }
-
-    /// `/harness`, `/harness log`, `/harness revert <id>`.
-    ///
-    /// The point of the harness is that its changes are inspectable and
-    /// undoable, which only helps if there is a way to look and to undo.
-    pub(super) fn harness_command(&mut self, argument: &str) {
-        let applied = |changes: Vec<String>, none: &str| {
-            if changes.is_empty() { none.to_owned() } else { changes.join(", ") }
-        };
-        if let Some(id) = argument.strip_prefix("revert").map(str::trim) {
-            if id.is_empty() {
-                return self.fail("Usage: /harness revert <refinement-id> — ids come from /harness log");
+    /// `/memory`: what Abacus has learned in this workspace — memories,
+    /// papercuts, standing guidance — and the tools to curate it: `forget`
+    /// removes one, `log` and `revert` inspect and undo refinements, `refine`
+    /// runs a refinement now.
+    pub(super) fn memory_command(&mut self, argument: &str) {
+        use crate::harness::EntryKind;
+        let argument = argument.trim();
+        let (verb, rest) =
+            argument.split_once(char::is_whitespace).map_or((argument, ""), |(verb, rest)| (verb, rest.trim()));
+        // One ordering for display and forgetting alike, or the numbers shown
+        // would target different entries.
+        let memories = self.state.harness.snapshot_of(EntryKind::Memory);
+        let papercuts = self.papercuts.snapshot();
+        match verb {
+            "" => {}
+            "forget" | "delete" => {
+                let reference = rest.to_ascii_lowercase();
+                let pick =
+                    |prefix: char| reference.strip_prefix(prefix).and_then(|number| number.parse::<usize>().ok());
+                if let Some(number) = pick('m')
+                    && let Some(memory) = numbered(&memories, &number.to_string())
+                    && self.state.harness.remove(EntryKind::Memory, &memory.id)
+                {
+                    return self.say(format!("Memory \"{}\" forgotten.", memory.title));
+                }
+                if let Some(number) = pick('p')
+                    && let Some(cut) = numbered(&papercuts, &number.to_string())
+                    && self.papercuts.remove(cut.id)
+                {
+                    return self.say(format!("Papercut \"{}\" forgotten.", cut.title));
+                }
+                return self.fail("Usage: /memory forget m<number> | p<number> — numbers from /memory");
             }
-            return match self.state.harness.rollback(id) {
-                Ok(result) => self.say(format!(
-                    "Reverted {id} ({} edit(s) undone): {}\nThis rollback is itself {} — \
-                     revert it to redo.",
-                    result.applied_count(),
-                    applied(result.changes(), "nothing applied"),
-                    result.id
-                )),
-                Err(error) => self.fail(format!("{error:#}")),
-            };
-        }
-        if argument == "log" {
-            let history = self.state.harness.history();
-            if history.is_empty() {
-                return self.say(
-                    "No refinements recorded yet. Abacus refines after a long turn, or when \
-                     you run /refine.",
-                );
-            }
-            let mut lines = vec![format!("{} refinement(s), newest first:", history.len())];
-            lines.extend(history.iter().rev().take(15).map(|result| {
-                let changes = applied(result.changes(), "no applied edits");
-                format!("- {} — {} [{changes}]", result.id, result.summary)
-            }));
-            lines.push("Undo one with /harness revert <id>.".to_owned());
-            return self.say(lines.join("\n"));
-        }
-        if !argument.is_empty() {
-            return self.fail("Usage: /harness | /harness log | /harness revert <id>");
+            "log" => return self.memory_log(),
+            "revert" => return self.memory_revert(rest),
+            "refine" => return self.start_refine(rest),
+            _ => return self.fail("Usage: /memory [forget m1|p1] [log] [revert <id>] [refine [--durable]]"),
         }
         let mut lines: Vec<String> = Vec::new();
-        for kind in crate::harness::EntryKind::ALL {
+        if !memories.is_empty() {
+            lines.push(format!("Memories ({}), newest first:", memories.len()));
+            lines.extend(memories.iter().enumerate().map(|(index, memory)| {
+                format!(
+                    "  m{}. [{}] {} — {}",
+                    index + 1,
+                    memory.lifetime_label(),
+                    memory.title,
+                    ui::truncate(&memory.content, 120)
+                )
+            }));
+        }
+        if !papercuts.is_empty() {
+            let now = chrono::Utc::now();
+            lines.push(format!("Papercuts ({}) — fixes recalled when their error comes back:", papercuts.len()));
+            lines.extend(papercuts.iter().enumerate().map(|(index, cut)| {
+                format!(
+                    "  p{}. {} — tripped {}x, strength {:.1}\n      fix: {}\n      tripwires: {}",
+                    index + 1,
+                    cut.title,
+                    cut.trip_count,
+                    cut.decayed_strength(now),
+                    cut.fix,
+                    cut.tripwires.join(" · "),
+                )
+            }));
+        }
+        for kind in [EntryKind::Prompt, EntryKind::Subagent] {
             let entries = self.state.harness.snapshot_of(kind);
             if entries.is_empty() {
                 continue;
@@ -615,20 +479,59 @@ impl App {
         }
         if lines.is_empty() {
             return self.say(
-                "The harness is empty. Abacus fills it as it works — new entries start \
-                 session-scoped and become durable once they recur across sessions.",
+                "Nothing learned here yet. Abacus records memories, papercuts and standing guidance as it \
+                 works — on its own after long turns, or with /memory refine.",
             );
         }
-        lines.push("/harness log for history, /harness revert <id> to undo.".to_owned());
+        lines.push(
+            "/memory forget m1 removes a memory (p1 a papercut) · /memory log lists refinements · /memory revert <id> undoes one."
+                .to_owned(),
+        );
         self.say(lines.join("\n"));
     }
 
-    pub(super) fn toggle_agent_mode(&mut self) {
-        self.set_agent_mode(match self.agent_mode {
-            AgentMode::Auto => AgentMode::Plan,
-            AgentMode::Plan => AgentMode::Build,
-            AgentMode::Build => AgentMode::Auto,
-        });
+    /// `/memory log`: the refinements, newest first.
+    fn memory_log(&mut self) {
+        let history = self.state.harness.history();
+        if history.is_empty() {
+            return self.say("No refinements recorded yet. Abacus refines after a long turn, or with /memory refine.");
+        }
+        let applied =
+            |changes: Vec<String>| if changes.is_empty() { "no applied edits".to_owned() } else { changes.join(", ") };
+        let mut lines = vec![format!("{} refinement(s), newest first:", history.len())];
+        lines.extend(
+            history
+                .iter()
+                .rev()
+                .take(15)
+                .map(|result| format!("- {} — {} [{}]", result.id, result.summary, applied(result.changes()))),
+        );
+        lines.push("Undo one with /memory revert <id>.".to_owned());
+        self.say(lines.join("\n"));
+    }
+
+    /// `/memory revert <id>`: undo a refinement, which is itself undoable.
+    fn memory_revert(&mut self, id: &str) {
+        if id.is_empty() {
+            return self.fail("Usage: /memory revert <refinement-id> — ids come from /memory log");
+        }
+        match self.state.harness.rollback(id) {
+            Ok(result) => {
+                let changes = result.changes();
+                self.say(format!(
+                    "Reverted {id} ({} edit(s) undone): {}\nThis rollback is itself {} — revert it to redo.",
+                    result.applied_count(),
+                    if changes.is_empty() { "nothing applied".to_owned() } else { changes.join(", ") },
+                    result.id
+                ))
+            }
+            Err(error) => self.fail(format!("{error:#}")),
+        }
+    }
+
+    /// Shift+Tab: AUTO and YOLO, back and forth, for this session.
+    pub(super) fn toggle_mode(&mut self) {
+        self.set_mode(self.mode().toggled());
     }
 
     pub(super) fn goal_command(&mut self, argument: &str) {
@@ -647,7 +550,7 @@ impl App {
                             goal.note.map(|note| format!("\n\nLatest update: {note}")).unwrap_or_default()
                         )
                     })
-                    .unwrap_or_else(|| "No goal is set. Use /goal <objective>, ideally after /plan.".to_owned())),
+                    .unwrap_or_else(|| "No goal is set. Use /goal <objective>.".to_owned())),
                 None,
             )
         } else if argument == "pause" {
@@ -701,34 +604,6 @@ impl App {
         }
     }
 
-    /// `/swarm <objective>` asks the model to decompose the objective into
-    /// independent units and delegate them in a single `spawn_subagents` call.
-    /// It reuses the normal turn path, so the spawn still goes through approval,
-    /// worktree isolation, and the worker limits — this is just a user-facing
-    /// nudge toward parallel delegation, not a separate execution path.
-    pub(super) fn swarm_command(&mut self, argument: &str) {
-        let objective = argument.trim();
-        if objective.is_empty() {
-            self.say(
-                "Usage: /swarm <objective>. Abacus splits the objective into independent \
-                       units and delegates them to parallel subagents (one approval, isolated git \
-                       worktrees). Best for separable work; a single repository is required.",
-            );
-            self.follow = true;
-            return;
-        }
-        let prompt = format!(
-            "Tackle this objective by delegating independent units of work to parallel subagents. \
-             Identify the genuinely separable tasks — independent files, modules, or fixes that \
-             need no shared intermediate state — and run them together in a single spawn_subagents \
-             call, one worker per task, each with a self-contained prompt that states exactly what \
-             to change and how to verify it. Afterward, integrate and verify the combined result. \
-             If the objective does not split into at least two independent tasks, do not force a \
-             split: say so briefly and complete it directly.\n\nObjective: {objective}"
-        );
-        self.start_turn(objective.to_owned(), prompt, true);
-    }
-
     pub(super) fn loop_command(&mut self, argument: &str) {
         let argument = argument.trim();
         if argument.is_empty() || argument == "status" {
@@ -761,6 +636,9 @@ impl App {
                 Err(error) => self.status = format!("loop resume failed: {error}"),
             }
             return;
+        }
+        if argument == "cancel" {
+            return self.cancel_ralph_loop();
         }
         match RalphLoop::from_command(argument) {
             Ok(state) => {
@@ -895,63 +773,26 @@ impl App {
         self.follow = true;
     }
 
+    /// `/profile` opens the profile hub; `/profile <name>` switches straight
+    /// to one, by its name or a unique part of it.
     pub(super) fn profile_command(&mut self, argument: &str) {
         let argument = argument.trim();
         if argument.is_empty() {
-            let mut lines = self
-                .settings
-                .profiles
-                .iter()
-                .map(|(id, profile)| {
-                    let marker = if *id == self.settings.default_profile { "●" } else { " " };
-                    format!("{marker} {id}  —  {}  ·  {}", profile.name, profile.model)
-                })
-                .collect::<Vec<_>>();
-            lines.push(String::new());
-            lines.push(
-                "Switch with /profile <id>; /profile rename <id>; /profile delete <id>; /profile add.".to_owned(),
-            );
-            self.say(lines.join("\n"));
-            return;
+            return self.open_model_hub();
         }
-        let (verb, rest) =
-            argument.split_once(char::is_whitespace).map(|(verb, rest)| (verb, rest.trim())).unwrap_or((argument, ""));
-        match verb {
-            "rename" => {
-                if rest.is_empty() {
-                    self.status = "usage: /profile rename <new-id>".to_owned();
-                    return;
-                }
-                let from = self.settings.default_profile.clone();
-                match self.rename_profile(&from, rest) {
-                    Ok(id) => self.status = format!("profile renamed to {id}"),
-                    Err(error) => self.status = format!("could not rename profile: {error:#}"),
-                }
+        if self.settings.profiles.contains_key(argument) {
+            return self.switch_profile(argument);
+        }
+        let needle = argument.to_ascii_lowercase();
+        let matches: Vec<String> =
+            self.settings.profiles.keys().filter(|name| name.to_ascii_lowercase().contains(&needle)).cloned().collect();
+        match matches.as_slice() {
+            [only] => {
+                let only = only.clone();
+                self.switch_profile(&only);
             }
-            "delete" => {
-                if rest.is_empty() {
-                    self.status = "usage: /profile delete <id>".to_owned();
-                    return;
-                }
-                let id = rest.to_owned();
-                match self.delete_profile(&id) {
-                    Ok(()) => self.status = format!("profile {id} deleted"),
-                    Err(error) => self.status = format!("could not delete profile: {error:#}"),
-                }
-            }
-            "add" | "new" => self.open_provider_picker(),
-            "list" => self.profile_command(""),
-            id => {
-                if !self.settings.profiles.contains_key(id) {
-                    self.status = format!("no profile named `{id}`");
-                    return;
-                }
-                self.settings.default_profile = id.to_owned();
-                match self.save_and_apply_settings() {
-                    Ok(()) => self.status = format!("profile {id}"),
-                    Err(error) => self.status = format!("could not switch profile: {error:#}"),
-                }
-            }
+            [] => self.fail(format!("No profile matches `{argument}`. /profile lists them.")),
+            several => self.fail(format!("`{argument}` matches {} — say which.", several.join(", "))),
         }
     }
 
@@ -1005,7 +846,7 @@ impl App {
                     };
                     format!(
                         "refine — {} ({} harness edit(s){papercuts}, {scope}). Undo with \
-                         /harness revert {}.",
+                         /memory revert {}.",
                         outcome.summary, outcome.applied, outcome.result.id
                     )
                 }

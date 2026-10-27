@@ -11,21 +11,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::mcp::McpServerConfig;
 use crate::model_info::ModelLimits;
+use crate::providers::{Connection, ProviderConfig, join_ref, split_ref};
 use crate::tool_format::ToolFormat;
 
-pub const SETTINGS_VERSION: u32 = 2;
+/// Version 3 replaced per-endpoint profiles with providers (connections) and
+/// profiles (a `provider/model` and how to run it). [`Settings::load`]
+/// migrates older files in place, keeping a copy of the original.
+pub const SETTINGS_VERSION: u32 = 3;
 
 /// clap value parser that tolerates `k`/`m` suffixes (e.g. `128k`, `1m`).
 fn parse_token_arg(input: &str) -> Result<usize, String> {
     crate::model_info::parse_tokens(input).map_err(|error| error.to_string())
 }
 
-/// clap value parser for the tool-call text format.
-fn parse_agent_mode(input: &str) -> Result<crate::agent::AgentMode, String> {
-    crate::agent::AgentMode::parse(input)
-        .ok_or_else(|| format!("unknown mode `{}` (expected auto, plan, or build)", input.trim()))
+fn parse_permission(input: &str) -> Result<Permission, String> {
+    Permission::parse(input).ok_or_else(|| format!("unknown mode `{}` (expected auto or yolo)", input.trim()))
 }
 
+/// clap value parser for the tool-call text format.
 fn parse_tool_format(input: &str) -> Result<ToolFormat, String> {
     ToolFormat::parse(input).ok_or_else(|| {
         format!(
@@ -41,15 +44,15 @@ pub struct Cli {
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 
-    /// Named provider profile from ~/.abacus/config.toml
+    /// Profile to run, by name (see `abacus profiles`)
     #[arg(long)]
     pub profile: Option<String>,
 
-    /// Override the configured model
+    /// Model for this run: `provider/model`, or a model id on the profile's own provider
     #[arg(short = 'm', long, env = "ABACUS_MODEL")]
     pub model: Option<String>,
 
-    /// Override the OpenAI-compatible API base URL
+    /// Talk to this endpoint instead of a configured provider (with --model)
     #[arg(long, env = "ABACUS_BASE_URL")]
     pub base_url: Option<String>,
 
@@ -81,9 +84,13 @@ pub struct Cli {
     #[arg(short = 'r', long)]
     pub resume: Option<String>,
 
-    /// Allow edits and shell commands without asking for this run
-    #[arg(short = 'y', long = "always-approve")]
+    /// YOLO mode for this run: every action runs without review
+    #[arg(short = 'y', long = "yolo", alias = "always-approve")]
     pub yes: bool,
+
+    /// Permission mode for this run: auto (actions are reviewed) or yolo
+    #[arg(long, value_name = "MODE", value_parser = parse_permission)]
+    pub mode: Option<Permission>,
 
     /// Do not create or update a persistent session
     #[arg(long)]
@@ -108,11 +115,6 @@ pub struct Cli {
     #[arg(long, value_name = "FORMAT", value_parser = parse_tool_format)]
     pub tool_format: Option<ToolFormat>,
 
-    /// Pin the workflow mode for a headless run: auto, plan, or build.
-    /// Without this a headless run uses AUTO, letting the model choose.
-    #[arg(long, value_name = "MODE", value_parser = parse_agent_mode)]
-    pub mode: Option<crate::agent::AgentMode>,
-
     /// Drive a headless Ralph loop that replays the prompt until the completion promise appears or the iteration limit is reached
     #[arg(long = "loop")]
     pub loop_run: bool,
@@ -130,6 +132,8 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Whether the command line names an endpoint of its own, so no stored
+    /// profile is needed.
     pub fn has_inline_provider(&self) -> bool {
         self.model.is_some() && self.base_url.is_some()
     }
@@ -137,16 +141,34 @@ impl Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Configure a provider and model
-    Setup {
-        /// Replace the current default profile without confirmation
+    /// Connect a provider and choose a model
+    Setup,
+    /// List the models every provider serves, as `provider/model`
+    Models {
+        /// Only this provider's models
         #[arg(long)]
-        force: bool,
+        provider: Option<String>,
+        /// Ask the providers again instead of using the cached lists
+        #[arg(long)]
+        refresh: bool,
+        /// Print JSON, for a front end
+        #[arg(long)]
+        json: bool,
     },
-    /// List models reported by the active provider
-    Models,
-    /// List the upstream providers that can serve the active model
-    Providers,
+    /// List the configured providers
+    Providers {
+        /// Print JSON, for a front end
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the profiles, the active one marked
+    Profiles {
+        /// Print JSON, for a front end
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the OpenRouter upstreams that can serve the active model
+    Upstreams,
     /// List saved sessions for this workspace
     Sessions {
         /// List every workspace that has saved sessions, not just this one
@@ -236,8 +258,8 @@ pub enum Command {
     },
 }
 
-/// Whether an eval run can see the papercuts, memories, hive tier, and mode
-/// counts this machine has accumulated.
+/// Whether an eval run can see the papercuts, memories and hive tier this
+/// machine has accumulated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum EvalState {
     /// Use the real `~/.abacus`
@@ -315,8 +337,8 @@ pub enum CronCommand {
         workspace: Option<PathBuf>,
         #[arg(long)]
         profile: Option<String>,
-        /// Permit edits and commands during unattended execution
-        #[arg(long)]
+        /// Run in YOLO mode: actions run unreviewed while nobody is watching
+        #[arg(long = "yolo", alias = "always-approve")]
         always_approve: bool,
         /// Stop a run after this many minutes
         #[arg(long, default_value_t = 120)]
@@ -386,37 +408,56 @@ pub enum OutputFormat {
     StreamingJson,
 }
 
+/// A model on a provider, resolved for use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Target {
+    pub connection: Connection,
+    /// The id the provider knows the model by.
+    pub model: String,
+}
+
+impl Target {
+    /// `provider/model`.
+    pub fn reference(&self) -> String {
+        join_ref(&self.connection.provider, &self.model)
+    }
+}
+
+/// The models a profile assigned to background jobs (see [`crate::roles`]).
+/// Only explicit assignments are here: an unassigned role stays `None` and
+/// follows the main model wherever `/profile` moves it.
+#[derive(Debug, Clone, Default)]
+pub struct RoleTargets {
+    pub aux: Option<Target>,
+    pub subagent: Option<Target>,
+    pub compaction: Option<Target>,
+    /// The auto-mode reviewer. Unassigned it uses the `aux` model.
+    pub review: Option<Target>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub workspace: PathBuf,
+    /// The active profile's name, or `cli` for an endpoint given on the
+    /// command line.
     pub profile: String,
+    /// The model id the provider knows, `openai/gpt-6` on OpenRouter.
     pub model: String,
-    pub base_url: String,
-    pub protocol: ProviderProtocol,
-    pub api_key: Option<String>,
+    /// The provider the model is on, resolved.
+    pub connection: Connection,
     pub max_steps: usize,
     pub tool_output_limit: usize,
-    pub yes: bool,
+    /// Whether actions are reviewed (AUTO) or simply run (YOLO).
+    pub permission: Permission,
     pub no_session: bool,
     pub model_limits: ModelLimits,
     pub tool_format: ToolFormat,
-    /// Workflow mode pinned on the command line, if any.
-    pub mode: Option<crate::agent::AgentMode>,
     /// Whether to append SFT training traces for this session.
     pub trace_enabled: bool,
     /// Upstream routing preferences, applied by providers that support them.
     pub routing: Routing,
     pub web_search: crate::web::WebConfig,
-    /// A custom endpoint definition, when the active profile names one.
-    pub endpoint: Option<crate::endpoint::ScriptedEndpoint>,
-    /// The auxiliary model for secondary calls, or None to reuse `model`.
-    pub aux_model: Option<String>,
-    /// Model for delegated agents that name none themselves — the `subagent`
-    /// role — or None to reuse `model`.
-    pub subagent_model: Option<String>,
-    /// Model for the rolling compaction summary — the `compaction` role — or
-    /// None to reuse `model`.
-    pub compaction_model: Option<String>,
+    pub roles: RoleTargets,
     /// Reasoning effort sent with every request, when set.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Aggressively reduce upstream context and nonessential auxiliary calls.
@@ -436,23 +477,17 @@ impl Config {
             workspace,
             profile: "default".to_owned(),
             model,
-            base_url,
-            protocol: ProviderProtocol::default(),
-            api_key: None,
+            connection: Connection::inline(&base_url, ProviderProtocol::default(), None),
             max_steps: 32,
             tool_output_limit: 30_000,
-            yes: false,
+            permission: Permission::default(),
             no_session: false,
             model_limits: ModelLimits::default(),
             tool_format: ToolFormat::default(),
-            mode: None,
             trace_enabled: false,
             routing: Routing::default(),
             web_search: Default::default(),
-            endpoint: None,
-            aux_model: None,
-            subagent_model: None,
-            compaction_model: None,
+            roles: RoleTargets::default(),
             reasoning_effort: None,
             token_compression: false,
             one_stream: false,
@@ -461,125 +496,138 @@ impl Config {
         }
     }
 
+    /// A configuration with no provider yet, for the app server, which helps
+    /// a front end set one up rather than refusing to start.
+    pub fn unconfigured(cli: &Cli, settings: &Settings, paths: AbacusPaths) -> Result<Self> {
+        let workspace = resolve_workspace(cli.path.as_deref())?;
+        let mut config = Self::for_endpoint(workspace, String::new(), String::new(), paths);
+        config.profile = String::new();
+        config.connection = Connection::default();
+        config.apply_agent_settings(cli, settings);
+        Ok(config)
+    }
+
     pub fn resolve(cli: &Cli, settings: &Settings, credentials: &Credentials, paths: AbacusPaths) -> Result<Self> {
         let workspace = resolve_workspace(cli.path.as_deref())?;
-        let profile_name = cli.profile.clone().unwrap_or_else(|| settings.default_profile.clone());
-        let profile = settings.profiles.get(&profile_name);
+        let mut config = Self::for_endpoint(workspace, String::new(), String::new(), paths);
+        config.apply_agent_settings(cli, settings);
 
-        let scripted_model = profile
-            .and_then(|profile| profile.endpoint.as_deref())
-            .and_then(|reference| crate::endpoint::ScriptedEndpoint::resolve(reference, &paths.endpoints_dir).ok())
-            .and_then(|endpoint| endpoint.model.clone());
-        let model = cli
-            .model
-            .clone()
-            .or_else(|| profile.map(|value| value.model.clone()))
-            .filter(|value| !value.trim().is_empty())
-            .or(scripted_model)
-            .context("no model configured; run `abacus setup`")?;
-        // A scripted endpoint, when the profile names one, supplies the URL,
-        // protocol, and (optionally) model — so a scripted profile need not
-        // repeat them. It is loaded only from ~/.abacus/endpoints, never a
-        // workspace, since it can run a token command and carry a bearer.
-        let endpoint = profile
-            .and_then(|profile| profile.endpoint.as_deref())
-            .map(|reference| crate::endpoint::ScriptedEndpoint::resolve(reference, &paths.endpoints_dir))
-            .transpose()?;
+        // An endpoint named on the command line needs no stored profile: the
+        // way a CI job or a one-off run points Abacus somewhere.
+        if let Some(base_url) = cli.base_url.as_deref().map(str::trim).filter(|url| !url.is_empty()) {
+            let model = cli
+                .model
+                .clone()
+                .filter(|model| !model.trim().is_empty())
+                .context("--base-url needs --model to say which model to run")?;
+            config.profile = "cli".to_owned();
+            config.connection = Connection::inline(base_url, cli.protocol.unwrap_or_default(), cli.api_key.clone());
+            config.model_limits = ModelLimits::resolve_from_name(&model, cli.context_window, cli.max_output_tokens);
+            config.tool_format = cli.tool_format.unwrap_or_default();
+            config.model = model;
+            return Ok(config);
+        }
 
-        let base_url = cli
-            .base_url
-            .clone()
-            .or_else(|| profile.map(|value| value.base_url.clone()))
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| endpoint.as_ref().map(|endpoint| endpoint.url.clone()))
-            .context("no provider URL configured; run `abacus setup`")?;
-        // A scripted endpoint is the authority on its own wire format, so it
-        // beats the profile's protocol (which is only the serde default when a
-        // scripted profile omits it). A CLI flag still wins over everything.
-        let protocol = cli
-            .protocol
-            .or_else(|| endpoint.as_ref().map(|endpoint| endpoint.protocol))
-            .or_else(|| profile.map(|value| value.protocol))
-            .unwrap_or_default();
-
-        // A scripted endpoint carries its own auth, so it does not need the
-        // standard API key; the ordinary sources still apply as a fallback.
-        let api_key = cli.api_key.clone().or_else(|| {
-            profile.and_then(|profile| {
-                profile
-                    .api_key_env
-                    .as_deref()
-                    .and_then(|name| std::env::var(name).ok())
-                    .or_else(|| credentials.keys.get(&profile_name).cloned())
-            })
-        });
-
-        // CLI wins for this run; then the active profile; leftover [agent]
-        // fields keep older config.toml working until a profile override is set.
-        let (profile_context, profile_output) = settings.profile_limits(&profile_name);
-        let context_override = cli.context_window.or(profile_context);
-        let output_override = cli.max_output_tokens.or(profile_output);
-        let model_limits = ModelLimits::resolve_from_name(&model, context_override, output_override);
-        let tool_format = cli
-            .tool_format
-            .or_else(|| settings.agent.tool_format.as_deref().and_then(ToolFormat::parse))
-            .unwrap_or_default();
-
-        Ok(Self {
-            workspace,
-            profile: if profile.is_some() { profile_name } else { "cli".to_owned() },
-            model,
-            base_url: base_url.trim_end_matches('/').to_owned(),
-            protocol,
-            api_key,
-            max_steps: cli.max_steps.unwrap_or(settings.agent.max_steps).clamp(1, 128),
-            tool_output_limit: settings.agent.tool_output_limit.clamp(2_000, 200_000),
-            yes: cli.yes || settings.ui.permission_mode == PermissionMode::AlwaysApprove,
-            no_session: cli.no_session,
-            model_limits,
-            tool_format,
-            mode: cli.mode,
-            trace_enabled: settings.trace.enabled,
-            routing: Routing {
-                order: profile.map(|profile| profile.providers.clone()).unwrap_or_default(),
-                allow_fallbacks: profile.is_none_or(|profile| profile.allow_fallbacks),
-            },
-            web_search: settings.search.resolve(),
-            endpoint,
-            aux_model: profile.and_then(|profile| profile.aux_model.clone()).filter(|model| !model.trim().is_empty()),
-            // Only an *explicit* role assignment travels here. An unassigned
-            // role stays `None` so the turn falls back to the main model,
-            // which is what the fallback chain resolves to anyway — resolving
-            // it here instead would pin the main model at startup and stop
-            // `/model` from moving these along with it.
-            subagent_model: profile.and_then(|profile| profile.role_model("subagent")).map(str::to_owned),
-            compaction_model: profile.and_then(|profile| profile.role_model("compaction")).map(str::to_owned),
-            reasoning_effort: profile.and_then(|profile| profile.reasoning_effort),
-            token_compression: settings.agent.token_compression,
-            one_stream: settings.agent.one_stream,
-            prompt_cache: settings.agent.prompt_cache,
-            paths,
-        })
+        let name = cli.profile.clone().unwrap_or_else(|| settings.default_profile.clone());
+        let profile = settings.profiles.get(&name).with_context(|| {
+            if settings.profiles.is_empty() {
+                "no profile configured yet; run `abacus setup`".to_owned()
+            } else {
+                format!(
+                    "no profile named `{name}` (there is {}); `abacus profiles` lists them",
+                    settings.profiles.keys().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")
+                )
+            }
+        })?;
+        let reference = match cli.model.as_deref().map(str::trim).filter(|model| !model.is_empty()) {
+            Some(model) => settings.qualify(model, profile),
+            None => profile.model.clone(),
+        };
+        let target = settings.target(&reference, credentials)?;
+        config.profile = name;
+        config.connection = target.connection;
+        if let Some(key) = cli.api_key.clone() {
+            config.connection.api_key = Some(key);
+        }
+        if let Some(protocol) = cli.protocol {
+            config.connection.protocol = protocol;
+        }
+        config.model_limits = ModelLimits::resolve_from_name(
+            &target.model,
+            cli.context_window.or(profile.context_window),
+            cli.max_output_tokens.or(profile.max_output_tokens),
+        );
+        config.tool_format =
+            cli.tool_format.or_else(|| profile.tool_format.as_deref().and_then(ToolFormat::parse)).unwrap_or_default();
+        config.model = target.model;
+        config.apply_profile(settings, profile, credentials);
+        Ok(config)
     }
 
-    pub fn endpoint(&self) -> String {
-        if let Some(scripted) = &self.endpoint {
-            return scripted.request_url().to_owned();
-        }
-        match self.protocol {
-            ProviderProtocol::ChatCompletions => format!("{}/chat/completions", self.base_url),
-            ProviderProtocol::Responses => format!("{}/responses", self.base_url),
-            ProviderProtocol::Anthropic => format!("{}/v1/messages", self.base_url),
-        }
+    /// The settings that are the agent's rather than the model's.
+    fn apply_agent_settings(&mut self, cli: &Cli, settings: &Settings) {
+        self.max_steps = cli.max_steps.unwrap_or(settings.agent.max_steps).clamp(1, 128);
+        self.tool_output_limit = settings.agent.tool_output_limit.clamp(2_000, 200_000);
+        self.permission = if cli.yes { Permission::Yolo } else { cli.mode.unwrap_or(settings.agent.mode) };
+        self.no_session = cli.no_session;
+        self.trace_enabled = settings.trace.enabled;
+        self.web_search = settings.search.resolve();
+        self.token_compression = settings.agent.token_compression;
+        self.one_stream = settings.agent.one_stream;
+        self.prompt_cache = settings.agent.prompt_cache;
     }
 
-    /// The models-list URL, or `None` when a scripted endpoint declares none —
-    /// in which case limit detection is skipped rather than hitting a 404.
-    pub fn models_endpoint(&self) -> Option<String> {
-        if let Some(scripted) = &self.endpoint {
-            return scripted.models_url.clone();
+    /// Point this configuration at another profile, the way `/profile` and
+    /// the desktop's profile picker switch mid-session. Limits come from the
+    /// profile, then from the provider's cached model list.
+    pub fn use_profile(&mut self, settings: &Settings, credentials: &Credentials, name: &str) -> Result<()> {
+        let profile = settings.profiles.get(name).with_context(|| format!("no profile named `{name}`"))?;
+        let target = settings.target(&profile.model, credentials)?;
+        self.profile = name.to_owned();
+        self.connection = target.connection;
+        self.model = target.model;
+        self.model_limits =
+            ModelLimits::resolve_from_name(&self.model, profile.context_window, profile.max_output_tokens);
+        if self.model_limits.source != crate::model_info::LimitSource::Override
+            && let Some(card) = crate::providers::cached_catalog(&self.paths, &self.connection.provider)
+                .and_then(|catalog| catalog.card(&self.model).cloned())
+            && let Some(context) = card.context_length
+        {
+            self.model_limits.apply_detected(context, card.max_output_tokens);
         }
-        Some(format!("{}/models", self.base_url))
+        self.tool_format = profile.tool_format.as_deref().and_then(ToolFormat::parse).unwrap_or_default();
+        self.apply_profile(settings, profile, credentials);
+        Ok(())
+    }
+
+    /// What a profile sets beyond its model: effort, routing, and the models
+    /// its background jobs run on.
+    pub fn apply_profile(&mut self, settings: &Settings, profile: &Profile, credentials: &Credentials) {
+        self.reasoning_effort = profile.reasoning_effort;
+        self.routing = Routing { order: profile.upstreams.clone(), allow_fallbacks: profile.allow_fallbacks };
+        // A role naming a provider that is gone falls back to the main model
+        // rather than stopping the session from opening at all.
+        let role = |id: &str| profile.role_model(id).and_then(|reference| settings.target(reference, credentials).ok());
+        self.roles = RoleTargets {
+            aux: role("aux"),
+            subagent: role("subagent"),
+            compaction: role("compaction"),
+            review: role("review"),
+        };
+    }
+
+    /// Whether a model is configured — false only for the app server's
+    /// set-up-first state.
+    pub fn is_configured(&self) -> bool {
+        !self.model.trim().is_empty() && !self.connection.base_url.is_empty()
+    }
+
+    /// `provider/model`, the name the model goes by everywhere a person sees it.
+    pub fn model_ref(&self) -> String {
+        if self.model.is_empty() {
+            return String::new();
+        }
+        join_ref(&self.connection.provider, &self.model)
     }
 
     pub fn workspace_name(&self) -> &str {
@@ -587,12 +635,55 @@ impl Config {
     }
 }
 
+/// Whether the agent's actions are reviewed before they run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    /// Reading, searching and edits inside the workspace run at once; anything
+    /// else is judged first by a reviewer model against what you asked for,
+    /// and blocked when it goes beyond it.
+    #[default]
+    Auto,
+    /// Everything runs without review.
+    Yolo,
+}
+
+impl Permission {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "AUTO",
+            Self::Yolo => "YOLO",
+        }
+    }
+
+    /// The mode `name` spells, in any case. The names older versions used
+    /// still parse: what they meant maps onto one of the two that remain.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "auto" | "plan" | "build" | "ask" => Some(Self::Auto),
+            "yolo" | "always-approve" | "bypass" => Some(Self::Yolo),
+            _ => None,
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Auto => Self::Yolo,
+            Self::Yolo => Self::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub version: u32,
+    /// The profile a new session runs, by name.
     pub default_profile: String,
-    pub profiles: BTreeMap<String, ProviderProfile>,
+    /// The API connections, by id. Model references name them.
+    pub providers: BTreeMap<String, ProviderConfig>,
+    /// The profiles, by name: a `provider/model` and how to run it.
+    pub profiles: BTreeMap<String, Profile>,
     pub ui: UiSettings,
     pub agent: AgentSettings,
     pub skills: DiscoverySettings,
@@ -612,7 +703,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             version: SETTINGS_VERSION,
-            default_profile: "default".to_owned(),
+            default_profile: String::new(),
+            providers: BTreeMap::new(),
             profiles: BTreeMap::new(),
             ui: UiSettings::default(),
             agent: AgentSettings::default(),
@@ -627,6 +719,84 @@ impl Default for Settings {
             remote: RemoteSettings::default(),
         }
     }
+}
+
+/// A profile: a model, and the settings to run it with. Its name is the key
+/// it is stored under; new ones are named after their model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Profile {
+    /// `provider/model`.
+    pub model: String,
+    /// Context window in tokens. Unset means detect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    /// Max output tokens, sent as `max_tokens`. Unset means detect, or leave
+    /// it to the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<usize>,
+    /// How hard the model should think. Unset leaves it to the provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// How to read tool calls a model writes as text (`auto`, `none`,
+    /// `hermes`, …). Unset means `auto`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_format: Option<String>,
+    /// OpenRouter upstreams to route to, most preferred first, spelled as
+    /// OpenRouter reports them (`Together`, `deepinfra/fp8`). One model is
+    /// served by several suppliers that differ in context length,
+    /// quantization and speed; pinning is how you stop landing on whichever
+    /// is cheapest today. Ignored by every other provider.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub upstreams: Vec<String>,
+    /// Whether an upstream outside `upstreams` may serve a request none of
+    /// them can. False makes the pin strict.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub allow_fallbacks: bool,
+    /// Models for the jobs beyond the conversation, each `provider/model`:
+    /// `aux`, `subagent`, `compaction`, `review` — see [`crate::roles`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, String>,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            context_window: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            tool_format: None,
+            upstreams: Vec::new(),
+            allow_fallbacks: true,
+            roles: BTreeMap::new(),
+        }
+    }
+}
+
+impl Profile {
+    pub fn for_model(reference: &str) -> Self {
+        Self { model: reference.to_owned(), ..Self::default() }
+    }
+
+    /// The provider id this profile's model is on.
+    pub fn provider(&self) -> &str {
+        split_ref(&self.model).map_or("", |(provider, _)| provider)
+    }
+}
+
+/// Profile names are free text — they are what pickers show — but one line,
+/// and not so long a picker cannot show it.
+pub fn validate_profile_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
+        bail!("a profile name is 1–80 characters on one line");
+    }
+    Ok(name)
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -683,18 +853,43 @@ impl ProjectExtensions {
 }
 
 impl Settings {
+    /// Read the settings. An older file is moved to the current shape first
+    /// and saved straight away, with the original kept beside it as
+    /// `config.toml.v<N>.bak`.
     pub fn load(paths: &AbacusPaths) -> Result<Self> {
         if !paths.config_file.exists() {
             return Ok(Self::default());
         }
         let content = fs::read_to_string(&paths.config_file)
             .with_context(|| format!("could not read {}", paths.config_file.display()))?;
-        let mut settings: Self =
+        let mut table: toml::Table =
             toml::from_str(&content).with_context(|| format!("invalid config: {}", paths.config_file.display()))?;
-        if settings.version > SETTINGS_VERSION {
-            bail!("config version {} is newer than this Abacus supports ({SETTINGS_VERSION})", settings.version);
+        let version = table.get("version").and_then(toml::Value::as_integer).unwrap_or(1);
+        if version > i64::from(SETTINGS_VERSION) {
+            bail!("config version {version} is newer than this Abacus supports ({SETTINGS_VERSION})");
         }
+        let migrated = version < i64::from(SETTINGS_VERSION);
+        let mut credentials = None;
+        if migrated {
+            let mut loaded = Credentials::load(paths).unwrap_or_default();
+            if migrate_v2(&mut table, &mut loaded, paths) {
+                credentials = Some(loaded);
+            }
+        }
+        let mut settings: Self = toml::Value::Table(table)
+            .try_into()
+            .with_context(|| format!("invalid config: {}", paths.config_file.display()))?;
         settings.version = SETTINGS_VERSION;
+        if migrated {
+            let backup = paths.root.join(format!("config.toml.v{version}.bak"));
+            if !backup.exists() {
+                atomic_write(&backup, content.as_bytes(), false)?;
+            }
+            settings.save(paths)?;
+            if let Some(credentials) = credentials {
+                credentials.save(paths)?;
+            }
+        }
         Ok(settings)
     }
 
@@ -704,111 +899,274 @@ impl Settings {
         atomic_write(&paths.config_file, content.as_bytes(), false)
     }
 
+    /// Whether the default profile exists and so does its provider.
     pub fn is_configured(&self) -> bool {
-        self.profiles.contains_key(&self.default_profile)
+        self.profiles.get(&self.default_profile).is_some_and(|profile| self.providers.contains_key(profile.provider()))
     }
 
-    /// Effective token-limit overrides for `profile_name`: the profile's own
-    /// values when set, otherwise leftover `[agent]` fields from older configs.
-    pub fn profile_limits(&self, profile_name: &str) -> (Option<usize>, Option<usize>) {
-        let profile = self.profiles.get(profile_name);
-        (
-            profile.and_then(|profile| profile.context_window).or(self.agent.context_window),
-            profile.and_then(|profile| profile.max_output_tokens).or(self.agent.max_output_tokens),
-        )
+    pub fn active_profile(&self) -> Option<&Profile> {
+        self.profiles.get(&self.default_profile)
     }
-}
 
-/// Profile map keys must stay TOML-table-safe. Display names can be anything;
-/// this only gates rename / create of the id itself.
-pub fn validate_profile_id(id: &str) -> Result<&str> {
-    let id = id.trim();
-    if id.is_empty() || id.len() > 64 || !id.chars().all(is_profile_id_char) {
-        bail!("profile id must be 1–64 characters: letters, digits, `.`, `_`, or `-`");
-    }
-    Ok(id)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderProfile {
-    pub name: String,
-    #[serde(default)]
-    pub base_url: String,
-    #[serde(default)]
-    pub model: String,
-    #[serde(default)]
-    pub protocol: ProviderProtocol,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_env: Option<String>,
-    /// A cheaper/secondary model used for background calls (refine, draft
-    /// recommendations, tether, compaction summary, command classification)
-    /// on this same endpoint. None means "use the main model".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aux_model: Option<String>,
-    /// How hard this profile's model should think. Unset leaves it to the
-    /// provider.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<ReasoningEffort>,
-    /// Name (or path) of a scripted endpoint YAML under ~/.abacus/endpoints.
-    /// When set, its URL, auth, headers, and body overrides drive the request
-    /// and `base_url`/`protocol` here are only fallbacks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    /// Upstream providers to route to, most preferred first.
-    ///
-    /// OpenRouter fronts many suppliers for the same model and they differ in
-    /// context length, quantization, and speed — one `glm-5.2` endpoint offers
-    /// 1M context at fp8, another 96k at fp4. Pinning is how you stop landing
-    /// on whichever happens to be cheapest today.
-    ///
-    /// Written through verbatim as `provider.order`, so use whatever spelling
-    /// OpenRouter reports (`Together`, `Z.AI`, `deepinfra/fp8`) — `abacus
-    /// providers` lists them for the active model. Empty means "let OpenRouter
-    /// choose". Ignored by providers that do not support routing.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub providers: Vec<String>,
-    /// Whether OpenRouter may fall back to a provider outside `providers` when
-    /// none of them can serve the request. False makes the pin strict: the
-    /// request fails rather than quietly landing somewhere else.
-    #[serde(default = "default_true")]
-    pub allow_fallbacks: bool,
-    /// Context window override in tokens for this profile. Unset means detect.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<usize>,
-    /// Max output tokens sent as `max_tokens` for this profile. Unset means
-    /// detect, or leave it to the server.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<usize>,
-    /// Models assigned to named jobs beyond the conversation itself — see
-    /// [`crate::roles`]. `default` and `aux` are stored in `model` and
-    /// `aux_model` above rather than here, so this map stays empty on a
-    /// profile that only uses the two slots that always existed.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub roles: BTreeMap<String, String>,
-}
-
-impl Default for ProviderProfile {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            base_url: String::new(),
-            model: String::new(),
-            protocol: ProviderProtocol::default(),
-            api_key_env: None,
-            aux_model: None,
-            reasoning_effort: None,
-            endpoint: None,
-            providers: Vec::new(),
-            allow_fallbacks: true,
-            context_window: None,
-            max_output_tokens: None,
-            roles: Default::default(),
+    /// `model` as a reference: as it is when its first segment names a
+    /// provider, otherwise a model on `profile`'s own provider. So
+    /// `openrouter/openai/gpt-6` and, on an OpenRouter profile, `openai/gpt-6`
+    /// both mean the same model.
+    pub fn qualify(&self, model: &str, profile: &Profile) -> String {
+        let model = model.trim();
+        match split_ref(model) {
+            Some((provider, _)) if self.providers.contains_key(provider) => model.to_owned(),
+            _ => join_ref(profile.provider(), model),
         }
     }
+
+    /// Resolve a `provider/model` reference.
+    pub fn target(&self, reference: &str, credentials: &Credentials) -> Result<Target> {
+        let (provider, model) = split_ref(reference)
+            .with_context(|| format!("`{reference}` names no provider; models are written `provider/model`"))?;
+        let config = self.providers.get(provider).with_context(|| {
+            format!("`{reference}` is on provider `{provider}`, which is not configured; `abacus providers` lists them")
+        })?;
+        Ok(Target { connection: Connection::resolve(provider, config, credentials), model: model.to_owned() })
+    }
+
+    /// The profile that runs exactly `reference`, if one does.
+    pub fn profile_for(&self, reference: &str) -> Option<&str> {
+        self.profiles.iter().find(|(_, profile)| profile.model == reference).map(|(name, _)| name.as_str())
+    }
+
+    /// The names of the profiles on `provider`.
+    pub fn profiles_on(&self, provider: &str) -> Vec<String> {
+        self.profiles
+            .iter()
+            .filter(|(_, profile)| profile.provider() == provider)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// `base`, or `base (2)`, `base (3)`… — the first no profile has.
+    pub fn unused_profile_name(&self, base: &str) -> String {
+        std::iter::once(base.to_owned())
+            .chain((2..).map(|suffix| format!("{base} ({suffix})")))
+            .find(|candidate| !self.profiles.contains_key(candidate))
+            .expect("an unused suffix exists")
+    }
+
+    /// Add a profile for `reference` with every setting at its default, named
+    /// after the model, and return its name.
+    pub fn add_profile(&mut self, reference: &str) -> String {
+        let name = self.unused_profile_name(reference);
+        self.profiles.insert(name.clone(), Profile::for_model(reference));
+        name
+    }
+
+    pub fn rename_profile(&mut self, from: &str, to: &str) -> Result<String> {
+        let to = validate_profile_name(to)?.to_owned();
+        if to == from {
+            return Ok(to);
+        }
+        if self.profiles.contains_key(&to) {
+            bail!("a profile named `{to}` already exists");
+        }
+        let profile = self.profiles.remove(from).with_context(|| format!("no profile named `{from}`"))?;
+        self.profiles.insert(to.clone(), profile);
+        if self.default_profile == from {
+            self.default_profile = to.clone();
+        }
+        Ok(to)
+    }
+
+    /// Remove a profile. The last one stays: a session needs something to run.
+    pub fn remove_profile(&mut self, name: &str) -> Result<()> {
+        if !self.profiles.contains_key(name) {
+            bail!("no profile named `{name}`");
+        }
+        if self.profiles.len() == 1 {
+            bail!("that is the only profile; add another before removing it");
+        }
+        self.profiles.remove(name);
+        if self.default_profile == name {
+            self.default_profile = self.profiles.keys().next().cloned().unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    /// Remove a provider and every profile on it, returning those profiles.
+    /// Roles that pointed at it fall back to their profile's model.
+    pub fn remove_provider(&mut self, id: &str) -> Vec<String> {
+        self.providers.remove(id);
+        let removed = self.profiles_on(id);
+        for name in &removed {
+            self.profiles.remove(name);
+        }
+        for profile in self.profiles.values_mut() {
+            profile.roles.retain(|_, reference| split_ref(reference).is_none_or(|(provider, _)| provider != id));
+        }
+        if !self.profiles.contains_key(&self.default_profile) {
+            self.default_profile = self.profiles.keys().next().cloned().unwrap_or_default();
+        }
+        removed
+    }
 }
 
-fn is_profile_id_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')
+/// Move a version 1 or 2 settings table to version 3, in place.
+///
+/// An old profile was an endpoint and a model at once. Each becomes a provider
+/// — shared with any earlier one on the same endpoint and key — and a profile
+/// of the same name on it, so `--profile` and scheduled jobs keep working. A
+/// profile that named a scripted endpoint file has the file folded into its
+/// provider. Returns whether `credentials` gained keys, which happens when a
+/// provider got an id other than its old profile's, or a scripted endpoint
+/// carried a literal token. Old entries are left in place, so restoring the
+/// backup restores a working setup.
+fn migrate_v2(table: &mut toml::Table, credentials: &mut Credentials, paths: &AbacusPaths) -> bool {
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct OldProfile {
+        name: String,
+        base_url: String,
+        model: String,
+        protocol: ProviderProtocol,
+        api_key_env: Option<String>,
+        aux_model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+        endpoint: Option<String>,
+        providers: Vec<String>,
+        #[serde(default = "default_true")]
+        allow_fallbacks: bool,
+        context_window: Option<usize>,
+        max_output_tokens: Option<usize>,
+        roles: BTreeMap<String, String>,
+    }
+
+    let old: BTreeMap<String, OldProfile> =
+        table.remove("profiles").and_then(|value| value.try_into().ok()).unwrap_or_default();
+    let mut agent = table.remove("agent").and_then(|value| value.as_table().cloned()).unwrap_or_default();
+    let mut ui = table.remove("ui").and_then(|value| value.as_table().cloned()).unwrap_or_default();
+    let tokens = |value: Option<toml::Value>| value.and_then(|value| value.as_integer()).map(|value| value as usize);
+    let leftover_context = tokens(agent.remove("context_window"));
+    let leftover_output = tokens(agent.remove("max_output_tokens"));
+    let leftover_format = agent.remove("tool_format").and_then(|value| value.as_str().map(str::to_owned));
+    let review_on_main = ui.remove("safety_uses_main").and_then(|value| value.as_bool()).unwrap_or(false);
+    if ui.remove("permission_mode").and_then(|value| value.as_str().map(str::to_owned)).as_deref()
+        == Some("always-approve")
+    {
+        agent.insert("mode".to_owned(), toml::Value::String("yolo".to_owned()));
+    }
+
+    let mut providers: BTreeMap<String, ProviderConfig> = BTreeMap::new();
+    let mut profiles: BTreeMap<String, Profile> = BTreeMap::new();
+    let mut credentials_changed = false;
+    for (old_id, old) in old {
+        let name = if old.name.trim().is_empty() { old_id.clone() } else { old.name.clone() };
+        let mut provider = ProviderConfig {
+            name: name.clone(),
+            base_url: old.base_url.trim().trim_end_matches('/').to_owned(),
+            protocol: old.protocol,
+            api_key_env: old.api_key_env.clone(),
+            ..ProviderConfig::default()
+        };
+        let mut model = old.model.trim().to_owned();
+        let mut key = credentials.keys.get(&old_id).cloned();
+        if let Some(reference) = &old.endpoint
+            && let Ok(imported) = crate::providers::import_endpoint(reference, &paths.endpoints_dir)
+        {
+            provider = ProviderConfig { name, ..imported.provider };
+            if model.is_empty() {
+                model = imported.model.unwrap_or_default();
+            }
+            key = key.or(imported.token);
+        }
+        let shared = providers
+            .iter()
+            .find(|(id, existing)| {
+                ProviderConfig { name: String::new(), ..(*existing).clone() }
+                    == ProviderConfig { name: String::new(), ..provider.clone() }
+                    && credentials.keys.get(*id) == key.as_ref()
+            })
+            .map(|(id, _)| id.clone());
+        let provider_id = match shared {
+            Some(id) => id,
+            None => {
+                // An id another profile's key is stored under is not reused,
+                // so no key is ever written over.
+                let id = crate::providers::unused_id(&preferred_provider_id(&old_id, &provider), |candidate| {
+                    providers.contains_key(candidate)
+                        || credentials.keys.get(candidate).is_some_and(|stored| Some(stored) != key.as_ref())
+                });
+                if let Some(key) = &key
+                    && credentials.keys.get(&id) != Some(key)
+                {
+                    credentials.keys.insert(id.clone(), key.clone());
+                    credentials_changed = true;
+                }
+                providers.insert(id.clone(), provider);
+                id
+            }
+        };
+        // A profile that never got a model was never runnable; its provider
+        // is kept so the key is not lost.
+        if model.is_empty() {
+            continue;
+        }
+        let qualify = |model: &str| join_ref(&provider_id, model.trim());
+        let mut roles = BTreeMap::new();
+        if let Some(aux) = old.aux_model.as_deref().filter(|aux| !aux.trim().is_empty()) {
+            roles.insert("aux".to_owned(), qualify(aux));
+        }
+        for (role, model) in &old.roles {
+            if !model.trim().is_empty() && role != "default" {
+                roles.insert(role.clone(), qualify(model));
+            }
+        }
+        if review_on_main {
+            roles.insert("review".to_owned(), qualify(&model));
+        }
+        profiles.insert(
+            old_id,
+            Profile {
+                model: qualify(&model),
+                context_window: old.context_window.or(leftover_context),
+                max_output_tokens: old.max_output_tokens.or(leftover_output),
+                reasoning_effort: old.reasoning_effort,
+                tool_format: leftover_format.clone(),
+                upstreams: old.providers,
+                allow_fallbacks: old.allow_fallbacks,
+                roles,
+            },
+        );
+    }
+
+    let default_profile = table.get("default_profile").and_then(toml::Value::as_str).unwrap_or_default().to_owned();
+    if !profiles.contains_key(&default_profile) {
+        let first = profiles.keys().next().cloned().unwrap_or_default();
+        table.insert("default_profile".to_owned(), toml::Value::String(first));
+    }
+    let as_table =
+        |value: Result<toml::Value, toml::ser::Error>| value.unwrap_or(toml::Value::Table(toml::Table::new()));
+    table.insert("providers".to_owned(), as_table(toml::Value::try_from(&providers)));
+    table.insert("profiles".to_owned(), as_table(toml::Value::try_from(&profiles)));
+    table.insert("agent".to_owned(), toml::Value::Table(agent));
+    table.insert("ui".to_owned(), toml::Value::Table(ui));
+    table.insert("version".to_owned(), toml::Value::Integer(i64::from(SETTINGS_VERSION)));
+    credentials_changed
+}
+
+/// The id a migrated provider would like: the preset it matches, else the old
+/// profile's id unless that was a placeholder, else its name made into an id.
+fn preferred_provider_id(old_id: &str, provider: &ProviderConfig) -> String {
+    if let Some(preset) = crate::providers::PRESETS
+        .iter()
+        .find(|preset| preset.base_url == provider.base_url && preset.protocol == provider.protocol)
+    {
+        return preset.id.to_owned();
+    }
+    if !matches!(old_id, "default" | "cli" | "custom") && crate::providers::validate_provider_id(old_id).is_ok() {
+        return old_id.to_owned();
+    }
+    Some(crate::providers::slug(&provider.name))
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| "provider".to_owned())
 }
 
 /// How hard the model should think before answering. Left unset, nothing is
@@ -910,7 +1268,6 @@ pub enum ProviderProtocol {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiSettings {
-    pub permission_mode: PermissionMode,
     pub vim_mode: bool,
     pub animations: bool,
     pub show_tooltips: bool,
@@ -927,11 +1284,6 @@ pub struct UiSettings {
     /// and say so in the transcript. Never downloads or installs anything.
     #[serde(default = "default_true")]
     pub check_updates: bool,
-    /// Judge borderline commands and paths with the main model rather than the
-    /// auxiliary one. The decision gates what the agent may do, so a stronger
-    /// model is sometimes worth the cost.
-    #[serde(default)]
-    pub safety_uses_main: bool,
     /// Show a live generation rate while a turn runs. Off by default — it is a
     /// diagnostic, and a number that moves every frame is a distraction when
     /// you are reading.
@@ -1016,7 +1368,6 @@ impl Default for TraceSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            permission_mode: PermissionMode::Ask,
             vim_mode: true,
             animations: true,
             show_tooltips: true,
@@ -1024,7 +1375,6 @@ impl Default for UiSettings {
             glyphs: crate::ui::GlyphChoice::Auto,
             show_thinking: true,
             check_updates: true,
-            safety_uses_main: false,
             show_token_rate: false,
             draft_replies: true,
             content_width: 112,
@@ -1033,27 +1383,13 @@ impl Default for UiSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PermissionMode {
-    Ask,
-    AlwaysApprove,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentSettings {
+    /// AUTO reviews what could do harm before it runs; YOLO runs everything.
+    pub mode: Permission,
     pub max_steps: usize,
     pub tool_output_limit: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<usize>,
-    /// Tool-call text format for models without native function-calling
-    /// (`auto`, `none`, `hermes`, `qwen`, `llama3_json`, `mistral`, `glm`,
-    /// `kimi`, `deepseek`, `json`). Unset means `auto`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_format: Option<String>,
     /// Balanced high-savings mode for upstream tokens.
     #[serde(default)]
     pub token_compression: bool,
@@ -1124,11 +1460,9 @@ impl Default for ActivitySettings {
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
+            mode: Permission::Auto,
             max_steps: 512,
             tool_output_limit: 30_000,
-            context_window: None,
-            max_output_tokens: None,
-            tool_format: None,
             token_compression: false,
             one_stream: false,
             prompt_cache: true,
@@ -1136,9 +1470,11 @@ impl Default for AgentSettings {
     }
 }
 
+/// Secrets, kept apart from the settings with owner-only permissions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Credentials {
+    /// API keys pasted into Abacus, by provider id.
     pub keys: BTreeMap<String, String>,
     pub sync: Option<SyncCredentials>,
 }
@@ -1181,10 +1517,13 @@ pub struct AbacusPaths {
     /// Versioned continual-harness state and its refinement history.
     pub harness_dir: PathBuf,
     pub hive_file: PathBuf,
+    /// Where scripted endpoint files used to live; read once, when settings
+    /// from before providers are migrated.
     pub endpoints_dir: PathBuf,
+    /// Each provider's discovered model list, one JSON file per provider.
+    pub models_dir: PathBuf,
     /// User-authored theme files, one JSON palette per name.
     pub themes_dir: PathBuf,
-    pub modes_file: PathBuf,
     /// Caches the last release check so startup asks GitHub at most daily.
     pub update_file: PathBuf,
     /// Where a turn cut short mid-stream is written, so the text survives.
@@ -1216,7 +1555,7 @@ impl AbacusPaths {
             harness_dir: root.join("harness"),
             hive_file: root.join("hive.json"),
             endpoints_dir: root.join("endpoints"),
-            modes_file: root.join("modes.json"),
+            models_dir: root.join("models"),
             update_file: root.join("update.json"),
             recovery_file: root.join("recovered.md"),
             root,
@@ -1369,6 +1708,8 @@ fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use tempfile::tempdir;
 
     /// Sync writes session files from background threads while the terminal
     /// saves its own: writes to one file from several threads each land
@@ -1424,14 +1765,10 @@ mod tests {
     /// OpenAI-shaped endpoint, or `minimal` to Anthropic, is a 400.
     #[test]
     fn effort_levels_map_to_what_each_protocol_accepts() {
-        // OpenAI-shaped tops out at high; the rungs above clamp down.
         assert_eq!(ReasoningEffort::XHigh.openai_label(), "high");
         assert_eq!(ReasoningEffort::Max.openai_label(), "high");
         assert_eq!(ReasoningEffort::Minimal.openai_label(), "minimal");
         assert_eq!(ReasoningEffort::Medium.openai_label(), "medium");
-
-        // Anthropic has no `minimal`, so the floor is `low`, and it keeps the
-        // two levels above `high` that OpenAI does not have.
         assert_eq!(ReasoningEffort::Minimal.anthropic_effort(), "low");
         assert_eq!(ReasoningEffort::XHigh.anthropic_effort(), "xhigh");
         assert_eq!(ReasoningEffort::Max.anthropic_effort(), "max");
@@ -1458,147 +1795,277 @@ mod tests {
         assert_eq!(Routing::parse_order("Z.AI"), vec!["Z.AI"]);
         assert!(Routing::parse_order("  ,, ").is_empty());
     }
-    use super::*;
-    use tempfile::tempdir;
+
+    #[test]
+    fn the_old_mode_names_map_onto_auto_and_yolo() {
+        for name in ["auto", "PLAN", "build", "ask"] {
+            assert_eq!(Permission::parse(name), Some(Permission::Auto), "{name}");
+        }
+        for name in ["yolo", "always-approve"] {
+            assert_eq!(Permission::parse(name), Some(Permission::Yolo), "{name}");
+        }
+        assert_eq!(Permission::parse("sometimes"), None);
+        assert_eq!(Permission::Auto.toggled(), Permission::Yolo);
+        assert_eq!(Permission::default(), Permission::Auto, "AUTO is the default");
+    }
+
+    /// Two providers and three profiles, the way setup and the pickers leave
+    /// them.
+    fn settings() -> Settings {
+        let mut settings = Settings { default_profile: "kojo".into(), ..Settings::default() };
+        settings
+            .providers
+            .insert("kojo".into(), ProviderConfig::from_preset(crate::providers::preset("kojo").unwrap()));
+        settings
+            .providers
+            .insert("llama".into(), ProviderConfig::from_preset(crate::providers::preset("llama").unwrap()));
+        settings.profiles.insert(
+            "kojo".into(),
+            Profile {
+                context_window: Some(1_000_000),
+                max_output_tokens: Some(64_000),
+                ..Profile::for_model("kojo/kojo")
+            },
+        );
+        settings.profiles.insert("llama/qwen-3-4b".into(), Profile::for_model("llama/qwen-3-4b"));
+        settings
+    }
 
     #[test]
     fn settings_round_trip() {
         let dir = tempdir().unwrap();
         let paths = AbacusPaths::under(dir.path().join("home"));
-        let mut settings = Settings::default();
-        settings.profiles.insert(
-            "local".into(),
-            ProviderProfile {
-                name: "Local".into(),
-                base_url: "http://localhost:11434/v1".into(),
-                model: "codestral".into(),
-                ..Default::default()
-            },
-        );
-        settings.profiles.get_mut("local").unwrap().context_window = Some(1_000_000);
-        settings.profiles.get_mut("local").unwrap().max_output_tokens = Some(64_000);
-        settings.default_profile = "local".into();
+        let mut settings = settings();
         settings.agent.token_compression = true;
-        settings.agent.one_stream = true;
+        settings.agent.mode = Permission::Yolo;
+        settings.providers.get_mut("kojo").unwrap().headers.insert("X-Title".into(), "abacus".into());
+        settings.providers.get_mut("kojo").unwrap().body =
+            crate::providers::parse_body_line(r#"{"store": false}"#).unwrap();
+        settings.providers.get_mut("kojo").unwrap().remove = vec!["parallel_tool_calls".into()];
         settings.save(&paths).unwrap();
         let loaded = Settings::load(&paths).unwrap();
-        assert_eq!(loaded.profiles["local"].model, "codestral");
-        assert_eq!(loaded.profiles["local"].context_window, Some(1_000_000));
-        assert_eq!(loaded.profiles["local"].max_output_tokens, Some(64_000));
+        assert_eq!(loaded.profiles, settings.profiles);
+        assert_eq!(loaded.providers, settings.providers);
         assert_eq!(loaded.version, SETTINGS_VERSION);
-        assert!(loaded.feedback.enabled);
-        assert!(loaded.ui.animations);
+        assert_eq!(loaded.agent.mode, Permission::Yolo);
         assert!(loaded.agent.token_compression);
-        assert!(loaded.agent.one_stream);
+        assert!(loaded.feedback.enabled);
     }
 
     #[test]
-    fn profile_limits_prefer_the_profile_then_leftover_agent_fields() {
-        let mut settings = Settings::default();
-        settings.agent.context_window = Some(128_000);
-        settings.agent.max_output_tokens = Some(8_000);
-        settings.profiles.insert(
-            "claude".into(),
-            ProviderProfile {
-                name: "Claude".into(),
-                base_url: "https://api.anthropic.com".into(),
-                model: "claude".into(),
-                protocol: ProviderProtocol::Anthropic,
-                context_window: Some(1_000_000),
-                max_output_tokens: Some(64_000),
-                ..Default::default()
-            },
-        );
-        settings.profiles.insert(
-            "local".into(),
-            ProviderProfile {
-                name: "Local".into(),
-                base_url: "http://localhost:11434/v1".into(),
-                model: "codestral".into(),
-                ..Default::default()
-            },
-        );
-        assert_eq!(settings.profile_limits("claude"), (Some(1_000_000), Some(64_000)));
-        assert_eq!(settings.profile_limits("local"), (Some(128_000), Some(8_000)));
-    }
-
-    #[test]
-    fn validate_profile_id_rejects_empty_and_unsafe_names() {
-        assert!(validate_profile_id("claude-4").is_ok());
-        assert!(validate_profile_id("local.v2").is_ok());
-        assert!(validate_profile_id("").is_err());
-        assert!(validate_profile_id("has space").is_err());
-        assert!(validate_profile_id("slash/name").is_err());
-    }
-
-    #[test]
-    fn resolve_prefers_cli_then_profile_then_leftover_agent_limits() {
+    fn resolve_runs_the_profile_with_cli_overrides_on_top() {
         let dir = tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
         let paths = AbacusPaths::under(dir.path().join("home"));
-        let mut settings = Settings { default_profile: "claude".into(), ..Settings::default() };
-        settings.agent.context_window = Some(128_000);
-        settings.agent.max_output_tokens = Some(8_000);
-        settings.profiles.insert(
-            "claude".into(),
-            ProviderProfile {
-                name: "Claude".into(),
-                base_url: "https://api.anthropic.com".into(),
-                model: "claude".into(),
-                protocol: ProviderProtocol::Anthropic,
-                context_window: Some(1_000_000),
-                max_output_tokens: Some(64_000),
-                ..Default::default()
-            },
-        );
-        settings.profiles.insert(
-            "local".into(),
-            ProviderProfile {
-                name: "Local".into(),
-                base_url: "http://localhost:11434/v1".into(),
-                model: "codestral".into(),
-                ..Default::default()
-            },
-        );
-        let credentials = Credentials::default();
+        let settings = settings();
+        let mut credentials = Credentials::default();
+        credentials.keys.insert("kojo".into(), "sk-kojo".into());
+        let resolve = |arguments: &[&str]| {
+            let mut all = vec!["abacus"];
+            all.extend_from_slice(arguments);
+            all.push(workspace.to_str().unwrap());
+            Config::resolve(&Cli::parse_from(all), &settings, &credentials, paths.clone()).unwrap()
+        };
 
-        let from_profile = Config::resolve(
-            &Cli::parse_from(["abacus", workspace.to_str().unwrap()]),
-            &settings,
-            &credentials,
-            paths.clone(),
-        )
-        .unwrap();
+        let from_profile = resolve(&[]);
+        assert_eq!(from_profile.profile, "kojo");
+        assert_eq!(from_profile.model, "kojo");
+        assert_eq!(from_profile.model_ref(), "kojo/kojo");
+        assert_eq!(from_profile.connection.request_url(), "https://api.kojo.sh/v1/chat/completions");
+        assert_eq!(from_profile.connection.api_key.as_deref(), Some("sk-kojo"));
         assert_eq!(from_profile.model_limits.context_window, 1_000_000);
         assert_eq!(from_profile.model_limits.configured_output_tokens, Some(64_000));
+        assert_eq!(from_profile.permission, Permission::Auto);
 
-        let from_agent = Config::resolve(
-            &Cli::parse_from(["abacus", "--profile", "local", workspace.to_str().unwrap()]),
+        let other = resolve(&["--profile", "llama/qwen-3-4b"]);
+        assert_eq!(other.model, "qwen-3-4b");
+        assert_eq!(other.connection.base_url, "http://localhost:8080/v1");
+        assert_eq!(other.connection.api_key, None, "a local server needs no key");
+
+        // A bare model is a model on the profile's own provider; a qualified
+        // one may be anywhere.
+        assert_eq!(resolve(&["--model", "kojo-mini"]).model_ref(), "kojo/kojo-mini");
+        assert_eq!(resolve(&["--model", "llama/other"]).model_ref(), "llama/other");
+
+        let overridden = resolve(&["--context-window", "2m", "--max-output-tokens", "32k", "--yolo"]);
+        assert_eq!(overridden.model_limits.context_window, 2_000_000);
+        assert_eq!(overridden.model_limits.configured_output_tokens, Some(32_000));
+        assert_eq!(overridden.permission, Permission::Yolo);
+        assert_eq!(resolve(&["--always-approve"]).permission, Permission::Yolo, "the old flag still works");
+
+        let inline = resolve(&["--base-url", "http://localhost:9000/v1", "--model", "tiny"]);
+        assert_eq!(inline.profile, "cli");
+        assert_eq!(inline.connection.request_url(), "http://localhost:9000/v1/chat/completions");
+    }
+
+    #[test]
+    fn roles_resolve_across_providers_and_a_missing_one_inherits() {
+        let mut settings = settings();
+        let profile = settings.profiles.get_mut("kojo").unwrap();
+        profile.roles.insert("aux".into(), "llama/qwen-3-4b".into());
+        profile.roles.insert("subagent".into(), "gone/model".into());
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let config = Config::resolve(
+            &Cli::parse_from(["abacus", workspace.to_str().unwrap()]),
             &settings,
-            &credentials,
-            paths.clone(),
+            &Credentials::default(),
+            AbacusPaths::under(dir.path().join("home")),
         )
         .unwrap();
-        assert_eq!(from_agent.model_limits.context_window, 128_000);
-        assert_eq!(from_agent.model_limits.configured_output_tokens, Some(8_000));
+        let aux = config.roles.aux.expect("aux is assigned");
+        assert_eq!(aux.reference(), "llama/qwen-3-4b");
+        assert_eq!(aux.connection.base_url, "http://localhost:8080/v1");
+        assert!(config.roles.subagent.is_none(), "a role on a removed provider follows the main model");
+        assert!(config.roles.compaction.is_none());
+    }
 
-        let from_cli = Config::resolve(
-            &Cli::parse_from([
-                "abacus",
-                "--context-window",
-                "2000000",
-                "--max-output-tokens",
-                "32000",
-                workspace.to_str().unwrap(),
-            ]),
-            &settings,
-            &credentials,
-            paths,
+    #[test]
+    fn profile_names_are_free_text_on_one_line() {
+        assert!(validate_profile_name("openrouter/openai/gpt-6-astra").is_ok());
+        assert!(validate_profile_name("Fast local (4b)").is_ok());
+        assert!(validate_profile_name("  ").is_err());
+        assert!(validate_profile_name("two\nlines").is_err());
+        let mut settings = settings();
+        assert_eq!(settings.add_profile("kojo/kojo"), "kojo/kojo");
+        assert_eq!(settings.add_profile("kojo/kojo"), "kojo/kojo (2)");
+        assert_eq!(settings.profile_for("llama/qwen-3-4b"), Some("llama/qwen-3-4b"));
+    }
+
+    #[test]
+    fn removing_a_provider_takes_its_profiles_and_roles_with_it() {
+        let mut settings = settings();
+        settings.profiles.get_mut("kojo").unwrap().roles.insert("aux".into(), "llama/qwen-3-4b".into());
+        settings.default_profile = "llama/qwen-3-4b".into();
+        assert_eq!(settings.remove_provider("llama"), ["llama/qwen-3-4b"]);
+        assert_eq!(settings.default_profile, "kojo", "the default moves to what is left");
+        assert!(settings.profiles["kojo"].roles.is_empty());
+        assert!(settings.remove_profile("kojo").is_err(), "the last profile stays");
+    }
+
+    #[test]
+    fn version_two_settings_become_providers_and_profiles() {
+        let dir = tempdir().unwrap();
+        let paths = AbacusPaths::under(dir.path().join("home"));
+        fs::create_dir_all(&paths.endpoints_dir).unwrap();
+        fs::write(
+            paths.endpoints_dir.join("codex.yaml"),
+            "name: ChatGPT Codex\nurl: https://chatgpt.com/backend-api/codex/responses\nprotocol: responses\n\
+             model: gpt-5.6-luna\nauth:\n  file: ~/.codex/auth.json\n  file_field: tokens.access_token\n",
         )
         .unwrap();
-        assert_eq!(from_cli.model_limits.context_window, 2_000_000);
-        assert_eq!(from_cli.model_limits.configured_output_tokens, Some(32_000));
+        let old = r#"
+version = 2
+default_profile = "default"
+
+[profiles.default]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1/"
+model = "anthropic/claude-sonnet-4.5"
+api_key_env = "OPENROUTER_API_KEY"
+aux_model = "openai/gpt-5-mini"
+providers = ["Anthropic"]
+allow_fallbacks = false
+
+[profiles.cheap]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4-flash"
+api_key_env = "OPENROUTER_API_KEY"
+
+[profiles.local]
+name = "Ollama"
+base_url = "http://localhost:11434/v1"
+model = "qwen3-coder"
+
+[profiles.codex]
+name = "Codex"
+endpoint = "codex"
+
+[profiles.unfinished]
+name = "Custom"
+base_url = "http://localhost:8000/v1"
+
+[ui]
+permission_mode = "always-approve"
+vim_mode = false
+
+[agent]
+max_steps = 64
+context_window = 128000
+tool_format = "hermes"
+"#;
+        fs::write(&paths.config_file, old).unwrap();
+        let mut credentials = Credentials::default();
+        credentials.keys.insert("default".into(), "sk-or-1".into());
+        credentials.keys.insert("cheap".into(), "sk-or-1".into());
+        credentials.save(&paths).unwrap();
+
+        let settings = Settings::load(&paths).unwrap();
+        assert_eq!(settings.version, SETTINGS_VERSION);
+        // The two OpenRouter profiles shared an endpoint and a key, so they
+        // share one provider, named after the preset it matches.
+        assert_eq!(settings.providers.keys().collect::<Vec<_>>(), ["codex", "ollama", "openrouter", "unfinished"]);
+        assert_eq!(settings.profiles["default"].model, "openrouter/anthropic/claude-sonnet-4.5");
+        assert_eq!(settings.profiles["cheap"].model, "openrouter/deepseek/deepseek-v4-flash");
+        assert_eq!(settings.profiles["default"].roles["aux"], "openrouter/openai/gpt-5-mini");
+        assert_eq!(settings.profiles["default"].upstreams, ["Anthropic"]);
+        assert!(!settings.profiles["default"].allow_fallbacks);
+        assert_eq!(settings.profiles["local"].model, "ollama/qwen3-coder");
+        // Leftover [agent] limits and the tool format move onto the profiles.
+        assert_eq!(settings.profiles["local"].context_window, Some(128_000));
+        assert_eq!(settings.profiles["local"].tool_format.as_deref(), Some("hermes"));
+        // The endpoint file is folded into its provider.
+        assert_eq!(settings.profiles["codex"].model, "codex/gpt-5.6-luna");
+        assert_eq!(settings.providers["codex"].token_field.as_deref(), Some("tokens.access_token"));
+        assert_eq!(settings.providers["codex"].base_url, "https://chatgpt.com/backend-api/codex");
+        // A profile with no model was never runnable; its provider stays.
+        assert!(!settings.profiles.contains_key("unfinished"));
+        assert_eq!(settings.default_profile, "default");
+        assert!(settings.is_configured());
+        // Approvals were always on, so this becomes YOLO; AUTO otherwise.
+        assert_eq!(settings.agent.mode, Permission::Yolo);
+        assert_eq!(settings.agent.max_steps, 64);
+        assert!(!settings.ui.vim_mode, "everything else is carried over");
+
+        // The key is now under the provider's id too, and the old entries stay.
+        let credentials = Credentials::load(&paths).unwrap();
+        assert_eq!(credentials.keys.get("openrouter").map(String::as_str), Some("sk-or-1"));
+        assert_eq!(credentials.keys.get("default").map(String::as_str), Some("sk-or-1"));
+        // Saved in the new shape, with the original kept.
+        assert_eq!(fs::read_to_string(paths.root.join("config.toml.v2.bak")).unwrap(), old);
+        assert!(fs::read_to_string(&paths.config_file).unwrap().contains("[providers.openrouter]"));
+        // And loading again changes nothing.
+        let again = Settings::load(&paths).unwrap();
+        assert_eq!(again.profiles, settings.profiles);
+        assert_eq!(again.providers, settings.providers);
+    }
+
+    #[test]
+    fn a_migrated_provider_never_takes_a_key_stored_for_another() {
+        let dir = tempdir().unwrap();
+        let paths = AbacusPaths::under(dir.path().join("home"));
+        fs::create_dir_all(&paths.root).unwrap();
+        fs::write(
+            &paths.config_file,
+            "version = 2\ndefault_profile = \"default\"\n\
+             [profiles.default]\nname = \"Work\"\nbase_url = \"https://openrouter.ai/api/v1\"\nmodel = \"a/b\"\n\
+             [profiles.openrouter]\nname = \"Personal\"\nbase_url = \"https://openrouter.ai/api/v1\"\nmodel = \"c/d\"\n",
+        )
+        .unwrap();
+        let mut credentials = Credentials::default();
+        credentials.keys.insert("default".into(), "work-key".into());
+        credentials.keys.insert("openrouter".into(), "personal-key".into());
+        credentials.save(&paths).unwrap();
+
+        let settings = Settings::load(&paths).unwrap();
+        let credentials = Credentials::load(&paths).unwrap();
+        let key_of = |profile: &str| credentials.keys[settings.profiles[profile].provider()].clone();
+        assert_eq!(key_of("default"), "work-key");
+        assert_eq!(key_of("openrouter"), "personal-key");
+        assert_ne!(settings.profiles["default"].provider(), settings.profiles["openrouter"].provider());
     }
 
     #[test]

@@ -1,0 +1,52 @@
+# Provider: the Anthropic Messages API with a Claude Code/Desktop OAuth token.
+#
+# Paste into ~/.abacus/config.toml, then make a profile for one of its models
+# with /profile. Uses protocol "anthropic": the Messages API wire format, not
+# an OpenAI-shaped one.
+
+[providers.claude-oauth]
+name = "Claude OAuth"
+base_url = "https://api.anthropic.com"   # requests go to {base_url}/v1/messages
+protocol = "anthropic"
+
+# OAuth tokens go in a bearer header, not in x-api-key like an API key.
+auth_header = "Authorization"
+auth_format = "Bearer {key}"
+
+# The token, resolved fresh for every request: the environment first, then the
+# newest live Claude Code/Desktop process, then the stored credential file,
+# whose copy expires.
+token_command = [
+  "bash", "-c", '''
+v="${ANTHROPIC_AUTH_TOKEN:-${CLAUDE_CODE_OAUTH_TOKEN:-}}"
+[ -n "$v" ] && { printf '%s' "$v"; exit 0; }
+best=""
+for p in /proc/[0-9]*; do
+  v=$(tr '\0' '\n' < "$p/environ" 2>/dev/null | sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' | head -n1)
+  [ -n "$v" ] || continue
+  t=$(stat -c %Y "$p" 2>/dev/null || echo 0)
+  if [ -z "$best" ] || [ "$t" -gt "${best%% *}" ]; then best="$t $v"; fi
+done 2>/dev/null
+if [ -n "$best" ]; then printf '%s' "${best#* }"; exit 0; fi
+f="$HOME/.claude/.credentials.json"
+if [ -f "$f" ] &&
+  v=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"])' "$f" 2>/dev/null) &&
+  [ -n "$v" ]
+then
+  printf '%s' "$v"; exit 0
+fi
+echo "no Claude OAuth token: set ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN, or start a Claude session" >&2
+exit 1
+''',
+]
+
+# The billing-attribution line must be its own leading system block, or raw
+# OAuth calls are rate-limited (HTTP 429). system_prefix places it first.
+system_prefix = "x-anthropic-billing-header: cc_version=2.1.215; cc_entrypoint=cli; cch=00000;"
+
+# First-party Claude Code headers. {session} becomes a per-session id.
+[providers.claude-oauth.headers]
+x-app = "cli"
+User-Agent = "claude-cli/2.1.215 (external, cli, agent-sdk/0.3.215)"
+X-Claude-Code-Session-Id = "{session}"
+anthropic-dangerous-direct-browser-access = "true"

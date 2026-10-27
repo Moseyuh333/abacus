@@ -42,10 +42,10 @@ The same contract runs without the TUI — useful in scripts and CI:
 
 ```sh
 abacus -p "Implement the importer, run all tests, and output DONE when green" \
-  --loop --max-iterations 20 --completion-promise "DONE" --always-approve
+  --loop --max-iterations 20 --completion-promise "DONE" --yolo
 ```
 
-`--always-approve` is required for the loop to make changes headlessly (otherwise mutations are rejected). Combine with `--output-format json` or `streaming-json` to capture progress programmatically.
+`--yolo` lets the loop run every action headlessly. Without it the loop runs in AUTO: edits inside the workspace and what the safety reviewer clears run, and anything the reviewer cannot decide on is not run, since no one is there to ask. Combine with `--output-format json` or `streaming-json` to capture progress programmatically.
 
 ## Writing a prompt that converges
 

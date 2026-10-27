@@ -102,11 +102,6 @@ impl SkillRegistry {
     pub fn tool_specs() -> Vec<Value> {
         vec![
             tool(
-                "skill_search",
-                "Search installed Agent Skills by capability. Skills are reusable instruction bundles.",
-                [req("query", json!({"type": "string"}))],
-            ),
-            tool(
                 "skill_load",
                 "Load the complete SKILL.md instructions for one installed skill.",
                 [req("name", json!({"type": "string"}))],
@@ -158,11 +153,6 @@ impl SkillRegistry {
                     req("instructions", string("The full new body, which replaces the old one")),
                 ],
             ),
-            tool(
-                "skill_reload",
-                "Rediscover skills from disk so one just written is callable now, without waiting for a restart.",
-                [],
-            ),
         ]
     }
 
@@ -173,7 +163,6 @@ impl SkillRegistry {
 
     pub fn execute(&self, tool: &str, arguments: &str) -> Option<String> {
         let result = match tool {
-            "skill_search" => self.execute_search(arguments),
             "skill_load" => self.execute_load(arguments),
             "skill_read" => self.execute_read(arguments),
             _ => return None,
@@ -229,23 +218,6 @@ impl SkillRegistry {
                 Err(error) => self.diagnostics.push(format!("{}: {error:#}", candidate.display())),
             }
         }
-    }
-
-    fn execute_search(&self, arguments: &str) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Args {
-            query: String,
-        }
-        let args: Args = serde_json::from_str(arguments)?;
-        let matches = self.search(&args.query);
-        if matches.is_empty() {
-            return Ok("No installed skills match that query.".to_owned());
-        }
-        Ok(matches
-            .into_iter()
-            .map(|skill| format!("{}: {}", skill.name, skill.description))
-            .collect::<Vec<_>>()
-            .join("\n"))
     }
 
     fn execute_load(&self, arguments: &str) -> Result<String> {

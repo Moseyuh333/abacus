@@ -216,7 +216,8 @@ impl AgentServices {
         self.mcp.execute(&call.name, &call.arguments).await
     }
 
-    /// `skill_create` / `skill_update` / `skill_reload`.
+    /// `skill_create` / `skill_update`. Each registers what it wrote at once,
+    /// so the skill is loadable in the same session.
     ///
     /// These live here rather than on the registry because writing needs the
     /// authorable roots and re-registering needs the discovery inputs, and the
@@ -225,7 +226,6 @@ impl AgentServices {
         let result = match tool {
             "skill_create" => self.create_skill(arguments),
             "skill_update" => self.update_skill(arguments),
-            "skill_reload" => Ok(format!("Reloaded skills — {} now registered.", self.reload_skills())),
             _ => return None,
         };
         Some(crate::tools::reply(result))
@@ -446,13 +446,7 @@ mod tests {
         let loaded = services.execute(&call("skill_load", json!({"name": "release-audit"}))).await.unwrap();
         assert!(loaded.contains("Check the changelog"), "{loaded}");
         assert!(services.prompt_context().contains("release-audit"));
-        assert!(
-            services
-                .execute(&call("skill_search", json!({"query": "release"})))
-                .await
-                .unwrap()
-                .contains("release-audit")
-        );
+        assert!(services.search_catalog("release").contains("skill/release-audit"), "tool_search finds it too");
     }
 
     /// macOS hands out `/var/folders/…` for a temporary directory, which is
@@ -596,7 +590,7 @@ mod tests {
             .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_owned))
             .collect();
         assert!(names.iter().any(|name| name == "skill_create"));
-        assert!(names.iter().any(|name| name == "skill_reload"));
+        assert!(names.iter().any(|name| name == "skill_update"));
 
         // A bare services object has no discovery inputs and so no root.
         let empty = AgentServices::empty(directory.path().to_owned());

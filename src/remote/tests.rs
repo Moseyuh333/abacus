@@ -275,7 +275,7 @@ fn a_failed_turn_reports_the_error_then_done() {
 fn notices_modes_and_prompts_are_mirrored() {
     let (mut bridge, mut frames) = Bridge::detached("s1");
     bridge.user_prompt(1, "Fix the parser");
-    bridge.on_event(&AgentEvent::ModeChanged { mode: AgentMode::Plan, reason: "read first".into() }, &usage(), None);
+    bridge.mode_changed(crate::config::Permission::Yolo, "set in the terminal");
     bridge.on_event(&AgentEvent::Notice("cut short".into()), &usage(), None);
     bridge.on_event(&AgentEvent::TraceFailed { error: "disk full".into() }, &usage(), None);
     let frames = drain(&mut frames);
@@ -283,7 +283,7 @@ fn notices_modes_and_prompts_are_mirrored() {
     assert_eq!(frames[0]["payload"]["entry"]["kind"], "user");
     assert_eq!(frames[0]["payload"]["entry"]["id"], "e1");
     assert_eq!(frames[0]["payload"]["entry"]["text"], "Fix the parser");
-    assert_eq!(frames[1]["payload"], json!({"mode": "plan", "reason": "read first"}));
+    assert_eq!(frames[1]["payload"], json!({"mode": "yolo", "reason": "set in the terminal"}));
     assert_eq!(frames[2]["payload"]["level"], "info");
     assert_eq!(frames[3]["payload"]["level"], "warning");
 }

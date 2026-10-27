@@ -169,40 +169,32 @@ impl PapercutStore {
     }
 
     pub fn tool_specs() -> Vec<Value> {
-        vec![
-            tool(
-                "papercut_record",
-                "Record a lesson learned from a snag you just worked through: what went wrong, the fix that worked, and tripwires — distinctive strings from the error output that will identify the same snag next time. Call this after recovering from repeated failures or a non-obvious error so future sessions get the fix immediately.",
-                [
-                    req("title", string("Short name for the lesson, e.g. 'sqlx tests need DATABASE_URL'")),
-                    req("description", string("What went wrong and why")),
-                    req("fix", string("The fix that actually worked, as an instruction")),
-                    opt("references", strings("Optional file paths, URLs, or commands worth consulting")),
-                    req(
-                        "tripwires",
-                        strings(
-                            "1-6 distinctive substrings of the failure that should trigger this reminder. Each at least 8 characters, and never a generic phrase alone ('not found', 'permission denied') — include the identifier the error names, e.g. 'frobnicate: not found'.",
-                        ),
+        vec![tool(
+            "papercut_record",
+            "Record a lesson learned from a snag you just worked through: what went wrong, the fix that worked, and tripwires — distinctive strings from the error output that will identify the same snag next time. Call this after recovering from repeated failures or a non-obvious error so future sessions get the fix immediately.",
+            [
+                req("title", string("Short name for the lesson, e.g. 'sqlx tests need DATABASE_URL'")),
+                req("description", string("What went wrong and why")),
+                req("fix", string("The fix that actually worked, as an instruction")),
+                opt("references", strings("Optional file paths, URLs, or commands worth consulting")),
+                req(
+                    "tripwires",
+                    strings(
+                        "1-6 distinctive substrings of the failure that should trigger this reminder. Each at least 8 characters, and never a generic phrase alone ('not found', 'permission denied') — include the identifier the error names, e.g. 'frobnicate: not found'.",
                     ),
-                    opt(
-                        "scope",
-                        json!({"type": "string", "enum": ["workspace", "global"], "description": "workspace (default) limits recall to this project; global recalls everywhere"}),
-                    ),
-                ],
-            ),
-            tool(
-                "papercut_list",
-                "List the recorded papercuts (lessons from past snags) relevant to this workspace.",
-                [],
-            ),
-        ]
+                ),
+                opt(
+                    "scope",
+                    json!({"type": "string", "enum": ["workspace", "global"], "description": "workspace (default) limits recall to this project; global recalls everywhere"}),
+                ),
+            ],
+        )]
     }
 
     /// Virtual-tool dispatch, mirroring `GoalState::execute`.
     pub fn execute(&self, name: &str, arguments: &str) -> Option<String> {
         match name {
             "papercut_record" => Some(crate::tools::reply(self.record_from_arguments(arguments))),
-            "papercut_list" => Some(self.list_for_model()),
             _ => None,
         }
     }
@@ -287,32 +279,6 @@ impl PapercutStore {
         });
         Self::save_locked(&inner);
         Ok(format!("Papercut \"{title}\" recorded. It will be recalled when a tripwire matches."))
-    }
-
-    fn list_for_model(&self) -> String {
-        let inner = self.inner.read().expect("papercut lock");
-        let now = Utc::now();
-        let mut lines: Vec<String> = inner
-            .papercuts
-            .iter()
-            .filter(|papercut| papercut.in_scope(&self.workspace))
-            .map(|papercut| {
-                format!(
-                    "- {} — {} Fix: {} (tripwires: {}; tripped {}x, strength {:.1})",
-                    papercut.title,
-                    papercut.description,
-                    papercut.fix,
-                    papercut.tripwires.join(", "),
-                    papercut.trip_count,
-                    papercut.decayed_strength(now),
-                )
-            })
-            .collect();
-        if lines.is_empty() {
-            return "No papercuts recorded for this workspace yet.".to_owned();
-        }
-        lines.insert(0, "Recorded papercuts:".to_owned());
-        lines.join("\n")
     }
 
     /// Scan `haystack` (a tool call's arguments and output) against every

@@ -5,12 +5,12 @@
 # Abacus
 
 Abacus is a coding agent that runs in your terminal and works in your
-repository. It reads code, edits files, runs commands and tests, and asks before
-it changes anything. It works with any OpenAI-compatible Chat Completions
-endpoint, the OpenAI Responses API or the Anthropic Messages API, including local
-models served by Ollama, llama.cpp or vLLM. It is for developers who want an
-agent in the terminal and want to choose the model. It is one Rust binary for
-macOS, Linux and Windows.
+repository. It reads code, edits files, runs commands and tests, and has a
+reviewer model check anything risky before it runs. It works with any
+OpenAI-compatible Chat Completions endpoint, the OpenAI Responses API or the
+Anthropic Messages API, including local models served by Ollama, llama.cpp or
+LM Studio. It is for developers who want an agent in the terminal and want to
+choose the model. It is one Rust binary for macOS, Linux and Windows.
 
 ## Install
 
@@ -43,21 +43,25 @@ cargo install --path .   # or: cargo build --release, then use target/release/ab
 ## First run
 
 ```sh
-abacus setup        # pick a provider, connect, choose a model
+abacus setup        # connect a provider, choose a model
 cd your-project
 abacus              # open the agent in this directory
 abacus doctor       # check the provider, credentials and environment
 ```
 
-`abacus setup` has three steps. You choose a provider (OpenAI, xAI, OpenRouter,
-Groq, DeepSeek, Mistral, Together, Fireworks, Cerebras, Ollama, a local
-llama.cpp/vLLM server, or a custom URL), Abacus lists the models the endpoint
-serves so you can pick one, and you set defaults for approvals, Vim keys and web
-search. If the provider's key is already in your environment, setup uses it.
-Otherwise you can paste one and it is stored in `~/.abacus/credentials.toml`
-with owner-only permissions. Running `abacus` with no configuration starts setup
-automatically. `abacus setup --force` replaces the current default profile.
-`abacus models` lists the models the active profile can reach.
+`abacus setup` asks two things. First, where your models come from: Kojo,
+OpenRouter, a local Ollama, llama.cpp or LM Studio server, or any other
+OpenAI-compatible or Anthropic endpoint by its URL. Setup marks the ones that
+will work straight away, a key already in your environment or a local server
+already running. Then it lists the models that provider serves and you pick one
+to start with. If the key is not in your environment, you paste it and it is
+stored in `~/.abacus/credentials.toml` with owner-only permissions. Everything
+else starts at a default and can be changed in `/config`. Running `abacus` with
+no provider starts setup automatically, and running setup again adds another
+provider. Abacus Desktop asks the same two things in its window.
+
+`abacus models` lists every model your providers serve, as `provider/model`;
+`abacus providers` and `abacus profiles` list what is configured.
 
 ## Using the terminal UI
 
@@ -67,10 +71,12 @@ one. Dropping an image file on the terminal, or pasting one copied in a file
 manager, attaches it too, from anywhere on disk. If the workspace has an
 `AGENTS.md`, Abacus reads it at startup and follows it.
 
-When the agent wants to change a file or run a command, it shows what it will do
-(a diff for file changes) and waits. Press `y` to allow it, `a` to allow it and every
-later change in this session, or `n` to reject it and then tell the agent in chat
-what to do instead. `v` switches between the semantic and raw diff.
+In AUTO mode (the default), edits inside the workspace and commands that only
+look run at once, and everything else is checked first by a reviewer model (see
+Modes). When the reviewer cannot decide, Abacus shows you the action (a diff for
+file changes) and waits. Press `y` to allow it, or `n` to reject it and then tell
+the agent in chat what to do instead. `v` switches between the semantic and raw
+diff.
 
 `Esc` or `Ctrl+C` stops a running turn. A message you type while a turn runs is
 handed to the model after its current tool call, so you can correct it without
@@ -79,16 +85,19 @@ instruction.
 
 ### Modes
 
-Abacus has three workflow modes, shown in the status bar. `Shift+Tab` cycles
-them, or use `/mode auto|plan|build`.
+Abacus has two permission modes, shown in the status bar. `Shift+Tab` switches
+between them, or use `/mode auto|yolo`. The mode for new sessions is in
+`/config` → Agent.
 
-- **PLAN** is read-only. The agent can read, search and run inspection commands
-  such as builds, linters and tests, but anything that writes, deletes, installs
-  or touches git history is refused.
-- **BUILD** lets the agent make changes, each subject to your approval.
-- **AUTO** (the default) lets the model pick PLAN or BUILD per turn.
-
-`/plan` toggles the PLAN pin.
+- **AUTO** (the default) runs reading, edits inside the workspace and commands
+  that only look straight away. Anything else (a command that changes the
+  system, deletes files, touches git history or reaches outside the workspace)
+  goes to a reviewer model first. The reviewer compares the action with what you
+  actually asked for in this session and blocks what you did not ask for; a
+  blocked action is not run, and the agent is told why. When the reviewer cannot
+  decide, or cannot be reached, you are asked. The reviewer is the profile's
+  **Safety reviewer** role, which falls back to the auxiliary model.
+- **YOLO** runs everything without review or asking.
 
 ### Keys
 
@@ -96,7 +105,7 @@ them, or use `/mode auto|plan|build`.
 | --- | --- |
 | `Enter` | Send |
 | `Ctrl+J`, `Shift+Enter` | New line |
-| `Shift+Tab` | Cycle AUTO / PLAN / BUILD |
+| `Shift+Tab` | Switch between AUTO and YOLO |
 | `Ctrl+O` | Open the newest tool output, or hide an open dialog |
 | `F1` | Key reference |
 | `F2` | Release the mouse so you can select text with drag |
@@ -113,26 +122,28 @@ selected block, `Y` copies the last reply, `i` returns to typing. Press `F1` or
 | Command | Effect |
 | --- | --- |
 | `/help` | Keys and commands |
-| `/config` | Settings panel: profile, model, API key, permissions, limits, search, theme |
-| `/config raw` | Edit the whole config file inside Abacus (`Ctrl+S` saves) |
-| `/model [id]`, `/models` | Show or switch the model; browse every model the endpoint serves |
-| `/profile [id]` | List or switch provider profiles |
-| `/mode`, `/plan` | Set the workflow mode |
+| `/profile [name]` | Switch profile, or pick any model a provider serves and make it a profile |
+| `/providers` | Add or edit providers: URL, key, headers, body fields |
+| `/mode [auto\|yolo]` | Show or set the permission mode |
 | `/effort <level>` | Reasoning effort: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto` |
+| `/config` | Settings, by tab: profile, providers, agent, search, interface, privacy |
+| `/config raw` | Edit the whole config file inside Abacus (`Ctrl+S` saves) |
+| `/goal`, `/loop` | Long-running work (see below) |
+| `/btw <note>` | Note something for the running turn without derailing it |
 | `/new`, `/fork` | Start a fresh session, or continue this one in a copy |
-| `/sessions`, `/resume <id>`, `/rename <title>` | Manage saved sessions |
-| `/goal`, `/loop`, `/swarm` | Long-running work (see below) |
+| `/resume [id]`, `/rename <title>` | Resume a saved session (a list without an id), rename this one |
 | `/compact` | Shrink the conversation context now |
 | `/repair` | Fix session history that a provider keeps rejecting |
-| `/memories`, `/papercuts` | Show or delete what Abacus has learned |
+| `/memory` | What Abacus has learned here: list, forget, log, revert, refine |
+| `/tools` | Tools, skills, plugin commands and MCP tools |
 | `/usage` | Local token usage and activity |
-| `/tools`, `/skills`, `/plugins`, `/mcps` | Show what the agent can use |
+| `/theme` | Switch theme, or export one to edit |
 | `/remote [on\|off\|qr\|url\|status]` | Share this session live with your phone (see Sync and remote) |
 | `/feedback` | Send feedback to the maintainers |
 | `/quit` | Exit |
 
-`/help` lists the rest, including `/theme`, `/thinking`, `/providers`,
-`/harness` and `/refine`.
+The names older versions used (`/model`, `/models`, `/sessions`, `/skills`,
+`/memories`, `/papercuts` and the like) still work, as aliases.
 
 ### Sessions
 
@@ -143,16 +154,17 @@ lists them. `abacus sessions --all` lists every workspace that has sessions, and
 
 ## Headless runs
 
-`-p` runs one prompt without the UI and prints the result. Headless runs reject
-every file change and command that needs approval unless you pass
-`--always-approve` (`-y`). `--image <path>` (`-i`) attaches an image to the
-prompt, as does an `@shot.png` reference to an image in the workspace.
+`-p` runs one prompt without the UI and prints the result. Headless runs use
+AUTO too: what the reviewer clears runs, and an action it cannot decide on is
+not run, since there is no one to ask. `--yolo` (`-y`) runs everything.
+`--image <path>` (`-i`) attaches an image to the prompt, as does an
+`@shot.png` reference to an image in the workspace.
 
 ```sh
 abacus -p "Explain this repository"
-abacus -p "Run the tests and fix failures" --always-approve
+abacus -p "Run the tests and fix failures" --yolo
 abacus -p "List the TODOs" --output-format json
-abacus --mode plan -p "Review the error handling in src/"
+abacus --profile local -p "Review the error handling in src/"
 ```
 
 `--output-format` takes `plain` (default), `json` (one object at the end) or
@@ -163,67 +175,107 @@ or the iteration cap is reached:
 
 ```sh
 abacus -p "Implement the importer, run all tests, and print DONE when they pass" \
-  --loop --max-iterations 20 --completion-promise DONE --always-approve
+  --loop --max-iterations 20 --completion-promise DONE --yolo
 ```
 
-Other per-run overrides: `--profile`, `--model`, `--base-url`, `--protocol`,
-`--api-key`, `--max-steps`, `--context-window 1m`, `--max-output-tokens 32k`, and
+Other per-run overrides: `--profile`, `--model` (`provider/model`, or a model on
+the profile's provider), `--base-url`, `--protocol`, `--api-key`, `--mode`,
+`--max-steps`, `--context-window 1m`, `--max-output-tokens 32k`, and
 `--tool-format` for models that write tool calls as text. Shell completions come
 from `abacus completions bash` (also `zsh`, `fish`, `elvish`, `powershell`).
 
 ## Configuration
 
-Settings live in `~/.abacus/config.toml`. `abacus setup` and `/config` write it
-for you; you can also edit it by hand. Each provider is a profile:
+Settings live in `~/.abacus/config.toml`. `abacus setup`, `/config` and the
+desktop app's settings write it for you; you can also edit it by hand. It has
+two parts.
+
+A **provider** is an API connection: where it is, which protocol it speaks,
+where its key comes from, and anything else it needs. Abacus asks each provider
+for its models and names them `provider/model`, such as
+`openrouter/openai/gpt-5` or `llama/qwen-3-4b`. The lists are cached in
+`~/.abacus/models/` for a day.
+
+A **profile** is one of those models with the settings it runs with. Every
+setting has a default, so a profile can be just its model; it is named after
+the model unless you name it.
 
 ```toml
-version = 2
-default_profile = "openrouter"
+version = 3
+default_profile = "openrouter/anthropic/claude-sonnet-4.5"
 
-[profiles.openrouter]
+[providers.openrouter]
 name = "OpenRouter"
 base_url = "https://openrouter.ai/api/v1"
-model = "your-model-id"
-protocol = "chat-completions"        # chat-completions | responses | anthropic
+protocol = "chat-completions"            # chat-completions | responses | anthropic
 api_key_env = "OPENROUTER_API_KEY"
-# aux_model = "a-cheaper-model"      # background calls; omit to use `model`
-# context_window = 128000            # omit to detect from the provider
 
-[profiles.local]
-name = "Ollama"
-base_url = "http://localhost:11434/v1"
-model = "your-local-model"
-protocol = "chat-completions"
+[providers.llama]
+name = "llama.cpp"
+base_url = "http://localhost:8080/v1"
 
-[ui]
-permission_mode = "ask"              # or "always-approve"
+[profiles."openrouter/anthropic/claude-sonnet-4.5"]
+model = "openrouter/anthropic/claude-sonnet-4.5"
+
+[profiles.fast]
+model = "llama/qwen-3-4b"
+context_window = 32000                   # omit to detect from the provider
+max_output_tokens = 8000                 # omit for the model's default
+reasoning_effort = "low"
+
+[profiles.fast.roles]
+review = "openrouter/openai/gpt-5-mini"  # any provider's model
+
+[agent]
+mode = "auto"                            # or "yolo"
 ```
 
-Switch profiles with `/profile <id>` or `abacus --profile local`. For the
-`anthropic` protocol, set `base_url` to the host without a path (for example
-`https://api.anthropic.com`); Abacus appends `/v1/messages`.
+Switch profiles with `/profile`, the desktop's profile picker, or
+`abacus --profile fast`. For the `anthropic` protocol, set `base_url` to the
+host without a path (for example `https://api.anthropic.com`); Abacus appends
+`/v1/messages`.
 
-The auxiliary model (`aux_model`, or **Auxiliary model** in `/config`) handles
-background calls such as command classification and drift checks. Set it to a
-cheaper model on the same endpoint to cut cost.
+A profile can hand jobs to other models, on any provider, as **roles**:
+`aux` for background calls such as prompt refinement and drift checks,
+`review` for AUTO's safety reviewer (it follows `aux` when unset), `subagent`
+for delegated agents, and `compaction` for the rolling summary. A role left
+unset uses the profile's own model. Set them in `/config` → Profile.
+
+A configuration from an older version is converted the first time it is
+loaded: each profile's endpoint becomes a provider (profiles that shared one
+share it), the original file is kept as `config.toml.v2.bak`, and
+`permission_mode = "always-approve"` becomes YOLO.
 
 ### API keys
 
 Abacus looks for a key in this order: `--api-key` or `ABACUS_API_KEY`, the
-environment variable named by the profile's `api_key_env`, then
-`~/.abacus/credentials.toml`. Local endpoints need no key. `ABACUS_MODEL` and
-`ABACUS_BASE_URL` override the model and URL. `ABACUS_HOME` moves all Abacus
-state somewhere other than `~/.abacus`.
+environment variable named by the provider's `api_key_env`, then the key stored
+for that provider in `~/.abacus/credentials.toml`. Local servers need no key.
+`ABACUS_MODEL` and `ABACUS_BASE_URL` override the model and URL. `ABACUS_HOME`
+moves all Abacus state somewhere other than `~/.abacus`. Keys are never shown
+back, in the terminal or the desktop app.
 
-### Scripted endpoints
+### Headers, body fields and tokens
 
-For a backend that needs custom auth, extra headers or a modified request body,
-write a YAML file in `~/.abacus/endpoints/` and point a profile at it with
-`endpoint = "<file name>"`. The file names the URL, protocol, model and where the
-token comes from (a literal, an environment variable, a JSON file or a command).
-The token is re-read on every request. Examples for xAI, Grok, ChatGPT/Codex and
-Anthropic OAuth are in [docs/endpoints](docs/endpoints). Abacus loads these files
-only from `~/.abacus/endpoints`, never from a workspace.
+Everything a backend needs is set on its provider, in `/providers` or the
+desktop's provider editor, or by hand:
+
+```toml
+[providers.openrouter.headers]
+HTTP-Referer = "https://example.com"
+X-Title = "my-tool"
+
+[providers.openrouter.body]               # merged into every request body
+provider = { sort = "throughput" }
+```
+
+`remove` lists body fields the API rejects, `auth_header` and `auth_format`
+move the key (`x-api-key`, `Bearer {key}`), and `system_prefix` puts a fixed
+line before the system prompt. For a short-lived token, `token_command` runs a
+command for every request, or `token_file` and `token_field` read it from a
+JSON file. `request_url` and `models_url` replace the derived endpoints, and
+`models` lists the models of an API that has no listing. Examples for Grok,
+ChatGPT/Codex and Anthropic OAuth are in [docs/providers](docs/providers).
 
 ### Web search
 
@@ -248,18 +300,19 @@ web tools.
 The agent works through a fixed set of tools. `/tools` lists the active ones.
 
 - Reading: `list_files`, `glob`, `grep`, `read_file`, `read_files`, `tool_search`.
-- Editing: `edit_file`, `write_file`, `append_file`, `apply_patch`,
-  `create_directory`, `move_file`, `delete_file`.
-- Git: `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, plus
-  `git_commit`, `git_restore` and `git_checkout`. No git tool pushes.
+- Editing: `edit_file`, `write_file`, `apply_patch`, `move_file`,
+  `delete_file`. Writing a file creates the directories it needs.
+- Git: `git_status`, `git_diff`, `git_log` and `git_commit`. No git tool
+  pushes; anything else goes through `run_command`.
 - Shell: `run_command` runs a command in the workspace with a timeout.
 - Web: `web_search` and `read_page`. `read_page` refuses private and loopback
   addresses.
 - Planning: `task_create`, `task_update`, `task_list`, `goal_status`,
-  `goal_update`, `mode_set`, `ask_user`.
+  `goal_update`, `ask_user`.
 
-File changes, shell commands and subagents ask for approval unless you allowed
-them for the session or started with `--always-approve`. MCP tools appear as
+In AUTO, edits inside the workspace and read-only commands run at once, and
+other commands, deletions, subagents and MCP calls go to the safety reviewer
+first (see Modes). In YOLO everything runs. MCP tools appear as
 `mcp__<server>__<tool>`.
 
 ## Skills, plugins and MCP
@@ -308,10 +361,11 @@ completion word you choose:
 `--max-iterations` so a loop that never converges stops. See
 [docs/how-to-use-loops.md](docs/how-to-use-loops.md).
 
-`/swarm <objective>` asks the agent to split the work and run it in parallel
-subagents. The agent can also do this on its own with `spawn_subagents`. After
-one approval, up to eight workers run in separate git worktrees seeded with your
-current changes, so their edits do not land in your checkout. Each worker returns
+Ask the agent to split work across subagents and it runs them in parallel with
+`spawn_subagents`. Up to eight workers run in separate git worktrees seeded with
+your current changes, so their edits do not land in your checkout. They run in
+the session's mode, and a worker cannot ask you anything: in AUTO, what the
+reviewer cannot clear is not run. Each worker returns
 a summary and a patch, and a patch is applied only if `git apply --check` passes.
 `Ctrl+P` shows each worker's progress.
 
@@ -320,18 +374,16 @@ a summary and a patch, and a patch is applied only if `git apply --check` passes
 Abacus remembers lessons between sessions in the same workspace.
 
 - **Memories** are facts, decisions and conventions the agent records about your
-  project. They are added to every new session. `/memories` lists them and
-  `/memories delete <n>` removes one.
+  project. They are added to every new session.
 - **Papercuts** are fixes for errors the agent has hit before. When the same
   error text shows up again, the fix is shown to the model next to the error.
-  `/papercuts` lists them and `/papercuts delete <n>` removes one.
 
-After long turns, Abacus reviews what happened and may record new memories,
-papercuts or short instructions for itself. `/refine` runs that review now. These
-records form the harness: `/harness` shows it, `/harness log` lists changes and
-`/harness revert <id>` undoes one. Durable instructions are also written into a
-marked `abacus:notes` block in the workspace's `AGENTS.md`; the rest of that file
-is left alone.
+`/memory` lists both, numbered, and `/memory forget m2` or `/memory forget p1`
+removes one. After long turns, Abacus reviews what happened and may record new
+memories, papercuts or short instructions for itself; `/memory refine` runs that
+review now. `/memory log` lists every change and `/memory revert <id>` undoes
+one. Durable instructions are also written into a marked `abacus:notes` block
+in the workspace's `AGENTS.md`; the rest of that file is left alone.
 
 All of this is stored locally under `~/.abacus/`.
 
@@ -346,8 +398,9 @@ abacus cron list
 abacus cron install        # background service: launchd, systemd or Task Scheduler
 ```
 
-Schedules use the machine's local time. Jobs cannot change files unless created
-with `--always-approve`. `abacus cron daemon` runs the scheduler in the
+Schedules use the machine's local time. Jobs run in AUTO, like any headless
+run: edits inside the workspace and what the reviewer clears run, and anything
+it cannot decide on is not run. Create a job with `--yolo` to run everything. `abacus cron daemon` runs the scheduler in the
 foreground instead of installing a service. `run`, `logs`, `enable`, `disable`
 and `remove` take a job ID.
 
@@ -355,7 +408,11 @@ and `remove` take a job ID.
 
 `abacus app-server` serves one session over JSON-RPC on stdin and stdout, so a
 desktop front end can drive Abacus with streaming output, approvals and
-questions. One process serves one workspace.
+questions. One process serves one workspace. It also manages providers and
+profiles (`presets/list`, `providers/list`, `provider/save`,
+`provider/models`, `profiles/list`, `profile/save`, `profile/select` and their
+removals), and reports `needsSetup` when there is no provider yet, so a front
+end can run first-time setup itself.
 
 ## Training traces
 
@@ -511,7 +568,8 @@ and the agent's tools still ask for approval the way they always do.
 
 ## Security
 
-Approvals, PLAN mode, worktrees and path checks are guardrails, not a sandbox.
+The safety reviewer, approvals, worktrees and path checks are guardrails, not a
+sandbox. The reviewer is a model and can be wrong.
 File tools never write outside the workspace or to `.env` files, and refuse to
 read production environment files and credentials such as `~/.ssh`. An approved
 command, a plugin hook or an MCP server still runs with your user account and can

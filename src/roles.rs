@@ -1,30 +1,24 @@
 //! Model roles: the named jobs a session hands to a model.
 //!
-//! A profile used to carry exactly two model slots — `model` for the
-//! conversation and `aux_model` for everything cheap and secondary. That is a
-//! reasonable default and a poor vocabulary: "secondary" bundles a two-token
-//! command classification with a subagent that will run for ten minutes, and
-//! there is no way to say "summarise on something bigger" without moving the
-//! whole session onto it.
+//! A profile runs one model for the conversation. Everything else it asks a
+//! model to do — a two-token command check, a subagent that runs for ten
+//! minutes, the rolling summary of a long session — is a role, and each role
+//! can be given a model of its own, on any provider: `llama/qwen-3-4b` for the
+//! cheap background calls beside `openrouter/anthropic/claude-opus` for the
+//! conversation.
 //!
-//! Roles name each job instead. Every role resolves to a model, and a role
-//! left unassigned falls back along [`Role::fallback`] rather than erroring —
-//! so a profile that assigns nothing behaves exactly as it did before roles
-//! existed, and assigning one is always additive.
-//!
-//! Storage stays where it was: `default` reads and writes `profile.model` and
-//! `aux` reads and writes `profile.aux_model`, so an existing settings file
-//! keeps working untouched and a downgrade does not lose the two assignments
-//! that matter most. Everything else lives in `profile.roles`.
+//! A role left unassigned falls back along [`Role::fallback`] rather than
+//! erroring, so a profile that assigns nothing runs everything on its own
+//! model, and assigning one is always additive.
 
-use crate::config::ProviderProfile;
+use crate::config::Profile;
 
 /// One named job, and what it falls back to when unassigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Role {
     pub id: &'static str,
     pub label: &'static str,
-    /// One line, shown under the roles list. Says what the role *does*, so the
+    /// One line, shown beside the role. Says what the role *does*, so the
     /// choice can be made without reading the source.
     pub help: &'static str,
     /// The role consulted when this one is unassigned. `None` on `default`,
@@ -40,25 +34,31 @@ pub struct Role {
 pub const ROLES: &[Role] = &[
     Role {
         id: "default",
-        label: "default",
+        label: "Model",
         help: "Runs the conversation and every tool call. The model the session is.",
         fallback: None,
     },
     Role {
         id: "aux",
-        label: "aux",
-        help: "Background calls — prompt refinement, drift checks, command classification, page extraction.",
+        label: "Auxiliary model",
+        help: "Background calls — prompt refinement, drift checks, page extraction, drafts.",
         fallback: Some("default"),
     },
     Role {
+        id: "review",
+        label: "Safety reviewer",
+        help: "Judges, in AUTO mode, whether an action is what you asked for. Follows the auxiliary model.",
+        fallback: Some("aux"),
+    },
+    Role {
         id: "subagent",
-        label: "subagent",
+        label: "Subagent model",
         help: "Delegated agents, when the delegating call does not name a model itself.",
         fallback: Some("default"),
     },
     Role {
         id: "compaction",
-        label: "compaction",
+        label: "Compaction model",
         help: "The rolling summary. Load-bearing for a long session — worth keeping on a capable model.",
         fallback: Some("default"),
     },
@@ -73,27 +73,24 @@ pub fn role(id: &str) -> Option<&'static Role> {
 /// or from following the fallback chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
+    /// `provider/model`.
     pub model: String,
     /// True when no assignment was found and a fallback supplied the model.
     /// The interface dims these, so "inherited" and "chosen" never look alike.
     pub inherited: bool,
 }
 
-impl ProviderProfile {
-    /// The model assigned to `id` on this profile, if any.
-    ///
-    /// `default` and `aux` read the dedicated fields rather than the map: they
-    /// predate roles and their storage is load-bearing elsewhere.
+impl Profile {
+    /// The `provider/model` assigned to `id` on this profile, if any.
     pub fn role_model(&self, id: &str) -> Option<&str> {
         let value = match id {
             "default" => Some(self.model.as_str()),
-            "aux" => self.aux_model.as_deref(),
             _ => self.roles.get(id).map(String::as_str),
         };
         value.map(str::trim).filter(|model| !model.is_empty())
     }
 
-    /// Assign a model to `id`, or clear it back to auto-selection with `None`.
+    /// Assign a model to `id`, or clear it back to its fallback with `None`.
     ///
     /// Clearing `default` is meaningless — it is the root of every fallback
     /// chain — so it is ignored rather than emptying the profile's model.
@@ -102,7 +99,6 @@ impl ProviderProfile {
         match (id, model) {
             ("default", Some(model)) => self.model = model,
             ("default", None) => {}
-            ("aux", model) => self.aux_model = model,
             (id, Some(model)) => {
                 self.roles.insert(id.to_owned(), model);
             }
@@ -125,66 +121,48 @@ impl ProviderProfile {
             inherited = true;
         }
     }
-
-    /// How many roles carry an explicit assignment, over how many exist — the
-    /// `2/4` annotation beside the roles entry in the model hub.
-    pub fn assigned_roles(&self) -> (usize, usize) {
-        let assigned = ROLES.iter().filter(|role| self.role_model(role.id).is_some()).count();
-        (assigned, ROLES.len())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn profile() -> ProviderProfile {
-        ProviderProfile {
-            name: "test".to_owned(),
-            base_url: "https://example.invalid/v1".to_owned(),
-            model: "big/model".to_owned(),
-            ..Default::default()
-        }
+    fn profile() -> Profile {
+        Profile::for_model("kojo/kojo")
     }
 
     #[test]
     fn an_unassigned_role_inherits_down_the_chain() {
         let profile = profile();
         let resolved = profile.resolve_role("subagent").expect("subagent resolves");
-        assert_eq!(resolved.model, "big/model");
+        assert_eq!(resolved.model, "kojo/kojo");
         assert!(resolved.inherited, "and says it was inherited");
         // The root is never inherited.
-        let default = profile.resolve_role("default").expect("default resolves");
-        assert!(!default.inherited);
-        assert_eq!(profile.assigned_roles(), (1, ROLES.len()));
+        assert!(!profile.resolve_role("default").unwrap().inherited);
     }
 
     #[test]
-    fn assignments_route_to_their_legacy_fields() {
-        // `default` and `aux` keep writing the fields an older abacus reads,
-        // so a settings file round-trips through a downgrade with the two
-        // assignments that matter still in place.
+    fn the_reviewer_follows_the_auxiliary_model() {
         let mut profile = profile();
-        profile.set_role_model("aux", Some("small/model".to_owned()));
-        profile.set_role_model("subagent", Some("mid/model".to_owned()));
-        assert_eq!(profile.aux_model.as_deref(), Some("small/model"));
-        assert_eq!(profile.roles.get("subagent").map(String::as_str), Some("mid/model"));
-        assert!(!profile.roles.contains_key("aux"), "aux is not duplicated into the map");
-        assert_eq!(profile.resolve_role("aux").unwrap().model, "small/model");
-        assert!(!profile.resolve_role("subagent").unwrap().inherited);
-        assert_eq!(profile.assigned_roles(), (3, ROLES.len()));
+        assert_eq!(profile.resolve_role("review").unwrap().model, "kojo/kojo");
+        profile.set_role_model("aux", Some("llama/qwen-3-4b".to_owned()));
+        let review = profile.resolve_role("review").unwrap();
+        assert_eq!(review.model, "llama/qwen-3-4b", "a cheap aux model judges by default");
+        assert!(review.inherited);
+        profile.set_role_model("review", Some("kojo/kojo".to_owned()));
+        assert!(!profile.resolve_role("review").unwrap().inherited);
     }
 
     #[test]
     fn clearing_a_role_falls_back_but_never_empties_the_default() {
         let mut profile = profile();
-        profile.set_role_model("aux", Some("small/model".to_owned()));
+        profile.set_role_model("aux", Some("llama/qwen-3-4b".to_owned()));
         profile.set_role_model("aux", None);
-        assert_eq!(profile.aux_model, None);
+        assert!(profile.roles.is_empty());
         assert!(profile.resolve_role("aux").unwrap().inherited);
 
         profile.set_role_model("default", None);
-        assert_eq!(profile.model, "big/model", "the root of the chain cannot be cleared out from under the session");
+        assert_eq!(profile.model, "kojo/kojo", "the root of the chain cannot be cleared out from under the session");
         // Whitespace is not an assignment.
         profile.set_role_model("subagent", Some("   ".to_owned()));
         assert!(profile.resolve_role("subagent").unwrap().inherited);

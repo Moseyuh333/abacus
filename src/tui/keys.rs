@@ -149,7 +149,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) {
             _ if ctrl(key, 'c') => app.handle_ctrl_c(),
             KeyCode::F(1) => app.show_help = true,
             KeyCode::F(12) => app.resume_latest(),
-            KeyCode::BackTab => app.toggle_agent_mode(),
+            KeyCode::BackTab => app.toggle_mode(),
             _ if app.mode == InputMode::Insert => handle_insert_key(app, key),
             _ => handle_normal_key(app, key),
         }
@@ -162,7 +162,6 @@ pub(super) fn approval_key(app: &mut App, key: KeyEvent) {
     }
     match key.code {
         KeyCode::Char('y') | KeyCode::Enter => app.decide(ApprovalDecision::Once),
-        KeyCode::Char('a') => app.decide(ApprovalDecision::Always),
         KeyCode::Char('n') | KeyCode::Esc => app.decide(ApprovalDecision::Reject),
         KeyCode::Char('v') => {
             if let Some(approval) = app.approval.as_mut().filter(|approval| approval.diff.is_some()) {
@@ -218,11 +217,6 @@ pub(super) fn picker_key(app: &mut App, key: KeyEvent) {
     let Some(picker) = &mut app.picker else {
         return;
     };
-    // An inline rename / delete prompt owns the keys until it is dismissed.
-    if picker.prompt.is_some() {
-        return handle_picker_prompt(app, key);
-    }
-    let profiles = picker.action == PickerAction::SwitchProfile;
     match key.code {
         KeyCode::Char('k') | KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
         KeyCode::Char('j') | KeyCode::Down => {
@@ -230,41 +224,47 @@ pub(super) fn picker_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => app.accept_picker(None),
         KeyCode::Esc | KeyCode::Char('q') => app.picker = None,
-        KeyCode::Char('n' | '+') if profiles => app.open_provider_picker(),
-        KeyCode::Char('r' | 'd') if profiles => {
-            let Some(id) = app.selected_profile_id() else {
-                return;
-            };
-            if key.code == KeyCode::Char('r') {
-                app.begin_profile_rename(&id);
-            } else {
-                app.begin_profile_delete(&id);
-            }
-        }
         _ => {}
     }
 }
 
+/// Keys for `/config`: ←/→ (or Tab) step the tabs, ↑/↓ the rows, Enter edits
+/// or cycles, Del clears a role back to inheriting, and Esc steps out of the
+/// provider editor before it closes the panel.
 pub(super) fn config_key(app: &mut App, key: KeyEvent) {
+    let rows = app.config_rows().len();
     let Some(panel) = &mut app.config_panel else {
         return;
     };
     if let Some((_, input)) = &mut panel.editing {
         return match key.code {
-            KeyCode::Esc => {
-                panel.editing = None;
-                app.cancel_pending_provider();
-            }
+            KeyCode::Esc => panel.editing = None,
             KeyCode::Enter => app.commit_config_edit(),
             _ => edit_buffer(input, key, false),
         };
     }
+    // Any key but a second Enter on it disarms the provider delete row.
+    if key.code != KeyCode::Enter {
+        panel.confirm_remove = false;
+    }
     match key.code {
         KeyCode::Char('k') | KeyCode::Up => panel.selected = panel.selected.saturating_sub(1),
-        KeyCode::Char('j') | KeyCode::Down => panel.selected = (panel.selected + 1).min(settings().count() - 1),
+        KeyCode::Char('j') | KeyCode::Down => panel.selected = (panel.selected + 1).min(rows.saturating_sub(1)),
+        KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => app.switch_config_tab(1),
+        KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') => app.switch_config_tab(-1),
         KeyCode::Enter | KeyCode::Char(' ') => {
             let selected = panel.selected;
             app.activate_setting(selected);
+        }
+        KeyCode::Delete | KeyCode::Backspace => {
+            let selected = panel.selected;
+            app.clear_setting(selected);
+        }
+        KeyCode::Esc | KeyCode::Char('q') if panel.provider.is_some() => {
+            // Back to the list, on the provider that was open.
+            let open = panel.provider.take();
+            panel.selected =
+                open.and_then(|id| app.settings.providers.keys().position(|candidate| *candidate == id)).unwrap_or(0);
         }
         KeyCode::Esc | KeyCode::Char('q') => app.config_panel = None,
         _ => {}
@@ -282,6 +282,7 @@ pub(super) fn handle_click(app: &mut App, column: u16, row: u16) {
     let hits = app.hits.borrow();
     let completion = hit(&hits.completion, column, row);
     let config = hit(&hits.config, column, row);
+    let config_tab = hit(&hits.config_tabs, column, row);
     let picker = hit(&hits.picker, column, row);
     let transcript = hit(&hits.transcript, column, row);
     let hub_scope = hit(&hits.hub_scope, column, row);
@@ -326,17 +327,19 @@ pub(super) fn handle_click(app: &mut App, column: u16, row: u16) {
     // Same precedence as drawing: a picker floats above the config panel, so a
     // click landing on both belongs to the picker.
     if let Some(index) = picker {
-        // A rename / delete prompt owns the overlay; list clicks must not
-        // switch profiles out from under it.
-        if app.picker.as_ref().is_some_and(|picker| picker.prompt.is_some()) {
-            return;
-        }
         let already = app.picker.as_ref().is_some_and(|picker| picker.selected == index);
         if let Some(picker) = &mut app.picker {
             picker.selected = index;
         }
         if already {
             app.accept_picker(Some(index));
+        }
+        return;
+    }
+    if let Some(tab) = config_tab {
+        if let Some(panel) = &app.config_panel {
+            let delta = tab as isize - panel.tab as isize;
+            app.switch_config_tab(delta);
         }
         return;
     }
@@ -543,53 +546,6 @@ pub(super) fn clipboard_text() -> Option<String> {
     }
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     if text.is_empty() { None } else { Some(text) }
-}
-
-pub(super) fn handle_picker_prompt(app: &mut App, key: KeyEvent) {
-    let renaming = app.picker.as_ref().is_some_and(|picker| matches!(picker.prompt, Some(PickerPrompt::Rename { .. })));
-    if renaming {
-        match key.code {
-            KeyCode::Esc => {
-                if let Some(picker) = app.picker.as_mut() {
-                    picker.prompt = None;
-                }
-            }
-            KeyCode::Enter => {
-                let Some(picker) = app.picker.as_mut() else {
-                    return;
-                };
-                let Some(PickerPrompt::Rename { id, input }) = picker.prompt.take() else {
-                    return;
-                };
-                let to = input.text();
-                app.commit_profile_rename(&id, &to);
-            }
-            _ => {
-                if let Some(PickerPrompt::Rename { input, .. }) =
-                    app.picker.as_mut().and_then(|picker| picker.prompt.as_mut())
-                {
-                    edit_buffer(input, key, false);
-                }
-            }
-        }
-        return;
-    }
-
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('n') => {
-            if let Some(picker) = app.picker.as_mut() {
-                picker.prompt = None;
-            }
-        }
-        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('d') => {
-            let id = match app.picker.as_mut().and_then(|picker| picker.prompt.take()) {
-                Some(PickerPrompt::ConfirmDelete { id }) => id,
-                _ => return,
-            };
-            app.confirm_profile_delete(&id);
-        }
-        _ => {}
-    }
 }
 
 /// The editing keys every text field shares.

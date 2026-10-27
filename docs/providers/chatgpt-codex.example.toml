@@ -1,0 +1,24 @@
+# Provider: the ChatGPT/Codex backend (gpt-5.6-luna family) over OAuth.
+#
+# Paste into ~/.abacus/config.toml, then make a profile for one of its models
+# with /profile (or edit the provider under /config → Providers). Every field
+# below is general-purpose; nothing is special-cased for this backend.
+
+[providers.codex]
+name = "ChatGPT Codex"
+base_url = "https://chatgpt.com/backend-api/codex"   # requests go to {base_url}/responses
+protocol = "responses"
+
+# The OAuth bearer, read fresh from the ChatGPT auth file on every request so
+# a refreshed token is picked up without restarting.
+token_file = "~/.codex/auth.json"
+token_field = "tokens.access_token"   # dotted path, or a /json/pointer
+
+# The backend lists no models, so name the ones to offer.
+models = ["gpt-5.6-luna"]
+
+# Fields this backend requires, deep-merged over what Abacus builds: these win,
+# nested objects merge, unmentioned keys survive.
+[providers.codex.body]
+store = false        # the backend rejects store=true
+stream = true        # and stream=false

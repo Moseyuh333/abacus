@@ -20,7 +20,7 @@ is a pass.
 | `description` | none | one line, shown in the run header |
 | `max_steps` | 40 | model-step ceiling |
 | `timeout_seconds` | 300 | wall-clock ceiling; a timeout is scored, not errored |
-| `mode` | `build` | `plan`, `build`, or `auto` |
+| `mode` | `yolo` | `yolo` (actions run unreviewed), `auto` (the safety reviewer judges them), or `read-only` |
 | `allow_subagents` | `false` | whether delegation is available |
 
 Unknown keys are rejected, so a typo fails loudly instead of silently scoring a

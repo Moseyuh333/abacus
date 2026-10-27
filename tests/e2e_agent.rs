@@ -2,11 +2,11 @@ mod support;
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use abacus_agent::{
-    agent::{AgentEvent, AgentMode, ApprovalDecision, DoneReason, TurnOptions},
+    agent::{AgentEvent, ApprovalDecision, DoneReason, TurnOptions},
     config::ProviderProtocol,
     provider::Provider,
     tools::tool_specs,
@@ -20,8 +20,16 @@ fn edit_call() -> String {
     calls(&[("edit_1", "edit_file", serde_json::from_str(EDIT).unwrap())])
 }
 
-fn locked() -> Arc<AtomicBool> {
+/// The session's YOLO switch, off: AUTO mode.
+fn auto() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
+}
+
+/// A command with an effect a test can see, and that no rule settles —
+/// `touch` is neither pure inspection nor destructive — so AUTO puts it to
+/// the reviewer.
+fn touch_marker() -> String {
+    calls(&[("c1", "run_command", json!({"command": "touch marker.txt"}))])
 }
 
 #[tokio::test]
@@ -62,7 +70,7 @@ async fn a_cancelled_turn_keeps_the_work_it_already_did() {
     let mut search = Some(calls(&[("call_1", "grep", json!({"query": "needle"}))]));
     let mock = Mock::answering(move |_| search.take().map_or(Reply::Hang, Reply::Send)).await;
 
-    let cancel = locked();
+    let cancel = Arc::new(AtomicBool::new(false));
     let raised = cancel.clone();
     let (completed, reason) = turn(
         project.provider(&mock),
@@ -100,7 +108,8 @@ async fn responses_protocol_uses_responses_endpoint_and_stream_format() {
     )
     .to_owned()])
     .await;
-    let config = abacus_agent::config::Config { protocol: ProviderProtocol::Responses, ..project.config(mock.address) };
+    let mut config = project.config(mock.address);
+    config.connection.protocol = ProviderProtocol::Responses;
     let (deltas, mut streamed) = tokio::sync::mpsc::unbounded_channel();
     let completion = Provider::new(&config)
         .unwrap()
@@ -116,31 +125,30 @@ async fn responses_protocol_uses_responses_endpoint_and_stream_format() {
     assert!(request.contains("\"name\":\"grep\""));
 }
 
+/// An edit the executor keeps inside the workspace is what the user asked an
+/// agent for: AUTO runs it at once, with neither a reviewer call nor a prompt.
+/// The mock serves two requests; a review in between would take the second
+/// and leave the turn hanging.
 #[tokio::test]
-async fn edit_requires_reviewable_approval_before_atomic_write() {
+async fn auto_runs_workspace_edits_without_a_review_or_a_prompt() {
     let project = project(&[("value.txt", "old\n")]);
     let mock = Mock::script([edit_call(), says("Updated value.txt.")]).await;
 
-    let mut approved = false;
     turn(
         project.provider(&mock),
         project.asks("update the value"),
-        TurnOptions { allow_mutations: locked(), allow_subagents: true, ..project.options() },
+        TurnOptions { yolo: auto(), allow_subagents: true, ..project.options() },
         |event| {
             if let AgentEvent::Approval(request) = event {
-                assert_eq!(request.tool, "edit_file");
-                assert!(request.details.contains("-old"));
-                assert!(request.details.contains("+new"));
-                request.respond.send(ApprovalDecision::Once).unwrap();
-                approved = true;
+                panic!("AUTO asked about a workspace edit: {}", request.tool);
             }
         },
     )
     .await;
-    mock.finish().await;
+    let requests = mock.finish().await;
 
-    assert!(approved);
     assert_eq!(project.read("value.txt"), "new\n");
+    assert_eq!(requests.len(), 2, "the turn's two requests and no review");
 }
 
 /// A model served without native function-calling emits a Hermes-format tool
@@ -158,7 +166,7 @@ async fn text_emitted_tool_calls_are_parsed_when_native_calls_absent() {
     turn(
         Provider::new(&config).unwrap(),
         project.asks("read target.txt"),
-        TurnOptions { mode: AgentMode::Auto, allow_mutations: locked(), allow_subagents: true, ..project.options() },
+        TurnOptions { yolo: auto(), allow_subagents: true, ..project.options() },
         |event| match event {
             AgentEvent::ToolStarted { name, summary } => {
                 assert_eq!(name, "read_file");
@@ -180,57 +188,132 @@ async fn text_emitted_tool_calls_are_parsed_when_native_calls_absent() {
     assert!(saw_result, "read_file must return the file contents");
 }
 
+/// The reviewer sees what the user said and the action, and its BLOCK stops
+/// the action: the agent reads why, and nothing ran.
 #[tokio::test]
-async fn auto_mode_blocks_mutation_until_model_selects_build() {
-    let project = project(&[("value.txt", "old\n")]);
-    let mock = Mock::script([edit_call(), says("I need to select a mode first.")]).await;
+async fn auto_review_blocks_an_action_the_user_did_not_ask_for() {
+    let project = project(&[]);
+    let mock = Mock::script([
+        touch_marker(),
+        says("BLOCK: creating files is not part of explaining the code."),
+        says("I will leave the files alone."),
+    ])
+    .await;
 
-    let mut blocked = false;
+    let mut output = String::new();
     turn(
         project.provider(&mock),
-        project.asks("update the value"),
-        TurnOptions { mode: AgentMode::Auto, allow_subagents: true, ..project.options() },
+        project.asks("explain what this repository does"),
+        TurnOptions { yolo: auto(), ..project.options() },
         |event| match event {
-            AgentEvent::ToolFinished { name, output } if name == "edit_file" => {
-                blocked = output.contains("Blocked by AUTO MODE")
-            }
-            AgentEvent::Approval(_) => panic!("blocked AUTO mutation requested approval"),
+            AgentEvent::ToolFinished { name, output: text } if name == "run_command" => output = text,
+            AgentEvent::Approval(_) => panic!("a decided review must not ask the person"),
             _ => {}
         },
     )
     .await;
-    mock.finish().await;
+    let requests = mock.finish().await;
 
-    assert!(blocked);
-    assert_eq!(project.read("value.txt"), "old\n");
+    assert!(output.starts_with("Blocked by AUTO mode"), "{output}");
+    assert!(output.contains("not part of explaining the code"), "the reviewer's reason reaches the agent: {output}");
+    assert!(!project.workspace.join("marker.txt").exists(), "a blocked command does not run");
+    let review = &requests[1];
+    assert!(review.contains("permission check"), "the second request is the review: {review}");
+    assert!(review.contains("explain what this repository does"), "the reviewer sees the user's words");
+    assert!(review.contains("touch marker.txt"), "and the action");
 }
 
 #[tokio::test]
-async fn auto_mode_selection_enables_later_tool_in_same_completion() {
-    let project = project(&[("value.txt", "old\n")]);
-    let choose = json!({"mode": "build", "reason": "The user requested implementation"});
-    let mock = Mock::script([
-        calls(&[("mode_1", "mode_set", choose), ("edit_1", "edit_file", serde_json::from_str(EDIT).unwrap())]),
-        says("Updated value.txt."),
-    ])
-    .await;
+async fn auto_review_lets_an_allowed_action_run() {
+    let project = project(&[]);
+    let mock = Mock::script([touch_marker(), says("ALLOW"), says("Created it.")]).await;
 
-    let mut selected_build = false;
     turn(
         project.provider(&mock),
-        project.asks("update the value"),
-        TurnOptions { mode: AgentMode::Auto, allow_subagents: true, ..project.options() },
+        project.asks("create marker.txt"),
+        TurnOptions { yolo: auto(), ..project.options() },
         |event| {
-            if let AgentEvent::ModeChanged { mode, .. } = event {
-                selected_build = mode == AgentMode::Build;
+            if let AgentEvent::Approval(_) = event {
+                panic!("an allowed action must not ask the person");
             }
         },
     )
     .await;
     mock.finish().await;
 
-    assert!(selected_build);
-    assert_eq!(project.read("value.txt"), "new\n");
+    assert!(project.workspace.join("marker.txt").exists(), "the allowed command ran");
+}
+
+/// A reviewer that answers with no verdict leaves the person as the only
+/// other authority: AUTO asks them instead of guessing either way.
+#[tokio::test]
+async fn an_undecided_review_asks_the_person() {
+    let project = project(&[]);
+    let mock = Mock::script([touch_marker(), says("Hard to say without more context."), says("done")]).await;
+
+    let mut asked = false;
+    turn(
+        project.provider(&mock),
+        project.asks("create marker.txt"),
+        TurnOptions { yolo: auto(), ..project.options() },
+        |event| {
+            if let AgentEvent::Approval(request) = event {
+                assert_eq!(request.tool, "run_command");
+                assert!(request.details.contains("could not decide"), "{}", request.details);
+                request.respond.send(ApprovalDecision::Once).unwrap();
+                asked = true;
+            }
+        },
+    )
+    .await;
+    mock.finish().await;
+
+    assert!(asked);
+    assert!(project.workspace.join("marker.txt").exists(), "the person allowed it");
+}
+
+/// YOLO is no review at all: the command runs, and the mock's two requests
+/// are the turn's own.
+#[tokio::test]
+async fn yolo_runs_everything_without_review() {
+    let project = project(&[]);
+    let mock = Mock::script([touch_marker(), says("done")]).await;
+
+    turn(project.provider(&mock), project.asks("create marker.txt"), project.options(), |event| {
+        if let AgentEvent::Approval(_) = event {
+            panic!("YOLO never asks");
+        }
+    })
+    .await;
+    let requests = mock.finish().await;
+
+    assert!(project.workspace.join("marker.txt").exists());
+    assert_eq!(requests.len(), 2, "no review request in between");
+}
+
+/// A scout is read-only mechanically: a command that changes something is
+/// refused even in YOLO, after the classifier calls it a mutation.
+#[tokio::test]
+async fn a_read_only_task_refuses_a_change() {
+    let project = project(&[]);
+    let mock = Mock::script([touch_marker(), says("MUTATE"), says("done")]).await;
+
+    let mut output = String::new();
+    turn(
+        project.provider(&mock),
+        project.asks("look around"),
+        TurnOptions { read_only: true, ..project.options() },
+        |event| {
+            if let AgentEvent::ToolFinished { output: text, .. } = event {
+                output = text;
+            }
+        },
+    )
+    .await;
+    mock.finish().await;
+
+    assert!(output.contains("this task is read-only"), "{output}");
+    assert!(!project.workspace.join("marker.txt").exists());
 }
 
 /// What kind of background request the agent is making. A summariser or
@@ -412,28 +495,27 @@ async fn shipped_grok_example_sends_a_bearer_key_to_an_openai_shaped_endpoint() 
     let mock = Mock::script([says("hello from grok")]).await;
 
     // The shipped example, verbatim except for the host and a key source the
-    // test can control — everything else (protocol, model, auth shape) is the
-    // file as users copy it.
+    // test can control — everything else (protocol, auth shape) is the file
+    // as users copy it.
+    #[derive(serde::Deserialize)]
+    struct Example {
+        providers: std::collections::BTreeMap<String, abacus_agent::providers::ProviderConfig>,
+    }
     let shipped = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/endpoints/grok.example.yaml"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/providers/grok.example.toml"),
     )
     .unwrap();
-    let home = project.directory.path();
-    let key_file = home.join("xai-key");
+    let mut grok = toml::from_str::<Example>(&shipped).unwrap().providers.remove("grok").expect("the grok provider");
+    let key_file = project.directory.path().join("xai-key");
     std::fs::write(&key_file, "xai-test-key-123\n").unwrap();
-    let adapted = shipped
-        .replace("https://api.x.ai/v1/chat/completions", &format!("http://{}/v1/chat/completions", mock.address))
-        .replace("  env: XAI_API_KEY", &format!("  file: {}", key_file.display()));
-    let endpoints = home.join("endpoints");
-    std::fs::create_dir(&endpoints).unwrap();
-    std::fs::write(endpoints.join("grok.yaml"), adapted).unwrap();
+    grok.base_url = format!("http://{}/v1", mock.address);
+    grok.api_key_env = None;
+    grok.token_file = Some(key_file);
 
     let mut config = project.config(mock.address);
-    let endpoint = abacus_agent::endpoint::ScriptedEndpoint::resolve("grok", &endpoints).unwrap();
-    // What `Config::resolve` does when the profile leaves its model blank: the
-    // endpoint supplies it. Taken from the file so a bad slug fails here.
-    config.model = endpoint.model.clone().expect("the example declares a model");
-    config.endpoint = Some(endpoint);
+    config.connection =
+        abacus_agent::providers::Connection::resolve("grok", &grok, &abacus_agent::config::Credentials::default());
+    config.model = "grok-4.5".to_owned();
 
     let opening = vec![json!({"role":"user","content":"hi"})];
     turn(Provider::new(&config).unwrap(), opening, project.options(), |_| {}).await;
@@ -441,11 +523,11 @@ async fn shipped_grok_example_sends_a_bearer_key_to_an_openai_shaped_endpoint() 
 
     let (headers, body) = request.split_once("\r\n\r\n").expect("a request body");
     let lowered = headers.to_ascii_lowercase();
-    assert!(headers.contains("POST /v1/chat/completions"), "the url is used verbatim: {headers}");
+    assert!(headers.contains("POST /v1/chat/completions"), "chat completions under the base URL: {headers}");
     assert!(lowered.contains("authorization: bearer xai-test-key-123"), "the key goes out as a bearer: {headers}");
     // OpenAI-shaped, not Anthropic: messages at the top level, no anthropic-version.
     let body: serde_json::Value = serde_json::from_str(body).expect("json body");
-    assert_eq!(body["model"], "grok-4.5", "the model comes from the endpoint");
+    assert_eq!(body["model"], "grok-4.5");
     assert!(body["messages"].is_array(), "chat-completions shape: {body}");
     assert!(!lowered.contains("anthropic-version"), "no anthropic headers on an OpenAI endpoint: {headers}");
 }
@@ -454,13 +536,10 @@ fn grep_command() -> String {
     calls(&[("c1", "run_command", json!({"command": "grep -rn needle ."}))])
 }
 
-/// PLAN used to send every shell command to a classifier that was told to
-/// refuse when unsure, so `grep` cost a round trip and `python -c` was refused
-/// for what python can do rather than what the command does. Inspection now
-/// runs directly: the mock serves the turn only, and a third request would
-/// mean a classifier call happened.
+/// A command that only looks never waits on the reviewer: the mock serves the
+/// turn only, and a third request would mean a review happened.
 #[tokio::test]
-async fn plan_mode_runs_inspection_without_a_classifier_call() {
+async fn auto_runs_inspection_without_a_review_call() {
     let project = project(&[("notes.txt", "the needle is here\n")]);
     let mock = Mock::script([grep_command(), says("found it")]).await;
 
@@ -468,14 +547,8 @@ async fn plan_mode_runs_inspection_without_a_classifier_call() {
     turn(
         project.provider(&mock),
         project.asks("where is the needle?"),
-        TurnOptions {
-            mode: AgentMode::Plan,
-            // Approval is deliberately NOT pre-granted: a command judged to
-            // change nothing should run in PLAN without a prompt, and there is
-            // nothing here that could answer one.
-            allow_mutations: locked(),
-            ..project.options()
-        },
+        // Nothing here could answer a prompt, and nothing should need to.
+        TurnOptions { yolo: auto(), ..project.options() },
         |event| {
             if let AgentEvent::ToolFinished { output: text, .. } = event {
                 output.push_str(&text);
@@ -485,10 +558,10 @@ async fn plan_mode_runs_inspection_without_a_classifier_call() {
     .await;
     let requests = mock.finish().await;
 
-    assert!(!output.contains("Blocked by PLAN MODE"), "grep only inspects: {output}");
-    assert!(!output.contains("User rejected"), "inspection must not wait on an approval nobody can give: {output}");
+    assert!(!output.contains("Blocked"), "grep only inspects: {output}");
+    assert!(!output.contains("rejected"), "inspection must not wait on an approval nobody can give: {output}");
     assert!(output.contains("needle"), "the command actually ran: {output}");
-    assert_eq!(requests.len(), 2, "two turn requests and no classifier call in between");
+    assert_eq!(requests.len(), 2, "two turn requests and no review in between");
 }
 
 /// Reading outside the workspace used to be impossible, so models detoured
@@ -518,7 +591,7 @@ async fn an_outside_read_is_cleared_but_a_credential_is_not() {
     turn(
         project.provider(&mock),
         project.asks("look at the sibling project"),
-        TurnOptions { mode: AgentMode::Plan, ..project.options() },
+        TurnOptions { yolo: auto(), ..project.options() },
         |event| {
             if let AgentEvent::ToolFinished { output, .. } = event {
                 outputs.push(output);
@@ -532,33 +605,6 @@ async fn an_outside_read_is_cleared_but_a_credential_is_not() {
     assert!(outputs[0].contains("pub fn shared()"), "the sibling checkout is readable: {}", outputs[0]);
     assert!(!outputs[1].contains("PRIVATE KEY MATERIAL"), "the key must never be returned: {}", outputs[1]);
     assert!(outputs[1].contains("private data"), "and it says why: {}", outputs[1]);
-}
-
-/// The inspection skip is scoped to PLAN. BUILD can mutate, so its approval
-/// prompt is the user's control over what happens to their machine — a `grep`
-/// there must still ask, or the skip has quietly disarmed the whole gate.
-#[tokio::test]
-async fn build_mode_still_asks_before_running_a_command() {
-    let project = project(&[("notes.txt", "the needle is here\n")]);
-    let mock = Mock::script([grep_command(), says("done")]).await;
-
-    let asks = AtomicUsize::new(0);
-    let mut output = String::new();
-    turn(
-        project.provider(&mock),
-        project.asks("find the needle"),
-        TurnOptions { allow_mutations: locked(), ..project.options() },
-        |event| match event {
-            AgentEvent::Approval(_) => drop(asks.fetch_add(1, Ordering::Relaxed)),
-            AgentEvent::ToolFinished { output: text, .. } => output.push_str(&text),
-            _ => {}
-        },
-    )
-    .await;
-    mock.finish().await;
-
-    assert!(asks.into_inner() > 0, "BUILD must still request approval for a shell command");
-    assert!(!output.contains("the needle is here"), "and must not run it unapproved: {output}");
 }
 
 /// A tool result too large to be worth reading whole is replaced by a handle
@@ -614,7 +660,7 @@ async fn a_streamed_leading_system_rejection_is_learned_and_retried() {
     let messages = vec![
         json!({"role":"system","content":"You are Abacus."}),
         json!({"role":"user","content":"Hi"}),
-        json!({"role":"system","content":"BUILD MODE is active."}),
+        json!({"role":"system","content":"AUTO mode: risky actions are reviewed."}),
     ];
     let completion = project.provider(&mock).ask(&messages, &[], &AtomicBool::new(false)).await.unwrap();
     assert_eq!(completion.content, "Hello from Qwen.");

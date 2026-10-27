@@ -1,8 +1,8 @@
 //! Eval harness: run a fixed task suite against a pinned model and score it
 //! objectively.
 //!
-//! Abacus carries five self-improvement loops — papercuts, memories, the
-//! refine pass, the hive tier, mode discipline — and until now no way to tell
+//! Abacus carries four self-improvement loops — papercuts, memories, the
+//! refine pass, the hive tier — and until now no way to tell
 //! whether any of them helps. This module is the measurement side: a task
 //! suite, an isolated workspace per run, and a verdict from a script rather
 //! than from a model.
@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::agent::{AgentEvent, AgentMode, ApprovalDecision, TurnOptions, UserAnswer, initial_messages, run_turn};
+use crate::agent::{AgentEvent, ApprovalDecision, TurnOptions, UserAnswer, initial_messages, run_turn};
 use crate::compaction::CompactionState;
 use crate::config::{AbacusPaths, Config, EvalState, Settings};
 use crate::model_info::ModelLimits;
@@ -56,9 +56,10 @@ struct TaskFile {
     max_steps: usize,
     #[serde(default = "default_timeout")]
     timeout_seconds: u64,
-    /// `plan`, `build`, or `auto`. Defaults to `build` — most tasks are
-    /// scored on a mutation, and AUTO would make the mode-selection step part
-    /// of what is being measured.
+    /// `yolo`, `auto`, or `read-only`. Defaults to `yolo` — most tasks are
+    /// scored on a mutation, and AUTO would make its reviewer part of what is
+    /// being measured. `build` and `plan` are still read, as `yolo` and
+    /// `read-only`.
     mode: Option<String>,
     #[serde(default)]
     allow_subagents: bool,
@@ -79,12 +80,22 @@ pub struct EvalTask {
     file: TaskFile,
 }
 
+/// How a task's actions are permitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskMode {
+    Yolo,
+    Auto,
+    ReadOnly,
+}
+
 impl EvalTask {
-    fn mode(&self) -> Result<AgentMode> {
-        let Some(mode) = self.file.mode.as_deref() else {
-            return Ok(AgentMode::Build);
-        };
-        AgentMode::parse(mode).with_context(|| format!("task `{}`: unknown mode `{mode}`", self.name))
+    fn mode(&self) -> Result<TaskMode> {
+        match self.file.mode.as_deref().map(|mode| mode.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("yolo" | "build") => Ok(TaskMode::Yolo),
+            Some("auto") => Ok(TaskMode::Auto),
+            Some("read-only" | "plan") => Ok(TaskMode::ReadOnly),
+            Some(other) => bail!("task `{}`: unknown mode `{other}` (yolo, auto, or read-only)", self.name),
+        }
     }
 }
 
@@ -270,16 +281,17 @@ async fn run_once(
     // A run's config is the real one with the workspace, limits, and learned
     // state swapped. Provider credentials are resolved fields on `Config`, so
     // repointing `paths` cannot break authentication — it only moves where
-    // papercuts, memories, the hive tier, and mode counts are read from.
+    // papercuts, memories, and the hive tier are read from.
+    let mode = task.mode()?;
     let mut config = config.clone();
     config.workspace = workspace.clone();
     config.max_steps = task.file.max_steps;
-    config.mode = Some(task.mode()?);
     config.no_session = true;
     config.trace_enabled = false;
     // Mutations are the point: the score comes from what the run changed in a
     // throwaway copy.
-    config.yes = true;
+    config.permission =
+        if mode == TaskMode::Auto { crate::config::Permission::Auto } else { crate::config::Permission::Yolo };
     if let Some(model) = model_override {
         config.model = model.to_owned();
         config.model_limits = ModelLimits::resolve_from_name(model, None, None);
@@ -305,8 +317,7 @@ async fn run_once(
     let cancel = Arc::new(AtomicBool::new(false));
     let (events, mut receiver) = mpsc::unbounded_channel();
     let turn = TurnOptions {
-        mode: config.mode.unwrap_or(AgentMode::Build),
-        allow_mutations: Arc::new(AtomicBool::new(true)),
+        read_only: mode == TaskMode::ReadOnly,
         compaction: CompactionState::new(None),
         allow_subagents: task.file.allow_subagents,
         harness: crate::harness::HarnessStore::load_migrated(
@@ -543,9 +554,9 @@ mod tests {
         assert_eq!(tasks[0].name, "fix-importer");
         assert_eq!(tasks[0].file.max_steps, DEFAULT_MAX_STEPS);
         assert_eq!(tasks[0].file.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
-        // Build is the default: a task scored on a mutation should not spend
-        // steps deciding whether it is allowed to mutate.
-        assert_eq!(tasks[0].mode().unwrap(), AgentMode::Build);
+        // YOLO is the default: a task scored on a mutation should not have a
+        // reviewer in the measurement.
+        assert_eq!(tasks[0].mode().unwrap(), TaskMode::Yolo);
     }
 
     #[test]

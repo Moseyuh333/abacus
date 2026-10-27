@@ -72,17 +72,6 @@ struct DeleteArgs {
     recursive: bool,
 }
 
-/// A file's text before and after `addition` is appended on a line of its own.
-fn appended(path: &Path, addition: &str) -> (String, String) {
-    let old = fs::read_to_string(path).unwrap_or_default();
-    let mut new = old.clone();
-    if !new.is_empty() && !new.ends_with('\n') {
-        new.push('\n');
-    }
-    new.push_str(addition);
-    (old, new)
-}
-
 /// Remove whatever is at `path`: a file, a symlink, or a whole directory.
 fn remove(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
@@ -124,7 +113,7 @@ impl ToolCall {
         let args: Value = serde_json::from_str(&self.arguments).unwrap_or(Value::Null);
         match self.name.as_str() {
             "run_command" => args["command"].as_str().unwrap_or("shell command").to_owned(),
-            "edit_file" | "write_file" | "read_file" | "delete_file" | "append_file" | "git_show" | "git_blame" => {
+            "edit_file" | "write_file" | "read_file" | "delete_file" => {
                 args["path"].as_str().unwrap_or("unknown path").to_owned()
             }
             "move_file" => format!(
@@ -152,10 +141,6 @@ impl ToolCall {
                 let preview: String = message.chars().take(60).collect();
                 format!("commit: {preview}")
             }
-            "git_restore" => {
-                format!("restore {} path(s)", args["paths"].as_array().map(Vec::len).unwrap_or(0))
-            }
-            "git_checkout" => args["branch"].as_str().unwrap_or("branch").to_owned(),
             "read_files" => {
                 format!("{} file(s)", args["paths"].as_array().map(Vec::len).unwrap_or(0))
             }
@@ -187,16 +172,12 @@ impl ToolCall {
                 | "apply_patch"
                 | "delete_file"
                 | "move_file"
-                | "create_directory"
                 | "run_command"
                 | "git_commit"
-                | "git_restore"
-                | "git_checkout"
-                | "append_file"
                 // Skill authoring writes a file into the workspace or the user
-                // home. Listing it here is what makes PLAN block it: mode gating
-                // is `requires_approval && !read_only`, so a mutating tool in
-                // neither list would run unchecked in a read-only session.
+                // home. Listing it here is what puts it in front of AUTO's
+                // reviewer and keeps it from a read-only worker: a mutating
+                // tool in neither list would run unchecked.
                 | "skill_create"
                 | "skill_update"
         )
@@ -256,19 +237,13 @@ impl ToolExecutor {
             "read_page" => self.read_page(&call.arguments).await,
             "edit_file" => self.edit_file(&call.arguments),
             "write_file" => self.write_file(&call.arguments),
-            "append_file" => self.append_file(&call.arguments),
             "apply_patch" => self.apply_patch(&call.arguments).await,
             "delete_file" => self.delete_file(&call.arguments),
             "move_file" => self.move_file(&call.arguments),
-            "create_directory" => self.create_directory(&call.arguments),
             "git_diff" => self.git_diff(&call.arguments).await,
             "git_status" => self.git_status().await,
             "git_log" => self.git_log(&call.arguments).await,
             "git_commit" => self.git_commit(&call.arguments).await,
-            "git_restore" => self.git_restore(&call.arguments).await,
-            "git_show" => self.git_show(&call.arguments).await,
-            "git_blame" => self.git_blame(&call.arguments).await,
-            "git_checkout" => self.git_checkout(&call.arguments).await,
             "run_command" => self.run_command(&call.arguments).await,
             other => Err(anyhow!("unknown tool: {other}")),
         };
@@ -283,11 +258,7 @@ impl ToolExecutor {
             "apply_patch" => self.preview_patch(&call.arguments),
             "delete_file" => self.preview_delete(&call.arguments),
             "git_commit" => self.preview_git_commit(&call.arguments),
-            "git_restore" => self.preview_git_restore(&call.arguments),
-            "git_checkout" => Ok(format!("git checkout {}", call.summary())),
-            "append_file" => self.preview_append(&call.arguments),
             "move_file" => Ok(format!("Move {}", call.summary())),
-            "create_directory" => Ok(format!("Create directory {}", call.summary())),
             "run_command" => Ok(format!("$ {}", call.summary())),
             _ => Ok(call.summary()),
         };
@@ -596,14 +567,6 @@ impl ToolExecutor {
         Ok(format!("Wrote {}.", args.path))
     }
 
-    fn append_file(&self, arguments: &str) -> Result<String> {
-        let args: PathContent = parse_args(arguments)?;
-        let path = self.writable(&args.path)?;
-        let (_, new) = appended(&path, &args.content);
-        write_text_atomic(&path, &new).with_context(|| format!("could not write {}", args.path))?;
-        Ok(format!("Appended to {}.", args.path))
-    }
-
     async fn apply_patch(&self, arguments: &str) -> Result<String> {
         let patch = self.preview_patch(arguments)?;
         run_git_apply(&self.root, &patch, true).await?;
@@ -652,18 +615,6 @@ impl ToolExecutor {
         Ok(format!("Moved {} to {}.", args.source, args.destination))
     }
 
-    fn create_directory(&self, arguments: &str) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Args {
-            path: String,
-        }
-        let args: Args = parse_args(arguments)?;
-        let path = self.resolve_for_write(&args.path)?;
-        guard_secret(&path)?;
-        fs::create_dir_all(&path)?;
-        Ok(format!("Created directory {}.", args.path))
-    }
-
     fn preview_edit(&self, arguments: &str) -> Result<String> {
         let args: EditFileArgs = parse_args(arguments)?;
         let (raw_path, operations) = args.into_operations()?;
@@ -679,14 +630,6 @@ impl ToolExecutor {
         guard_secret(&path)?;
         let old = if path.exists() { fs::read_to_string(path)? } else { String::new() };
         Ok(unified_diff(&args.path, &old, &args.content))
-    }
-
-    fn preview_append(&self, arguments: &str) -> Result<String> {
-        let args: PathContent = parse_args(arguments)?;
-        let path = self.resolve_for_write(&args.path)?;
-        guard_secret(&path)?;
-        let (old, new) = appended(&path, &args.content);
-        Ok(unified_diff(&args.path, &old, &new))
     }
 
     /// The patch itself, once every path it names has been checked.
@@ -742,34 +685,10 @@ impl ToolExecutor {
         Ok((message.to_owned(), args.paths))
     }
 
-    /// The arguments of a restore, checked: paths, and whether to stop at the index.
-    fn restore_args(&self, arguments: &str) -> Result<(Vec<String>, &'static str)> {
-        #[derive(Deserialize)]
-        struct Args {
-            paths: Vec<String>,
-            #[serde(default)]
-            staged_only: bool,
-        }
-        let args: Args = parse_args(arguments)?;
-        if args.paths.is_empty() {
-            bail!("at least one path is required");
-        }
-        if args.paths.len() > 100 {
-            bail!("git_restore accepts at most 100 paths");
-        }
-        self.guard_paths(&args.paths)?;
-        Ok((args.paths, if args.staged_only { "index" } else { "HEAD" }))
-    }
-
     fn preview_git_commit(&self, arguments: &str) -> Result<String> {
         let (message, paths) = self.commit_args(arguments)?;
         let paths = if paths.is_empty() { "staged changes".to_owned() } else { paths.join(" ") };
         Ok(format!("git commit -m {message:?} -- {paths}"))
-    }
-
-    fn preview_git_restore(&self, arguments: &str) -> Result<String> {
-        let (paths, target) = self.restore_args(arguments)?;
-        Ok(format!("git restore → {target} ({})", paths.join(" ")))
     }
 
     /// Run git in the workspace and return what it printed, or fail with what
@@ -867,68 +786,6 @@ impl ToolExecutor {
         }
     }
 
-    async fn git_restore(&self, arguments: &str) -> Result<String> {
-        let (paths, target) = self.restore_args(arguments)?;
-        // core.autocrlf=false so restored content is byte-identical to HEAD
-        // rather than being re-encoded with the host's line-ending setting.
-        let mut command = vec!["-c", "core.autocrlf=false", "restore"];
-        if target == "index" {
-            command.push("--staged");
-        } else {
-            command.extend(["--source=HEAD", "--staged", "--worktree"]);
-        }
-        command.push("--");
-        command.extend(paths.iter().map(String::as_str));
-        self.git(&command).await?;
-        Ok(format!("Restored {} path(s) to {target}.", paths.len()))
-    }
-
-    /// The arguments of a history lookup, checked: a path and a revision.
-    fn revision_args(&self, arguments: &str) -> Result<(String, String)> {
-        #[derive(Deserialize)]
-        struct Args {
-            path: String,
-            #[serde(default = "default_head")]
-            revision: String,
-        }
-        let args: Args = parse_args(arguments)?;
-        guard_secret(&self.resolve_for_write(&args.path)?)?;
-        Ok((args.path, validate_ref(&args.revision)?))
-    }
-
-    async fn git_show(&self, arguments: &str) -> Result<String> {
-        let (path, revision) = self.revision_args(arguments)?;
-        let content = self.git(&["show", &format!("{revision}:{path}")]).await?;
-        let numbered = content
-            .lines()
-            .enumerate()
-            .take(2_000)
-            .map(|(index, line)| format!("{:>5} | {line}", index + 1))
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(format!(">>> {revision}:{path} ({} lines)\n{numbered}", content.lines().count()))
-    }
-
-    async fn git_blame(&self, arguments: &str) -> Result<String> {
-        let (path, revision) = self.revision_args(arguments)?;
-        let blame = self.git(&["blame", "--date=short", &revision, "--", &path]).await?;
-        Ok(or_note(blame, "No blame output."))
-    }
-
-    async fn git_checkout(&self, arguments: &str) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Args {
-            branch: String,
-            #[serde(default)]
-            create: bool,
-        }
-        let args: Args = parse_args(arguments)?;
-        let branch = validate_branch(&args.branch)?;
-        let (flags, done): (&[&str], _) =
-            if args.create { (&["checkout", "-b"], "Created and switched to") } else { (&["checkout"], "Switched to") };
-        self.git(&[flags, &[branch.as_str()]].concat()).await?;
-        Ok(format!("{done} branch {branch}."))
-    }
     async fn run_command(&self, arguments: &str) -> Result<String> {
         #[derive(Deserialize)]
         struct Args {
@@ -1219,11 +1076,6 @@ pub fn tool_specs() -> Vec<Value> {
             ],
         ),
         tool(
-            "create_directory",
-            "Create a directory and any missing parents inside the workspace.",
-            [req("path", string("Workspace-relative directory path"))],
-        ),
-        tool(
             "git_diff",
             "Show a repository diff without modifying anything. Defaults to the working tree against HEAD; pass base/head to diff a commit or revision range.",
             [
@@ -1257,52 +1109,6 @@ pub fn tool_specs() -> Vec<Value> {
                     json!({"type": "array", "items": {"type": "string"}, "description": "Optional workspace-relative paths to stage before committing; omit to commit already-staged changes", "maxItems": 100}),
                 ),
             ],
-        ),
-        tool(
-            "git_restore",
-            "Restore workspace paths from HEAD, discarding staged and working-tree changes. Approval-gated and destructive.",
-            [
-                req(
-                    "paths",
-                    json!({"type": "array", "items": {"type": "string"}, "description": "Workspace-relative paths to restore", "maxItems": 100}),
-                ),
-                opt(
-                    "staged_only",
-                    boolean("Only unstage (restore to index), keep working-tree changes; defaults to false"),
-                ),
-            ],
-        ),
-        tool(
-            "git_show",
-            "Show a file's contents at a past revision. Read-only; use it to compare before and after changes.",
-            [
-                req("path", string("Workspace-relative file path")),
-                opt(
-                    "revision",
-                    string("Git revision such as HEAD, HEAD~1, a commit sha, or a branch; defaults to HEAD"),
-                ),
-            ],
-        ),
-        tool(
-            "git_blame",
-            "Show per-line authorship for a file at a revision. Read-only.",
-            [
-                req("path", string("Workspace-relative file path")),
-                opt("revision", string("Git revision; defaults to HEAD")),
-            ],
-        ),
-        tool(
-            "git_checkout",
-            "Create and switch to a new branch, or switch to an existing one. Approval-gated.",
-            [
-                req("branch", string("Branch name to create or switch to")),
-                opt("create", boolean("Create the branch with -b before switching; defaults to false")),
-            ],
-        ),
-        tool(
-            "append_file",
-            "Append text to an existing file, or create it if it is missing. Atomic and approval-gated.",
-            [req("path", string("Workspace-relative file path")), req("content", string("Text to append"))],
         ),
         tool(
             "run_command",
@@ -1589,16 +1395,10 @@ fn tool_catalog() -> Vec<(&'static str, &'static str)> {
         ("apply_patch", "apply a precise unified diff across workspace files"),
         ("delete_file", "delete a file or recursive directory"),
         ("move_file", "move or rename a workspace path"),
-        ("create_directory", "create a directory and missing parents"),
         ("git_diff", "inspect working-tree, staged, or commit-range repository changes"),
         ("git_status", "inspect branch, changes, and untracked files"),
         ("git_log", "inspect recent repository history"),
         ("git_commit", "stage optional paths and create a local commit"),
-        ("git_restore", "restore workspace paths to HEAD, discarding changes"),
-        ("git_show", "show a file's contents at a past revision"),
-        ("git_blame", "show per-line authorship for a file"),
-        ("git_checkout", "create or switch to a git branch"),
-        ("append_file", "append text to a file, creating it if missing"),
         ("run_command", "run project commands with a timeout"),
         ("web_search", "search the web for current information"),
         ("read_page", "fetch and read the text of a web page"),
@@ -1666,9 +1466,6 @@ fn default_log_limit() -> usize {
 fn dot() -> String {
     ".".to_owned()
 }
-fn default_head() -> String {
-    "HEAD".to_owned()
-}
 
 fn validate_ref(value: &str) -> Result<String> {
     let trimmed = value.trim();
@@ -1682,20 +1479,6 @@ fn validate_ref(value: &str) -> Result<String> {
         || trimmed.chars().any(|c| c.is_whitespace())
     {
         bail!("invalid revision {trimmed:?}");
-    }
-    Ok(trimmed.to_owned())
-}
-
-fn validate_branch(value: &str) -> Result<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > 200 {
-        bail!("invalid branch name");
-    }
-    if trimmed.starts_with('-')
-        || trimmed.contains("..")
-        || trimmed.chars().any(|c| c.is_whitespace() || matches!(c, ':' | '~' | '^' | '?' | '*' | '[' | ']' | '\\'))
-    {
-        bail!("invalid branch name {trimmed:?}");
     }
     Ok(trimmed.to_owned())
 }
@@ -2012,44 +1795,10 @@ mod tests {
         assert!(tools.execute(&log).await.contains("initial"));
     }
 
-    #[tokio::test]
-    async fn git_restore_reverts_working_tree_to_head() {
-        let dir = tempdir().unwrap();
-        assert!(StdCommand::new("git").args(["init", "--quiet"]).current_dir(dir.path()).status().unwrap().success());
-        StdCommand::new("git")
-            .args(["config", "user.email", "agent@abacus.test"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
-        StdCommand::new("git").args(["config", "user.name", "Abacus"]).current_dir(dir.path()).status().unwrap();
-        fs::write(dir.path().join("file.txt"), "original\n").unwrap();
-        let tools = ToolExecutor::new(dir.path().canonicalize().unwrap());
-        let commit = tool_call("git_commit", r#"{"message":"baseline","paths":["file.txt"]}"#);
-        tools.execute(&commit).await;
-        fs::write(dir.path().join("file.txt"), "mutated\n").unwrap();
-        assert_eq!(fs::read_to_string(dir.path().join("file.txt")).unwrap(), "mutated\n");
-        let restore = tool_call("git_restore", r#"{"paths":["file.txt"]}"#);
-        assert!(tools.execute(&restore).await.contains("HEAD"));
-        assert_eq!(fs::read_to_string(dir.path().join("file.txt")).unwrap(), "original\n");
-    }
-
     fn init_repo(dir: &std::path::Path) {
         StdCommand::new("git").args(["init", "--quiet"]).current_dir(dir).status().unwrap();
         StdCommand::new("git").args(["config", "user.email", "agent@abacus.test"]).current_dir(dir).status().unwrap();
         StdCommand::new("git").args(["config", "user.name", "Abacus"]).current_dir(dir).status().unwrap();
-    }
-
-    #[tokio::test]
-    async fn git_show_returns_file_contents_at_head() {
-        let dir = tempdir().unwrap();
-        init_repo(dir.path());
-        fs::write(dir.path().join("file.txt"), "first\nsecond\n").unwrap();
-        let tools = ToolExecutor::new(dir.path().canonicalize().unwrap());
-        tools.execute(&tool_call("git_commit", r#"{"message":"base","paths":["file.txt"]}"#)).await;
-        fs::write(dir.path().join("file.txt"), "first\nCHANGED\n").unwrap();
-        let output = tools.execute(&tool_call("git_show", r#"{"path":"file.txt"}"#)).await;
-        assert!(output.contains("second"));
-        assert!(!output.contains("CHANGED"));
     }
 
     #[tokio::test]
@@ -2071,18 +1820,6 @@ mod tests {
         // head without base is rejected.
         let invalid = tools.execute(&tool_call("git_diff", r#"{"head":"HEAD"}"#)).await;
         assert!(invalid.starts_with("Error:"));
-    }
-
-    #[tokio::test]
-    async fn git_blame_runs_against_committed_file() {
-        let dir = tempdir().unwrap();
-        init_repo(dir.path());
-        fs::write(dir.path().join("file.txt"), "first\n").unwrap();
-        let tools = ToolExecutor::new(dir.path().canonicalize().unwrap());
-        tools.execute(&tool_call("git_commit", r#"{"message":"base","paths":["file.txt"]}"#)).await;
-        let output = tools.execute(&tool_call("git_blame", r#"{"path":"file.txt"}"#)).await;
-        assert!(!output.contains("Error:"));
-        assert!(output.contains("first"));
     }
 
     /// Dropping a command that has not finished (an interrupted turn, a
@@ -2110,30 +1847,6 @@ mod tests {
         panic!("the background sleep {pid} outlived its abandoned command");
     }
 
-    #[tokio::test]
-    async fn git_checkout_creates_and_switches_branch() {
-        let dir = tempdir().unwrap();
-        init_repo(dir.path());
-        fs::write(dir.path().join("file.txt"), "first\n").unwrap();
-        let tools = ToolExecutor::new(dir.path().canonicalize().unwrap());
-        tools.execute(&tool_call("git_commit", r#"{"message":"base","paths":["file.txt"]}"#)).await;
-        let output = tools.execute(&tool_call("git_checkout", r#"{"branch":"feature/x","create":true}"#)).await;
-        assert!(output.contains("Created and switched to"));
-        let branch = tools.execute(&tool_call("run_command", r#"{"command":"git branch --show-current"}"#)).await;
-        assert!(branch.contains("feature/x"));
-    }
-
-    #[tokio::test]
-    async fn append_file_creates_then_appends() {
-        let dir = tempdir().unwrap();
-        let tools = ToolExecutor::new(dir.path().canonicalize().unwrap());
-        tools.execute(&tool_call("append_file", r#"{"path":"log.txt","content":"line one"}"#)).await;
-        let second = tool_call("append_file", r#"{"path":"log.txt","content":"line two"}"#);
-        tools.execute(&second).await;
-        assert_eq!(fs::read_to_string(dir.path().join("log.txt")).unwrap(), "line one\nline two");
-        assert!(tools.approval_details(&second).contains("line two"));
-    }
-
     #[test]
     fn git_commit_rejects_empty_message_without_git() {
         let dir = tempdir().unwrap();
@@ -2148,11 +1861,13 @@ mod tests {
         let names = specs.iter().filter_map(|spec| spec["function"]["name"].as_str()).collect::<Vec<_>>();
         let unique = names.iter().copied().collect::<std::collections::HashSet<_>>();
         assert_eq!(names.len(), unique.len());
-        for name in [
-            "apply_patch", "delete_file", "move_file", "create_directory", "git_status", "git_log", "git_commit",
-            "git_restore", "git_show", "git_blame", "git_checkout", "append_file", "read_files",
-        ] {
+        for name in ["apply_patch", "delete_file", "move_file", "git_status", "git_log", "git_commit", "read_files"] {
             assert!(unique.contains(name), "missing {name}");
+        }
+        // Folded into the others: plain git through run_command, which AUTO
+        // reviews, and write_file, which makes parent directories itself.
+        for name in ["append_file", "create_directory", "git_restore", "git_checkout", "git_show", "git_blame"] {
+            assert!(!unique.contains(name), "{name} was removed");
         }
     }
 

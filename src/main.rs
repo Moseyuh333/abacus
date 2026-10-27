@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     // Commands that need no provider: copying files or listing sessions must
     // work on a machine that is not, or is no longer, configured.
     match &cli.command {
-        Some(Command::Setup { force }) => return setup::run(&paths, *force).await,
+        Some(Command::Setup) => return setup::run(&paths).await,
         Some(Command::Completions { shell }) => {
             let out = &mut std::io::stdout();
             clap_complete::generate(*shell, &mut Cli::command(), "abacus", out);
@@ -58,23 +58,38 @@ async fn main() -> Result<()> {
         Some(Command::Skills { .. } | Command::Plugins { .. } | Command::Mcp | Command::Trust | Command::Untrust) => {
             return extension_command(&cli, &paths).await;
         }
+        Some(Command::Models { provider, refresh, json }) => {
+            return list_models(&paths, provider.as_deref(), *refresh, *json).await;
+        }
+        Some(Command::Providers { json }) => return list_providers(&paths, *json),
+        Some(Command::Profiles { json }) => return list_profiles(&paths, *json),
         _ => {}
     }
 
     let mut settings = Settings::load(&paths)?;
-    if !settings.is_configured() && !cli.has_inline_provider() {
+    // The app server sets a provider up from the front end rather than
+    // through the terminal wizard, so it starts either way.
+    let app_server = matches!(cli.command, Some(Command::AppServer));
+    if !settings.is_configured() && !cli.has_inline_provider() && !app_server {
         if matches!(cli.command, Some(Command::Doctor)) {
             println!("Abacus {}", env!("CARGO_PKG_VERSION"));
             println!("home       {}", paths.root.display());
-            println!("config     missing (run `abacus setup`)");
+            println!("config     no provider yet (run `abacus setup`)");
             return Ok(());
         }
         eprintln!("Abacus needs a provider before its first run. Starting setup…\n");
-        setup::run(&paths, false).await?;
+        setup::run(&paths).await?;
         settings = Settings::load(&paths)?;
     }
     let credentials = Credentials::load(&paths)?;
-    let mut config = Config::resolve(&cli, &settings, &credentials, paths.clone())?;
+    let mut config = match Config::resolve(&cli, &settings, &credentials, paths.clone()) {
+        Ok(config) => config,
+        Err(error) if app_server => {
+            eprintln!("app-server: no usable profile yet — {error:#}");
+            Config::unconfigured(&cli, &settings, paths.clone())?
+        }
+        Err(error) => return Err(error),
+    };
 
     // Commands that talk to the provider but open no session.
     match cli.command {
@@ -82,23 +97,20 @@ async fn main() -> Result<()> {
             let options = abacus_agent::eval::EvalOptions { filter: tasks, repeat, state, model, json };
             return abacus_agent::eval::run(config, settings, options).await;
         }
-        Some(Command::Models) => {
-            for model in setup::discover_models(&config.base_url, config.api_key.as_deref()).await? {
-                println!("{} {model}", if model == config.model { "*" } else { " " });
-            }
-            return Ok(());
-        }
-        Some(Command::Providers) => return list_providers(&config).await,
+        Some(Command::Upstreams) => return list_upstreams(&config).await,
         Some(Command::Doctor) => return doctor(&config, &settings).await,
         // Everything else returned above; the app server wants the same
         // resolved config, session store, and services the TUI gets.
         _ => {}
     }
 
-    // Best-effort: ask the provider for the model's real context window and
-    // output cap so compaction thresholds and output limits scale with the
-    // model. Non-fatal — we fall back to the heuristic/default estimates.
-    if let Some(limits) = detect_limits(&config, config.model_limits).await {
+    // Best-effort: the model's real context window and output cap, from the
+    // provider's cached model list or a quick look at its endpoint, so
+    // compaction thresholds and output limits scale with the model. Non-fatal
+    // — the heuristic/default estimates stand otherwise.
+    if config.is_configured()
+        && let Some(limits) = detect_limits(&config, config.model_limits).await
+    {
         config.model_limits = limits;
     }
 
@@ -171,10 +183,135 @@ async fn detect_limits(config: &Config, mut limits: model_info::ModelLimits) -> 
     if limits.source == model_info::LimitSource::Override {
         return None;
     }
-    let (context, output) =
-        model_info::detect_limits(&config.models_endpoint()?, config.api_key.as_deref(), &config.model).await?;
+    let (context, output) = model_info::detect_limits(&config.paths, &config.connection, &config.model).await?;
     limits.apply_detected(context, output);
     Some(limits)
+}
+
+/// `abacus models`: every model every provider serves, from the cached lists
+/// unless `--refresh` asks again (a list older than a day is asked again
+/// anyway).
+async fn list_models(paths: &AbacusPaths, only: Option<&str>, refresh: bool, json: bool) -> Result<()> {
+    let settings = Settings::load(paths)?;
+    let credentials = Credentials::load(paths)?;
+    if let Some(only) = only
+        && !settings.providers.contains_key(only)
+    {
+        anyhow::bail!("no provider named `{only}`; `abacus providers` lists them");
+    }
+    let active = settings.active_profile().map(|profile| profile.model.clone()).unwrap_or_default();
+    let mut rows = Vec::new();
+    for (id, provider) in settings.providers.iter().filter(|(id, _)| only.is_none_or(|only| only == id.as_str())) {
+        let connection = abacus_agent::providers::Connection::resolve(id, provider, &credentials);
+        match abacus_agent::providers::catalog(paths, &connection, refresh).await {
+            Ok(catalog) => rows.extend(catalog.models.into_iter().map(|card| (id.clone(), card))),
+            Err(error) => eprintln!("{id}: {error:#}"),
+        }
+    }
+    if json {
+        let models: Vec<_> = rows
+            .iter()
+            .map(|(provider, card)| {
+                json!({
+                    "id": abacus_agent::providers::join_ref(provider, &card.id),
+                    "provider": provider,
+                    "model": card.id,
+                    "name": card.name,
+                    "contextLength": card.context_length,
+                    "maxOutputTokens": card.max_output_tokens,
+                    "inputCost": card.input_cost,
+                    "outputCost": card.output_cost,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&json!({"models": models}))?);
+        return Ok(());
+    }
+    for (provider, card) in &rows {
+        let reference = abacus_agent::providers::join_ref(provider, &card.id);
+        let facts = [card.context_label(), card.cost_label()].into_iter().filter(|fact| !fact.is_empty());
+        println!(
+            "{} {reference}  {}",
+            if reference == active { "*" } else { " " },
+            facts.collect::<Vec<_>>().join("  ")
+        );
+    }
+    Ok(())
+}
+
+/// `abacus providers`: the configured connections and where each one's key
+/// comes from.
+fn list_providers(paths: &AbacusPaths, json: bool) -> Result<()> {
+    let settings = Settings::load(paths)?;
+    let credentials = Credentials::load(paths)?;
+    if json {
+        let providers: Vec<_> = settings
+            .providers
+            .iter()
+            .map(|(id, provider)| {
+                json!({
+                    "id": id,
+                    "name": provider.display_name(id),
+                    "baseUrl": provider.base_url,
+                    "protocol": provider.protocol,
+                    "key": provider.key_status(id, &credentials).label(),
+                    "profiles": settings.profiles_on(id),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&json!({"providers": providers}))?);
+        return Ok(());
+    }
+    if settings.providers.is_empty() {
+        println!("No providers yet. `abacus setup` connects one.");
+        return Ok(());
+    }
+    let width = settings.providers.keys().map(String::len).max().unwrap_or(8);
+    for (id, provider) in &settings.providers {
+        println!(
+            "{id:<width$}  {}  {}  key: {}",
+            provider.display_name(id),
+            provider.base_url,
+            provider.key_status(id, &credentials).label()
+        );
+    }
+    Ok(())
+}
+
+/// `abacus profiles`: what `--profile` and `/profile` can switch to.
+fn list_profiles(paths: &AbacusPaths, json: bool) -> Result<()> {
+    let settings = Settings::load(paths)?;
+    if json {
+        let profiles: Vec<_> = settings
+            .profiles
+            .iter()
+            .map(|(name, profile)| {
+                json!({
+                    "name": name,
+                    "model": profile.model,
+                    "active": *name == settings.default_profile,
+                    "contextWindow": profile.context_window,
+                    "maxOutputTokens": profile.max_output_tokens,
+                    "reasoningEffort": profile.reasoning_effort,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&json!({"profiles": profiles}))?);
+        return Ok(());
+    }
+    if settings.profiles.is_empty() {
+        println!("No profiles yet. `abacus setup` makes one.");
+        return Ok(());
+    }
+    for (name, profile) in &settings.profiles {
+        let marker = if *name == settings.default_profile { "*" } else { " " };
+        if *name == profile.model {
+            println!("{marker} {name}");
+        } else {
+            println!("{marker} {name}  ({})", profile.model);
+        }
+    }
+    Ok(())
 }
 
 /// `abacus skills | plugins | mcp | trust | untrust`.
@@ -263,13 +400,13 @@ async fn extension_command(cli: &Cli, paths: &AbacusPaths) -> Result<()> {
     Ok(())
 }
 
-/// `abacus providers`: the upstreams that can serve the active model, with the
-/// ones the profile already pins marked — so the list doubles as a view of the
-/// current routing.
-async fn list_providers(config: &Config) -> Result<()> {
+/// `abacus upstreams`: the OpenRouter upstreams that can serve the active
+/// model, with the ones the profile already pins marked — so the list doubles
+/// as a view of the current routing.
+async fn list_upstreams(config: &Config) -> Result<()> {
     use abacus_agent::console;
-    let endpoints = setup::discover_endpoints(&config.base_url, config.api_key.as_deref(), &config.model).await?;
-    console::banner(&format!("providers for {}", config.model));
+    let endpoints = abacus_agent::providers::discover_upstreams(&config.connection, &config.model).await?;
+    console::banner(&format!("upstreams for {}", config.model_ref()));
     console::blank();
     if endpoints.is_empty() {
         console::note("The endpoint reported no upstream providers for this model.");
@@ -294,7 +431,7 @@ async fn list_providers(config: &Config) -> Result<()> {
     }
     console::blank();
     if pinned.is_empty() {
-        console::note("Nothing pinned — the endpoint chooses. Pin with /providers <name, name>.");
+        console::note("Nothing pinned — OpenRouter chooses. Pin them under /config → Profile → Upstream routing.");
     } else {
         console::note(&format!(
             "Pinned: {}  ·  fallbacks {}",
@@ -508,30 +645,25 @@ async fn doctor(config: &Config, settings: &Settings) -> Result<()> {
 
     console::section("Provider");
     console::field("profile", &config.profile);
-    console::field("model", &config.model);
-    console::field("endpoint", &config.endpoint());
-    if let Some(scripted) = &config.endpoint {
-        console::field("scripted endpoint", scripted.display_name());
+    console::field("model", &config.model_ref());
+    console::field("provider", &config.connection.name);
+    console::field("endpoint", &config.connection.request_url());
+    console::field("protocol", &format!("{:?}", config.connection.protocol));
+    console::field("mode", config.permission.label());
+    // A token command or file is run here, so a broken one shows up as the
+    // failure it will be on the first request.
+    match config.connection.auth() {
+        Ok(Some(_)) => record(Health::Pass, "credential", "available"),
+        Ok(None) if config.connection.is_local() => record(Health::Pass, "credential", "none (local endpoint)"),
+        Ok(None) => record(
+            Health::Fail,
+            "credential",
+            "missing — paste one under /config → Providers, or export the provider's key variable",
+        ),
+        Err(error) => record(Health::Fail, "credential", &format!("{error:#}")),
     }
-    console::field("protocol", &format!("{:?}", config.protocol));
-    // A scripted endpoint with an auth block carries its own token — resolve
-    // it to report health rather than flagging the absent standard credential.
-    let scripted_auth = config.endpoint.as_ref().map(|endpoint| endpoint.auth_header());
-    match (&config.api_key, scripted_auth) {
-        (_, Some(Ok(Some(_)))) => record(Health::Pass, "credential", "scripted endpoint auth"),
-        (_, Some(Ok(None))) if config.endpoint.is_some() => {
-            record(Health::Pass, "credential", "none (scripted endpoint)")
-        }
-        (_, Some(Err(error))) => {
-            record(Health::Fail, "credential", &format!("scripted endpoint auth failed — {error:#}"))
-        }
-        (Some(_), _) => record(Health::Pass, "credential", "available"),
-        (None, _) if config.base_url.contains("localhost") || config.base_url.contains("127.0.0.1") => {
-            record(Health::Pass, "credential", "none (local endpoint)")
-        }
-        (None, _) => record(Health::Fail, "credential", "missing — export the profile's key or run `abacus setup`"),
-    }
-    match setup::discover_models(&config.base_url, config.api_key.as_deref()).await {
+    let discovered = abacus_agent::providers::refresh_catalog(&config.paths, &config.connection).await;
+    match discovered.map(|catalog| catalog.models.into_iter().map(|card| card.id).collect::<Vec<_>>()) {
         Ok(models) if models.contains(&config.model) => {
             record(Health::Pass, "reachable", &format!("{} models, including {}", models.len(), config.model))
         }
@@ -584,6 +716,15 @@ async fn doctor(config: &Config, settings: &Settings) -> Result<()> {
     } else {
         record(Health::Warn, "settings", "not written yet — run `abacus setup`");
     }
+    record(
+        Health::Pass,
+        "providers",
+        &format!(
+            "{} · {}",
+            console::count(settings.providers.len(), "provider"),
+            console::count(settings.profiles.len(), "profile")
+        ),
+    );
     let store = SessionStore::new(&config.paths, config.workspace.clone());
     match store.list().context("could not inspect sessions") {
         Ok(sessions) => record(Health::Pass, "sessions", &format!("{} for this workspace", sessions.len())),

@@ -1,0 +1,54 @@
+# Provider: Grok through the grok CLI's own OAuth login — your Grok
+# subscription, spent through the OpenAI-shaped proxy the grok CLI talks to.
+# This is not the api.x.ai API-key path; see grok.example.toml for that.
+#
+# Verified against grok 1.0.3 (2026-08-12): the CLI stores its OAuth JWT in
+# ~/.grok/auth.json and the proxy takes it as a plain bearer. The one extra
+# requirement is the client-version header below.
+
+[providers.grok-oauth]
+name = "Grok OAuth"
+base_url = "https://cli-chat-proxy.grok.com/v1"
+protocol = "chat-completions"
+
+# The access token lives about six hours; running `grok` once refreshes it.
+# The file is keyed per issuer, so a command pulls out the first account's key
+# and fails fast with that hint when it has expired.
+token_command = [
+  "bash", "-c", '''
+f="$HOME/.grok/auth.json"
+if [ ! -f "$f" ]; then
+  echo "no $f — run 'grok' once to sign in" >&2
+  exit 1
+fi
+python3 - "$f" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+d = json.load(open(sys.argv[1]))
+for entry in d.values():
+    if not isinstance(entry, dict) or not entry.get("key"):
+        continue
+    exp = entry.get("expires_at")
+    if exp:
+        try:
+            expired = datetime.fromisoformat(exp.replace("Z", "+00:00")) < datetime.now(timezone.utc)
+        except ValueError:
+            expired = False
+        if expired:
+            print(f"grok OAuth token expired at {exp}; run 'grok' once to refresh it", file=sys.stderr)
+            sys.exit(1)
+    print(entry["key"])
+    sys.exit(0)
+print(f"no access token in {sys.argv[1]}", file=sys.stderr)
+sys.exit(1)
+PY
+''',
+]
+
+# The tier's models; the proxy's model list wants the same bearer.
+models = ["grok-4.6", "grok-4.5"]
+
+# Without it chat requests answer 426 "Your Grok CLI version (none) is
+# outdated". Any value at or above 0.1.202 passes.
+[providers.grok-oauth.headers]
+X-Grok-Client-Version = "0.1.202"

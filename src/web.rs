@@ -1056,9 +1056,8 @@ mod tests {
     fn test_provider(base_url: &str) -> crate::provider::Provider {
         let config = crate::config::Config {
             profile: "test".into(),
-            protocol: crate::config::ProviderProtocol::ChatCompletions,
             max_steps: 4,
-            yes: true,
+            permission: crate::config::Permission::Yolo,
             no_session: true,
             ..crate::config::Config::for_endpoint(
                 std::env::temp_dir(),

@@ -1,0 +1,28 @@
+# Provider: xAI Grok over the public API (api.x.ai).
+#
+# xAI is also a built-in preset (`abacus setup`, or /config → Providers → Add),
+# which is the shorter path if all you want is a key and a model. Write it out
+# like this when you want more: pinned body fields, extra headers, a gateway in
+# front of the API, or a key that lives somewhere other than a variable.
+
+[providers.grok]
+name = "Grok"
+base_url = "https://api.x.ai/v1"
+protocol = "chat-completions"   # xAI's API is OpenAI-shaped
+
+# The API key, from https://console.x.ai. Either name the variable it is in,
+# paste it under /config → Providers (it is stored in credentials.toml), or run
+# a command for it — a password manager, or a key that needs minting:
+#
+#   token_command = ["pass", "show", "xai/api"]
+api_key_env = "XAI_API_KEY"
+
+# Fields a given gateway does not accept. Nothing needs removing against
+# api.x.ai itself.
+# remove = ["parallel_tool_calls"]
+
+# Body fields deep-merged over what Abacus builds. Prefer /effort (or the
+# profile's reasoning effort) over pinning it here, so it stays switchable.
+# [providers.grok.body]
+# temperature = 0.2
+# search_parameters = { mode = "auto" }

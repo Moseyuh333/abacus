@@ -633,7 +633,7 @@ impl HarnessStore {
         self.inner.write().expect("harness lock").session = state;
     }
 
-    /// Everything applying to this workspace, for `/harness`.
+    /// Everything applying to this workspace, for `/memory`.
     pub fn snapshot(&self) -> Vec<HarnessEntry> {
         self.applying(&EntryKind::ALL)
     }
@@ -674,7 +674,7 @@ impl HarnessStore {
         entries
     }
 
-    /// Delete by id, for the `/harness` and `/memories` commands. Removes from
+    /// Delete by id, for `/memory forget`. Removes from
     /// whichever side holds it.
     pub fn remove(&self, kind: EntryKind, id: &str) -> bool {
         let mut inner = self.inner.write().expect("harness lock");
@@ -754,11 +754,6 @@ impl HarnessStore {
                 ],
             ),
             tool(
-                "memory_list",
-                "List the stored memories for this workspace, with their titles as handles for memory_record (update) and memory_forget.",
-                [],
-            ),
-            tool(
                 "memory_forget",
                 "Delete a memory that is stale or wrong, by its exact title.",
                 [req("title", string("Exact title of the memory to delete"))],
@@ -769,7 +764,6 @@ impl HarnessStore {
     pub fn execute(&self, name: &str, arguments: &str) -> Option<String> {
         match name {
             "memory_record" => Some(crate::tools::reply(self.record(arguments))),
-            "memory_list" => Some(self.list_for_model()),
             "memory_forget" => Some(crate::tools::reply(self.forget(arguments))),
             _ => None,
         }
@@ -864,22 +858,6 @@ impl HarnessStore {
             bail!("no memory titled `{title}` in this workspace");
         }
         Ok(format!("Memory \"{title}\" forgotten."))
-    }
-
-    fn list_for_model(&self) -> String {
-        let merged = self.merged();
-        let mut lines: Vec<String> = merged
-            .entries
-            .memory
-            .values()
-            .filter(|entry| entry.in_scope(&self.workspace))
-            .map(|entry| format!("- {} [{}] — {}", entry.title, entry.lifetime.label(), entry.content))
-            .collect();
-        if lines.is_empty() {
-            return "No memories stored for this workspace yet.".to_owned();
-        }
-        lines.insert(0, "Stored memories:".to_owned());
-        lines.join("\n")
     }
 
     /// The context layer injected at the start of every turn.
@@ -1024,7 +1002,7 @@ impl HarnessStore {
 /// whether the role is read-only, and its prompt.
 ///
 /// `read_only` in the metadata is enforced mechanically, not just instructed:
-/// a spec carrying it runs its worker in PLAN with mutations locked off.
+/// a spec carrying it runs its worker read-only, with every change refused.
 pub const BUILT_IN_SUBAGENTS: [(&str, &str, bool, &str); 3] = [
     (
         "drone",

@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-    config::{AbacusPaths, ProviderProfile},
+    config::{AbacusPaths, Profile},
+    providers::ProviderConfig,
     services::AgentServices,
 };
 use ratatui::{Terminal, backend::TestBackend};
@@ -168,103 +169,71 @@ async fn aux_model_drives_the_secondary_provider_and_defaults_to_main() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
     // No aux model set → the aux provider mirrors the main model.
     assert_eq!(app.aux_provider.model(), app.provider.model());
+    assert_eq!(app.config_value(ConfigKey::AuxModel), "test/test-model (inherited)");
 
-    // Setting it via the config commit path rebuilds the aux provider on
-    // the same endpoint with the cheaper model.
-    let mut input = InputBuffer::new();
-    input.insert_str("cheap/model");
-    app.config_panel = Some(ConfigPanel { selected: 0, editing: Some((ConfigKey::AuxModel, input)) });
-    app.commit_config_edit();
-    assert_eq!(app.aux_provider.model(), "cheap/model");
+    // Assigning one rebuilds the aux provider with the cheaper model.
+    app.assign_role("aux", Some("test/cheap-model".to_owned()));
+    assert_eq!(app.aux_provider.model(), "cheap-model");
     assert_eq!(app.provider.model(), "test-model", "main model untouched");
-    assert_eq!(app.config_value(ConfigKey::AuxModel), "cheap/model", "config shows the set value");
+    assert_eq!(app.config_value(ConfigKey::AuxModel), "test/cheap-model", "config shows the set value");
 
-    // Clearing it returns to "(same as main)".
-    let mut blank = InputBuffer::new();
-    blank.insert_str("  ");
-    app.config_panel = Some(ConfigPanel { selected: 0, editing: Some((ConfigKey::AuxModel, blank)) });
-    app.commit_config_edit();
+    // Del on the row inherits again.
+    app.open_config_tab(0);
+    let row = app
+        .config_rows()
+        .iter()
+        .position(|row| matches!(row, ConfigRow::Setting(setting) if setting.key == ConfigKey::AuxModel))
+        .unwrap();
+    app.clear_setting(row);
     assert_eq!(app.aux_provider.model(), app.provider.model());
-    assert_eq!(app.config_value(ConfigKey::AuxModel), "(same as main)");
+    assert_eq!(app.config_value(ConfigKey::AuxModel), "test/test-model (inherited)");
 }
 
 #[tokio::test]
-async fn switching_away_from_a_scripted_profile_drops_the_endpoint() {
+async fn switching_profiles_moves_the_session_to_the_other_provider() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    let dir = &app.config.paths.endpoints_dir;
-    std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(
-        dir.join("claude.yaml"),
-        "url: https://api.anthropic.com/v1/messages\nprotocol: anthropic\nmodel: claude-opus-4-8\n",
-    )
-    .unwrap();
-    // A scripted (Anthropic) profile and a plain chat-completions one.
-    app.settings.profiles.insert(
+    app.settings.providers.insert(
         "claude".into(),
-        ProviderProfile {
+        ProviderConfig {
             name: "Claude".into(),
-            base_url: "https://api.anthropic.com/v1/messages".into(),
-            model: "claude-opus-4-8".into(),
+            base_url: "https://api.anthropic.com".into(),
             protocol: ProviderProtocol::Anthropic,
-            endpoint: Some("claude".into()),
             ..Default::default()
         },
     );
-    app.settings.profiles.insert(
-        "plain".into(),
-        ProviderProfile {
-            name: "Plain".into(),
-            base_url: "https://openrouter.ai/api/v1".into(),
-            model: "some/model".into(),
-            ..Default::default()
-        },
-    );
+    app.settings.profiles.insert("claude".into(), Profile::for_model("claude/claude-opus-4-8"));
 
-    app.settings.default_profile = "claude".into();
-    app.apply_settings().unwrap();
-    assert!(app.config.endpoint.is_some(), "scripted endpoint attached");
-    assert_eq!(app.config.protocol, ProviderProtocol::Anthropic);
+    app.switch_profile("claude");
+    assert_eq!(app.config.profile, "claude");
+    assert_eq!(app.config.model, "claude-opus-4-8");
+    assert_eq!(app.config.connection.protocol, ProviderProtocol::Anthropic);
+    assert_eq!(app.config.connection.request_url(), "https://api.anthropic.com/v1/messages");
 
-    // Switching to the plain profile must drop the scripted endpoint and
-    // its wire format — the bug was it stayed attached.
-    app.settings.default_profile = "plain".into();
-    app.apply_settings().unwrap();
-    assert!(app.config.endpoint.is_none(), "endpoint dropped on switch");
-    assert_eq!(app.config.protocol, ProviderProtocol::ChatCompletions);
-    assert!(app.config.base_url.contains("openrouter"));
+    // And back: the wire format and URL follow the profile, not the last one.
+    app.switch_profile("test");
+    assert_eq!(app.config.connection.protocol, ProviderProtocol::ChatCompletions);
+    assert_eq!(app.config.connection.base_url, "http://127.0.0.1:9/v1");
+    assert_eq!(app.settings.default_profile, "test", "a switch is also the default for the next launch");
 }
 
 #[test]
-fn scripted_endpoints_are_listed_and_selectable_in_the_provider_picker() {
+fn the_provider_picker_offers_the_presets_and_a_custom_endpoint() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    // Drop a scripted endpoint into the app's endpoints dir.
-    let dir = &app.config.paths.endpoints_dir;
-    std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(
-        dir.join("claude-oauth.yaml"),
-        "url: https://api.anthropic.com/v1/messages\nprotocol: anthropic\nmodel: claude-opus-4-8\n",
-    )
-    .unwrap();
-
-    // It shows up as a provider-picker row with the endpoint sentinel.
     app.open_provider_picker();
     let picker = app.picker.as_ref().expect("provider picker");
-    let row = picker
-        .items
-        .iter()
-        .find(|(_, value)| value == &format!("{ENDPOINT_SENTINEL_PREFIX}claude-oauth"))
-        .expect("claude-oauth is listed");
-    assert!(row.0.contains("claude-oauth"), "{}", row.0);
+    assert_eq!(picker.action, PickerAction::AddProvider);
+    let values: Vec<&str> = picker.items.iter().map(|(_, value)| value.as_str()).collect();
+    for preset in crate::providers::PRESETS {
+        assert!(values.contains(&preset.id), "{} is offered", preset.id);
+    }
+    assert_eq!(values.last(), Some(&CUSTOM_PROVIDER), "and any endpoint by URL, last");
 
-    // Selecting it creates a live profile referencing the endpoint, with
-    // the model/url/protocol copied from the YAML so it validates.
-    app.add_provider(&format!("{ENDPOINT_SENTINEL_PREFIX}claude-oauth"));
-    let profile = app.settings.profiles.get(&app.settings.default_profile).expect("the new profile is active");
-    assert_eq!(profile.endpoint.as_deref(), Some("claude-oauth"));
-    assert_eq!(profile.model, "claude-opus-4-8");
-    assert_eq!(profile.protocol, ProviderProtocol::Anthropic);
-    assert!(profile.base_url.contains("anthropic.com"));
-    assert!(app.status.contains("active"), "{}", app.status);
+    // A local preset needs no key, so it goes straight to its model list.
+    let ollama = values.iter().position(|value| *value == "ollama").unwrap();
+    app.accept_picker(Some(ollama));
+    assert!(app.settings.providers.contains_key("ollama"));
+    assert_eq!(app.model_hub.as_ref().and_then(|hub| hub.scoped_provider()), Some("ollama"));
+    assert!(app.status.contains("pick a model"), "{}", app.status);
 }
 
 #[test]
@@ -384,26 +353,27 @@ fn sessions_made_here_are_open_to_sync_until_left() {
     assert!(!crate::sync::is_open(&fork));
 }
 
-/// "Always" — from the keyboard or a phone — approves for the session it was
-/// given in, not for every session this process opens afterwards.
+/// YOLO switched on for one session — from the keyboard or a phone — does not
+/// carry into the next one; the configured default does.
 #[test]
-fn an_always_approval_ends_with_its_session() {
+fn yolo_switched_on_for_one_session_ends_with_it() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
     app.session_store = Some(SessionStore::new(&app.config.paths, app.config.workspace.clone()));
     app.messages.push(json!({"role": "user", "content": "edit the parser"}));
     app.persist_session();
-    // What the agent does with an `Always` decision.
-    app.allow_mutations.store(true, Ordering::Relaxed);
+    assert_eq!(app.mode(), Permission::Auto, "AUTO is the default");
+    press_back_tab(&mut app);
+    assert_eq!(app.mode(), Permission::Yolo, "Shift+Tab switches");
 
     app.fork_session();
-    assert!(app.allow_mutations.load(Ordering::Relaxed), "a fork continues the same work");
+    assert_eq!(app.mode(), Permission::Yolo, "a fork continues the same work");
     app.new_session();
-    assert!(!app.allow_mutations.load(Ordering::Relaxed), "a new session asks again");
+    assert_eq!(app.mode(), Permission::Auto, "a new session starts from the default");
 
-    // `--always-approve` is for the whole run.
-    app.config.yes = true;
+    // YOLO as the default is YOLO for every session.
+    app.settings.agent.mode = Permission::Yolo;
     app.new_session();
-    assert!(app.allow_mutations.load(Ordering::Relaxed));
+    assert_eq!(app.mode(), Permission::Yolo);
 }
 
 #[test]
@@ -416,50 +386,37 @@ fn fork_without_a_conversation_reports_instead_of_creating() {
 }
 
 #[test]
-fn the_profile_row_opens_a_picker_that_switches_profiles() {
+fn the_profile_row_opens_the_hub_which_switches_profiles() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.settings.profiles.insert(
-        "second".to_owned(),
-        crate::config::ProviderProfile {
-            name: "Second".into(),
-            base_url: "http://127.0.0.1:9/v1".into(),
-            model: "other-model".into(),
-            ..Default::default()
-        },
-    );
-    app.open_profile_picker();
-    let picker = app.picker.as_ref().expect("picker");
-    assert_eq!(picker.action, PickerAction::SwitchProfile);
-    // Every profile, plus the add-a-provider row.
-    assert_eq!(picker.items.len(), app.settings.profiles.len() + 1);
+    extra_profile(&mut app, "second", "other-model");
+    app.open_config_tab(0);
+    app.cycle_config_value(ConfigKey::Profile).unwrap();
+    let hub = app.model_hub.as_ref().expect("the hub");
+    assert_eq!(*hub.current_scope(), crate::model_hub::Scope::Profiles);
 
-    let index = picker.items.iter().position(|(_, value)| value == "second").expect("second profile listed");
-    app.accept_picker(Some(index));
+    let rows = crate::model_hub::profile_rows(&app.settings);
+    let index = rows.iter().position(|row| row.name == "second").expect("second profile listed");
+    app.model_hub.as_mut().unwrap().selected = index;
+    press(&mut app, KeyCode::Enter);
     assert_eq!(app.settings.default_profile, "second");
-    assert!(app.picker.is_none());
+    assert_eq!(app.config.model, "other-model");
+    assert!(app.model_hub.is_none());
 }
 
-fn extra_profile(app: &mut App, id: &str, model: &str) {
-    extra_profile_with_limits(app, id, model, None, None);
+fn extra_profile(app: &mut App, name: &str, model: &str) {
+    extra_profile_with_limits(app, name, model, None, None);
 }
 
 fn extra_profile_with_limits(
     app: &mut App,
-    id: &str,
+    name: &str,
     model: &str,
     context_window: Option<usize>,
     max_output_tokens: Option<usize>,
 ) {
     app.settings.profiles.insert(
-        id.to_owned(),
-        crate::config::ProviderProfile {
-            name: id.to_owned(),
-            base_url: "http://127.0.0.1:9/v1".into(),
-            model: model.into(),
-            context_window,
-            max_output_tokens,
-            ..Default::default()
-        },
+        name.to_owned(),
+        Profile { context_window, max_output_tokens, ..Profile::for_model(&format!("test/{model}")) },
     );
 }
 
@@ -482,58 +439,31 @@ fn switching_profiles_applies_that_profiles_token_limits() {
 }
 
 #[test]
-fn leftover_agent_limits_apply_until_a_profile_sets_its_own() {
-    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    extra_profile(&mut app, "other", "other-model");
-    app.settings.agent.context_window = Some(200_000);
-    app.settings.agent.max_output_tokens = Some(16_000);
-    app.save_and_apply_settings().unwrap();
-    assert_eq!(app.config.model_limits.context_window, 200_000);
-    assert_eq!(app.config.model_limits.configured_output_tokens, Some(16_000));
-
-    // Writing a profile override clears the leftover so a later blank
-    // does not resurrect the old global value.
-    let edit = |app: &mut App, key: ConfigKey, text: &str| {
-        let mut input = InputBuffer::new();
-        input.insert_str(text);
-        app.config_panel = Some(ConfigPanel { selected: 0, editing: Some((key, input)) });
-        app.commit_config_edit();
-    };
-    edit(&mut app, ConfigKey::ContextWindow, "1m");
-    assert_eq!(app.settings.agent.context_window, None);
-    assert_eq!(app.settings.profiles["test"].context_window, Some(1_000_000));
-    assert_eq!(app.settings.profile_limits("other"), (None, Some(16_000)));
-}
-
-#[test]
-fn profile_picker_renames_and_moves_the_stored_key() {
+fn the_profile_hub_renames_a_profile() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
     extra_profile(&mut app, "second", "other-model");
-    app.credentials.keys.insert("second".into(), "secret-key".into());
-    app.open_profile_picker();
-    let index = app.picker.as_ref().unwrap().items.iter().position(|(_, value)| value == "second").unwrap();
-    app.picker.as_mut().unwrap().selected = index;
-    app.begin_profile_rename("second");
-    handle_picker_prompt(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-    // Replace the seeded id with the new one.
-    if let Some(PickerPrompt::Rename { input, .. }) = app.picker.as_mut().and_then(|picker| picker.prompt.as_mut()) {
+    app.open_model_hub();
+    let index = crate::model_hub::profile_rows(&app.settings).iter().position(|row| row.name == "second").unwrap();
+    app.model_hub.as_mut().unwrap().selected = index;
+    press(&mut app, KeyCode::Char('r'));
+    if let Some(crate::model_hub::HubPrompt::Rename { input, .. }) =
+        app.model_hub.as_mut().and_then(|hub| hub.prompt.as_mut())
+    {
         input.clear();
-        input.insert_str("renamed");
+        input.insert_str("fast local");
     }
-    handle_picker_prompt(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+    press(&mut app, KeyCode::Enter);
     assert!(!app.settings.profiles.contains_key("second"));
-    assert!(app.settings.profiles.contains_key("renamed"));
-    assert_eq!(app.credentials.keys.get("renamed").map(String::as_str), Some("secret-key"));
-    assert!(!app.credentials.keys.contains_key("second"));
+    assert_eq!(app.settings.profiles["fast local"].model, "test/other-model", "names are free text");
 }
 
 #[test]
-fn profile_picker_refuses_to_delete_the_last_profile() {
+fn the_profile_hub_refuses_to_delete_the_last_profile() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.open_profile_picker();
-    app.begin_profile_delete("test");
-    assert!(app.picker.as_ref().unwrap().prompt.is_none());
-    assert!(app.status.contains("last remaining"), "{}", app.status);
+    app.open_model_hub();
+    press(&mut app, KeyCode::Char('d'));
+    assert!(app.model_hub.as_ref().unwrap().prompt.is_none());
+    assert!(app.status.contains("only profile"), "{}", app.status);
     assert!(app.settings.profiles.contains_key("test"));
 }
 
@@ -541,37 +471,39 @@ fn profile_picker_refuses_to_delete_the_last_profile() {
 fn deleting_the_active_profile_switches_to_another() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
     extra_profile(&mut app, "second", "other-model");
-    app.settings.default_profile = "test".into();
-    app.delete_profile("test").unwrap();
+    app.open_model_hub();
+    let index = crate::model_hub::profile_rows(&app.settings).iter().position(|row| row.name == "test").unwrap();
+    app.model_hub.as_mut().unwrap().selected = index;
+    press(&mut app, KeyCode::Char('d'));
+    press(&mut app, KeyCode::Enter);
     assert!(!app.settings.profiles.contains_key("test"));
     assert_eq!(app.settings.default_profile, "second");
     assert_eq!(app.config.profile, "second");
+    assert_eq!(app.config.model, "other-model");
 }
 
 #[test]
-fn profile_slash_command_lists_switches_renames_and_deletes() {
+fn profile_slash_command_opens_the_hub_or_switches_by_name() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
     extra_profile(&mut app, "second", "other-model");
     extra_profile(&mut app, "third", "third-model");
 
     assert!(app.slash_command("/profile"));
-    let listed = &app.entries.last().unwrap().text;
-    assert!(listed.contains("test"), "{listed}");
-    assert!(listed.contains("second"), "{listed}");
-    assert!(listed.contains("/profile rename"), "{listed}");
+    assert!(app.model_hub.is_some(), "a bare /profile opens the hub");
+    app.model_hub = None;
 
     assert!(app.slash_command("/profile second"));
     assert_eq!(app.settings.default_profile, "second");
     assert_eq!(app.config.model, "other-model");
 
-    assert!(app.slash_command("/profile rename claude"));
-    assert!(app.settings.profiles.contains_key("claude"));
-    assert!(!app.settings.profiles.contains_key("second"));
-    assert_eq!(app.settings.default_profile, "claude");
-
-    assert!(app.slash_command("/profile delete claude"));
-    assert!(!app.settings.profiles.contains_key("claude"));
-    assert_ne!(app.settings.default_profile, "claude");
+    // A unique part of a name is enough; an ambiguous one says so.
+    assert!(app.slash_command("/profile thi"));
+    assert_eq!(app.config.profile, "third");
+    assert!(app.slash_command("/profile nowhere"));
+    assert!(app.entries.last().unwrap().text.contains("No profile matches"));
+    // The old names reach the same place.
+    assert!(app.slash_command("/model"));
+    assert!(app.model_hub.is_some());
 }
 
 #[test]
@@ -580,88 +512,77 @@ fn profile_is_offered_by_the_command_palette() {
 }
 
 #[test]
-fn adding_a_provider_creates_a_profile_and_asks_for_a_model() {
+fn adding_a_custom_provider_asks_for_its_url_then_shows_its_models() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.config_panel = Some(ConfigPanel { selected: 0, editing: None });
-    app.open_profile_picker();
-    let index = app
-        .picker
-        .as_ref()
-        .expect("picker")
-        .items
-        .iter()
-        .position(|(_, value)| value == NEW_PROVIDER_SENTINEL)
-        .expect("add-provider row");
-    app.accept_picker(Some(index));
-
-    // That row opens a second step rather than selecting anything.
-    let picker = app.picker.as_ref().expect("provider picker");
-    assert_eq!(picker.action, PickerAction::AddProvider);
-    let xai = picker.items.iter().position(|(_, value)| value == "xai").expect("xai preset offered");
-    app.accept_picker(Some(xai));
-
-    let profile = app.settings.profiles.get("xai").expect("profile created");
-    assert_eq!(profile.base_url, "https://api.x.ai/v1");
-    assert_eq!(profile.api_key_env.as_deref(), Some("XAI_API_KEY"));
-    assert_eq!(app.settings.default_profile, "xai");
-    // Not applied yet: a profile with no model cannot validate, so the
-    // running session stays on the old provider until one is given.
+    app.add_provider(CUSTOM_PROVIDER);
+    assert!(app.settings.providers.contains_key("custom"));
+    let panel = app.config_panel.as_ref().expect("the provider editor");
+    assert_eq!(panel.provider.as_deref(), Some("custom"));
+    assert_eq!(panel.editing.as_ref().map(|(key, _)| *key), Some(ConfigKey::ProviderUrl));
+    // The session keeps running what it ran: a provider is not a profile.
     assert_eq!(app.config.profile, "test");
-    // A profile with no model cannot run, so that field opens straight away.
-    let editing = app.config_panel.as_ref().and_then(|panel| panel.editing.as_ref()).map(|(key, _)| *key);
-    assert_eq!(editing, Some(ConfigKey::Model));
-}
 
-#[test]
-fn abandoning_the_model_prompt_rolls_the_new_provider_back() {
-    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.config_panel = Some(ConfigPanel { selected: 0, editing: None });
-    app.add_provider("groq");
-    assert_eq!(app.settings.default_profile, "groq");
-
-    // Esc out of the model prompt.
-    press(&mut app, KeyCode::Esc);
-    assert_eq!(app.settings.default_profile, "test", "the previous profile should be restored");
-    assert!(!app.settings.profiles.contains_key("groq"), "an unusable profile should not be left behind");
-}
-
-#[test]
-fn a_committed_model_keeps_the_new_provider() {
-    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.config_panel = Some(ConfigPanel { selected: 0, editing: None });
-    app.add_provider("groq");
-    if let Some(panel) = &mut app.config_panel
-        && let Some((_, input)) = panel.editing.as_mut()
-    {
-        input.insert_str("llama-3.3-70b");
+    if let Some((_, input)) = app.config_panel.as_mut().and_then(|panel| panel.editing.as_mut()) {
+        input.clear();
+        input.insert_str("127.0.0.1:9/v1");
     }
     app.commit_config_edit();
-    assert_eq!(app.settings.default_profile, "groq");
-    assert_eq!(app.config.model, "llama-3.3-70b", "now applied");
-    assert!(app.pending_provider.is_none());
-
-    // A later Esc must not undo a finished profile.
-    press(&mut app, KeyCode::Esc);
-    assert!(app.settings.profiles.contains_key("groq"));
+    assert_eq!(app.settings.providers["custom"].base_url, "http://127.0.0.1:9/v1", "a scheme is added");
+    // No profile uses it yet, so its model list opens.
+    assert_eq!(app.model_hub.as_ref().and_then(|hub| hub.scoped_provider()), Some("custom"));
 }
 
 #[test]
-fn adding_the_same_provider_twice_does_not_overwrite_the_first() {
+fn a_hosted_provider_without_a_key_asks_for_one() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.add_provider("groq");
-    app.settings.profiles.get_mut("groq").expect("first").model = "keep-me".into();
-    app.add_provider("groq");
-    assert_eq!(app.settings.profiles.get("groq").expect("first").model, "keep-me", "the existing profile must survive");
-    assert!(app.settings.profiles.contains_key("groq-2"));
-    assert_eq!(app.settings.default_profile, "groq-2");
+    let kojo = crate::providers::preset("kojo").unwrap();
+    app.add_provider("kojo");
+    assert_eq!(app.settings.providers["kojo"].base_url, "https://api.kojo.sh/v1");
+    assert_eq!(app.settings.providers["kojo"].api_key_env.as_deref(), Some("KOJO_API_KEY"));
+    let editing = app.config_panel.as_ref().and_then(|panel| panel.editing.as_ref()).map(|(key, _)| *key);
+    if crate::providers::key_in_env(kojo) {
+        assert_eq!(editing, None, "an exported key needs no asking");
+    } else {
+        assert_eq!(editing, Some(ConfigKey::ApiKey), "the key is what it still needs");
+    }
+}
+
+#[test]
+fn picking_a_model_in_a_providers_list_makes_its_profile() {
+    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
+    app.catalogs
+        .insert("test".to_owned(), crate::model_hub::Catalog::Ready(vec![hub_card("qwen-3-4b", 32_000, 0.0, 0.0)]));
+    app.open_provider_models("test");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.config.profile, "test/qwen-3-4b", "named after the model");
+    assert_eq!(app.config.model, "qwen-3-4b");
+    assert_eq!(app.settings.profiles["test"].model, "test/test-model", "the other profile is untouched");
+
+    // Picking it again switches to that profile rather than making another.
+    app.switch_profile("test");
+    app.open_provider_models("test");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.config.profile, "test/qwen-3-4b");
+    assert_eq!(app.settings.profiles.len(), 2);
+}
+
+#[test]
+fn adding_a_preset_twice_opens_the_one_there_is() {
+    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
+    app.add_provider("ollama");
+    app.settings.providers.get_mut("ollama").expect("first").name = "Mine".into();
+    app.add_provider("ollama");
+    assert_eq!(app.settings.providers["ollama"].name, "Mine", "the existing provider must survive");
+    assert!(!app.settings.providers.contains_key("ollama-2"));
+    assert!(app.status.contains("set up already"), "{}", app.status);
 }
 
 #[test]
 fn the_api_key_row_reports_provenance_and_never_the_secret() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    assert_eq!(app.config_value(ConfigKey::ApiKey), "not set");
+    app.open_provider_editor("test", None);
+    assert_eq!(app.config_value(ConfigKey::ApiKey), "none needed", "a local endpoint needs none");
 
-    app.config_panel = Some(ConfigPanel { selected: 0, editing: None });
     app.begin_config_edit(ConfigKey::ApiKey);
     // The editor starts empty rather than seeded with anything.
     let buffer = app
@@ -679,30 +600,22 @@ fn the_api_key_row_reports_provenance_and_never_the_secret() {
     }
     app.commit_config_edit();
     let shown = app.config_value(ConfigKey::ApiKey);
-    assert_eq!(shown, "set · stored locally");
+    assert_eq!(shown, "stored in credentials.toml");
     assert!(!shown.contains("sk-secret"), "the key must never be echoed");
     assert_eq!(app.credentials.keys.get("test").map(String::as_str), Some("sk-secret-value"));
+    assert_eq!(app.config.connection.api_key.as_deref(), Some("sk-secret-value"), "and the session uses it now");
 }
 
 #[test]
 fn a_picker_opened_from_config_is_visible_and_owns_the_keys() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.settings.profiles.insert(
-        "second".to_owned(),
-        crate::config::ProviderProfile {
-            name: "Second".into(),
-            base_url: "http://127.0.0.1:9/v1".into(),
-            model: "other".into(),
-            ..Default::default()
-        },
-    );
-    app.config_panel = Some(ConfigPanel { selected: 0, editing: None });
-    app.open_profile_picker();
+    app.open_config_tab(PROVIDERS_TAB);
+    app.open_provider_picker();
 
     // Drawn on top: the config panel must not paint over its own child.
-    let rendered = render(&mut app, 96, 34);
-    assert!(rendered.contains("PROFILE"), "picker should be visible");
-    assert!(rendered.contains("Add a provider"), "picker rows should be visible");
+    let rendered = render(&mut app, 110, 34);
+    assert!(rendered.contains("ADD A PROVIDER"), "picker should be visible:\n{rendered}");
+    assert!(rendered.contains("Custom endpoint"), "picker rows should be visible");
 
     // And it owns the keys, rather than them going to the panel behind it.
     press(&mut app, KeyCode::Down);
@@ -1083,7 +996,7 @@ fn output_token_override_applies_live_and_clears_back_to_auto() {
     let edit = |app: &mut App, key: ConfigKey, text: &str| {
         let mut input = InputBuffer::new();
         input.insert_str(text);
-        app.config_panel = Some(ConfigPanel { selected: 0, editing: Some((key, input)) });
+        app.config_panel = Some(ConfigPanel { editing: Some((key, input)), ..panel() });
         app.commit_config_edit();
     };
 
@@ -1093,7 +1006,6 @@ fn output_token_override_applies_live_and_clears_back_to_auto() {
     edit(&mut app, ConfigKey::MaxOutput, "64k");
     let profile = app.settings.profiles.get(&app.settings.default_profile).expect("active profile");
     assert_eq!(profile.max_output_tokens, Some(64_000));
-    assert_eq!(app.settings.agent.max_output_tokens, None);
     assert_eq!(app.config.model_limits.configured_output_tokens, Some(64_000));
     assert!(app.status.contains("saved"), "{}", app.status);
 
@@ -1198,9 +1110,11 @@ fn approval_modal_spells_out_the_choices() {
         respond,
     });
     let rendered = render(&mut app, 110, 34);
-    assert!(rendered.contains("Yes, run it once"), "{rendered}");
-    assert!(rendered.contains("allow this for the rest of the session"), "{rendered}");
+    assert!(rendered.contains("could not decide"), "say why a person is being asked: {rendered}");
+    assert!(rendered.contains("Yes, run it"), "{rendered}");
     assert!(rendered.contains("tell Abacus in chat what to do instead"), "{rendered}");
+    // AUTO's reviewer decides each action, so an approval never sticks.
+    assert!(!rendered.contains("rest of the session"), "{rendered}");
 }
 
 #[test]
@@ -1329,100 +1243,96 @@ fn provider_failure_hints_at_repair() {
 }
 
 #[test]
-fn thinking_command_toggles_and_takes_an_explicit_state() {
+fn f3_toggles_thinking_and_says_capture_continues_when_hidden() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
     assert!(app.settings.ui.show_thinking);
 
-    // Bare invocation flips it.
+    press(&mut app, KeyCode::F(3));
+    assert!(!app.settings.ui.show_thinking);
+    assert!(app.status.contains("still recorded"), "hiding must not read as disabling capture: {}", app.status);
+    assert!(!Settings::load(&app.config.paths).unwrap().ui.show_thinking, "the choice is saved");
+
+    press(&mut app, KeyCode::F(3));
+    assert!(app.settings.ui.show_thinking);
+    // The command it replaced is gone, not silently kept.
     assert!(app.slash_command("/thinking"));
-    assert!(!app.settings.ui.show_thinking);
-    assert!(app.slash_command("/thinking"));
-    assert!(app.settings.ui.show_thinking);
-
-    // Explicit states are idempotent, so a keybinding or script can set
-    // rather than flip.
-    assert!(app.slash_command("/thinking off"));
-    assert!(!app.settings.ui.show_thinking);
-    assert!(app.slash_command("/thinking off"));
-    assert!(!app.settings.ui.show_thinking);
-    assert!(app.slash_command("/thinking on"));
-    assert!(app.settings.ui.show_thinking);
-}
-
-#[test]
-fn thinking_command_says_capture_continues_when_hidden() {
-    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.slash_command("/thinking off");
-    let last = app.entries.last().expect("a notice");
-    assert_eq!(last.kind, EntryKind::System);
-    assert!(last.text.contains("still recorded"), "hiding must not read as disabling capture: {}", last.text);
-}
-
-#[test]
-fn thinking_command_rejects_an_unknown_argument_without_changing_anything() {
-    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    let before = app.settings.ui.show_thinking;
-    assert!(app.slash_command("/thinking maybe"));
-    assert_eq!(app.settings.ui.show_thinking, before);
     assert_eq!(app.entries.last().expect("an error").kind, EntryKind::Error);
+    assert!(app.settings.ui.show_thinking);
 }
 
 /// The palette is built from the same table the dispatcher matches on, so a
 /// command that exists must be discoverable.
 #[test]
-fn thinking_is_offered_by_the_command_palette() {
-    assert!(SLASH_COMMANDS.iter().any(|(command, _)| *command == "/thinking"));
+fn mode_is_offered_by_the_command_palette() {
+    assert!(SLASH_COMMANDS.iter().any(|(command, _)| *command == "/mode"));
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.input.insert_str("/think");
+    app.input.insert_str("/mo");
     let (items, _) = app.visible_completion().expect("a suggestion");
-    assert!(items.iter().any(|(value, _)| value == "/thinking"));
+    assert!(items.iter().any(|(value, _)| value == "/mode"));
+    // And every command the palette offers runs.
+    for (command, _) in SLASH_COMMANDS {
+        assert!(!matches!(*command, "/plan" | "/swarm" | "/thinking" | "/models"), "{command} was folded into another");
+    }
 }
 
 #[test]
-fn providers_command_pins_orders_and_clears() {
+fn upstream_routing_is_a_profile_setting() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    assert!(app.slash_command("/providers Together, Anthropic"));
-    let profile = app.settings.profiles.get("test").expect("profile");
+    let edit = |app: &mut App, text: &str| {
+        let mut input = InputBuffer::new();
+        input.insert_str(text);
+        app.config_panel = Some(ConfigPanel { editing: Some((ConfigKey::Upstreams, input)), ..panel() });
+        app.commit_config_edit();
+    };
+    edit(&mut app, "Together, Anthropic");
     // Order is meaningful — it is a preference list, not a set.
-    assert_eq!(profile.providers, vec!["Together", "Anthropic"]);
-
+    assert_eq!(app.settings.profiles["test"].upstreams, vec!["Together", "Anthropic"]);
+    assert_eq!(app.config.routing.order, vec!["Together", "Anthropic"], "applied live");
     // Whitespace separation works too, since both read naturally.
-    assert!(app.slash_command("/providers DeepInfra Novita"));
-    assert_eq!(app.settings.profiles["test"].providers, vec!["DeepInfra", "Novita"]);
-
-    assert!(app.slash_command("/providers clear"));
-    assert!(app.settings.profiles["test"].providers.is_empty());
+    edit(&mut app, "DeepInfra Novita");
+    assert_eq!(app.settings.profiles["test"].upstreams, vec!["DeepInfra", "Novita"]);
+    edit(&mut app, "");
+    assert!(app.settings.profiles["test"].upstreams.is_empty());
 }
 
 #[test]
-fn strict_and_fallback_control_whether_anything_else_may_serve() {
+fn strict_routing_is_a_switch_on_the_profile() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
     assert!(app.settings.profiles["test"].allow_fallbacks, "on by default");
-    assert!(app.slash_command("/providers strict"));
+    app.cycle_config_value(ConfigKey::Fallbacks).unwrap();
     assert!(!app.settings.profiles["test"].allow_fallbacks);
-    assert!(app.slash_command("/providers fallback"));
+    assert!(!app.config.routing.allow_fallbacks);
+    app.cycle_config_value(ConfigKey::Fallbacks).unwrap();
     assert!(app.settings.profiles["test"].allow_fallbacks);
 }
 
 #[test]
-fn providers_with_no_argument_reports_the_current_pin() {
+fn providers_command_opens_the_providers_tab() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.slash_command("/providers");
-    let text = &app.entries.last().expect("a notice").text;
-    assert!(text.contains("No providers pinned"), "{text}");
+    assert!(app.slash_command("/providers"));
+    let panel = app.config_panel.as_ref().expect("the config panel");
+    assert_eq!(panel.tab, PROVIDERS_TAB);
+    let rows = app.config_rows();
+    assert!(matches!(rows.first(), Some(ConfigRow::Provider(id)) if id == "test"));
+    assert!(matches!(rows.last(), Some(ConfigRow::AddProvider)));
 
-    app.slash_command("/providers Together");
-    app.slash_command("/providers");
-    let text = &app.entries.last().expect("a notice").text;
-    assert!(text.contains("Together"), "{text}");
+    // Enter opens the provider; Esc goes back to the list, then closes.
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.config_panel.as_ref().unwrap().provider.as_deref(), Some("test"));
+    assert_eq!(app.config_value(ConfigKey::ProviderUrl), "http://127.0.0.1:9/v1");
+    press(&mut app, KeyCode::Esc);
+    assert!(app.config_panel.as_ref().unwrap().provider.is_none());
+    press(&mut app, KeyCode::Esc);
+    assert!(app.config_panel.is_none());
 }
 
 #[test]
-fn every_setting_has_one_row_under_a_heading() {
+fn every_setting_has_one_row_under_a_tab() {
     let mut seen = Vec::new();
-    for (heading, section) in SETTINGS {
-        assert!(!section.is_empty(), "heading {heading} has no settings under it");
-        for setting in *section {
+    for (index, (tab, section)) in SETTINGS.iter().enumerate() {
+        // The Providers tab lists the providers; its rows are the editor's.
+        assert_eq!(section.is_empty(), index == PROVIDERS_TAB, "tab {tab}");
+        for setting in section.iter().chain(if index == PROVIDERS_TAB { PROVIDER_FIELDS } else { &[] }) {
             assert!(!seen.contains(&setting.key), "{:?} is listed twice", setting.key);
             seen.push(setting.key);
         }
@@ -1448,7 +1358,7 @@ fn polished_layout_renders_at_standard_and_compact_sizes() {
         assert!(rendered.contains("focused coding agent") || width < 72);
         assert!(rendered.contains("commands"));
 
-        app.config_panel = Some(ConfigPanel { selected: 0, editing: None });
+        app.config_panel = Some(panel());
         let rendered = render(&mut app, width, height);
         assert!(rendered.contains("CONFIGURATION"));
         assert!(rendered.contains("Active profile"));
@@ -1494,12 +1404,12 @@ fn semantic_diff_approval_renders_at_standard_and_compact_sizes() {
             respond,
         });
         let rendered = render(&mut app, width, height);
-        assert!(rendered.contains("APPROVAL REQUIRED"));
+        assert!(rendered.contains("YOUR CALL"));
         assert!(rendered.contains("src/main.rs"));
         assert!(rendered.contains("+1"));
         assert!(rendered.contains("-1"));
         assert!(rendered.contains("println!"));
-        assert!(rendered.contains("once"));
+        assert!(rendered.contains("allow"));
         assert!(rendered.contains("reject"));
     }
 }
@@ -1507,7 +1417,7 @@ fn semantic_diff_approval_renders_at_standard_and_compact_sizes() {
 #[test]
 fn config_changes_are_saved_and_live_immediately() {
     let (directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.settings.profiles.get_mut("test").unwrap().model = "new-model".into();
+    app.settings.profiles.get_mut("test").unwrap().model = "test/new-model".into();
     app.settings.agent.max_steps = 64;
     app.settings.ui.vim_mode = false;
     app.save_and_apply_settings().unwrap();
@@ -1516,7 +1426,7 @@ fn config_changes_are_saved_and_live_immediately() {
     assert_eq!(app.mode, InputMode::Insert);
     assert!(app.reload_services);
     let saved = Settings::load(&AbacusPaths::under(directory.path().join("home"))).unwrap();
-    assert_eq!(saved.profiles["test"].model, "new-model");
+    assert_eq!(saved.profiles["test"].model, "test/new-model");
     assert_eq!(saved.agent.max_steps, 64);
 }
 
@@ -1642,7 +1552,7 @@ fn slash_palette_lists_every_command_not_just_six() {
     let all = slash_suggestions("/");
     assert_eq!(all.len(), SLASH_COMMANDS.len());
     assert!(all.len() > 6);
-    assert!(all.iter().any(|(command, _)| *command == "/swarm"));
+    assert!(all.iter().any(|(command, _)| *command == "/profile"));
     assert!(all.iter().any(|(command, _)| *command == "/usage"));
 }
 
@@ -1711,18 +1621,15 @@ fn the_model_hub_renders_both_columns_in_one_box() {
             hub_card("openai/gpt-5", 400_000, 1.25, 10.0),
         ]),
     );
-    app.model_hub = Some(crate::model_hub::ModelHub::new(&app.settings));
-    if let Some(hub) = app.model_hub.as_mut() {
-        hub.scope = 2;
-        hub.pane = crate::model_hub::Pane::Body;
-    }
+    app.open_provider_models("test");
     let rendered = render(&mut app, 110, 24);
 
-    assert!(rendered.contains("MODELS"), "{rendered}");
-    // Sidebar and body are both live, and the sidebar carries the profile
-    // marker and its model count.
-    assert!(rendered.contains("roles"), "{rendered}");
+    assert!(rendered.contains("PROFILES"), "{rendered}");
+    // Sidebar and body are both live, and the sidebar marks the provider the
+    // session runs on, with its model count.
+    assert!(rendered.contains("profiles"), "{rendered}");
     assert!(rendered.contains("[x] Test"), "{rendered}");
+    assert!(rendered.contains("+ add provider"), "{rendered}");
     assert!(rendered.contains("anthropic/"), "{rendered}");
     assert!(rendered.contains("claude-sonnet-4.5"), "{rendered}");
     // The metric columns carry what the catalog reported.
@@ -1752,57 +1659,44 @@ fn the_model_hub_renders_both_columns_in_one_box() {
 }
 
 #[test]
-fn picking_a_model_for_a_role_assigns_it_and_returns_to_the_roles_list() {
-    use crate::model_hub::{Pane, Scope};
+fn picking_a_model_for_a_role_assigns_it_without_switching() {
+    use crate::model_hub::Pick;
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
     app.catalogs.insert(
         "test".to_owned(),
         crate::model_hub::Catalog::Ready(vec![hub_card("openai/gpt-5", 400_000, 1.25, 10.0)]),
     );
-    app.model_hub = Some(crate::model_hub::ModelHub::new(&app.settings));
-    if let Some(hub) = app.model_hub.as_mut() {
-        hub.pane = Pane::Body;
-        // The `aux` role.
-        hub.selected = 1;
-    }
-    // Enter on the role opens the catalog with the role in hand…
-    press(&mut app, KeyCode::Enter);
-    let hub = app.model_hub.as_ref().expect("hub is still open");
-    assert_eq!(hub.assigning.as_deref(), Some("aux"));
-    assert!(matches!(hub.current_scope(), Scope::Profile { .. }));
+    // The aux row in /config opens the hub with the role in hand.
+    app.open_config_tab(0);
+    app.cycle_config_value(ConfigKey::AuxModel).unwrap();
+    let hub = app.model_hub.as_ref().expect("the hub");
+    assert_eq!(hub.pick, Pick::Assign("aux".to_owned()));
+    assert_eq!(hub.scoped_provider(), Some("test"));
 
-    // …and Enter on a model assigns it and comes back.
+    // Enter on a model assigns it, and the config panel is back.
     press(&mut app, KeyCode::Enter);
-    let hub = app.model_hub.as_ref().expect("hub is still open");
-    assert_eq!(hub.assigning, None);
-    assert_eq!(*hub.current_scope(), Scope::Roles);
-    assert_eq!(hub.selected, 1, "the cursor lands back on the role it set");
+    assert!(app.model_hub.is_none());
+    assert!(app.config_panel.is_some());
     let profile = &app.settings.profiles["test"];
-    assert_eq!(profile.role_model("aux"), Some("openai/gpt-5"));
+    assert_eq!(profile.role_model("aux"), Some("test/openai/gpt-5"));
     // The main model is untouched: assigning a role is not switching.
-    assert_eq!(profile.model, "test-model");
-    assert_eq!(app.config.aux_model.as_deref(), Some("openai/gpt-5"));
-
-    // Delete clears it back to inheriting.
-    press(&mut app, KeyCode::Delete);
-    assert_eq!(app.settings.profiles["test"].role_model("aux"), None);
+    assert_eq!(profile.model, "test/test-model");
+    assert_eq!(app.config.roles.aux.as_ref().map(|target| target.reference()).as_deref(), Some("test/openai/gpt-5"));
 }
 
 #[test]
-fn enter_on_a_model_with_no_role_in_hand_switches_the_profile_model() {
+fn choosing_the_profiles_model_from_config_replaces_it_in_place() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
     app.catalogs.insert(
         "test".to_owned(),
         crate::model_hub::Catalog::Ready(vec![hub_card("openai/gpt-5", 400_000, 1.25, 10.0)]),
     );
-    app.model_hub = Some(crate::model_hub::ModelHub::new(&app.settings));
-    if let Some(hub) = app.model_hub.as_mut() {
-        hub.scope = 2;
-        hub.pane = crate::model_hub::Pane::Body;
-    }
+    app.open_config_tab(0);
+    app.cycle_config_value(ConfigKey::Model).unwrap();
     press(&mut app, KeyCode::Enter);
-    assert_eq!(app.settings.profiles["test"].model, "openai/gpt-5");
+    assert_eq!(app.settings.profiles["test"].model, "test/openai/gpt-5");
     assert_eq!(app.config.model, "openai/gpt-5", "and it is applied live");
+    assert_eq!(app.settings.profiles.len(), 1, "no new profile");
 }
 
 #[test]
@@ -1843,12 +1737,11 @@ fn a_role_assigned_mid_session_reaches_the_running_config() {
     // Saving settings has to push the role through to `Config`, or the
     // assignment sits in the file doing nothing until the next launch.
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    assert_eq!(app.config.subagent_model, None);
-    app.model_hub = Some(crate::model_hub::ModelHub::new(&app.settings));
-    app.assign_role("subagent", Some("openai/gpt-5".to_owned()));
-    assert_eq!(app.config.subagent_model.as_deref(), Some("openai/gpt-5"));
+    assert!(app.config.roles.subagent.is_none());
+    app.assign_role("subagent", Some("test/openai/gpt-5".to_owned()));
+    assert_eq!(app.config.roles.subagent.as_ref().map(|target| target.model.as_str()), Some("openai/gpt-5"));
     app.assign_role("subagent", None);
-    assert_eq!(app.config.subagent_model, None, "clearing it lets the turn fall back to the main model again");
+    assert!(app.config.roles.subagent.is_none(), "clearing it lets the turn fall back to the main model again");
 }
 
 #[test]
@@ -1858,18 +1751,20 @@ fn escape_backs_out_one_layer_at_a_time() {
         "test".to_owned(),
         crate::model_hub::Catalog::Ready(vec![hub_card("openai/gpt-5", 400_000, 1.25, 10.0)]),
     );
-    app.model_hub = Some(crate::model_hub::ModelHub::new(&app.settings));
-    if let Some(hub) = app.model_hub.as_mut() {
-        hub.scope = 2;
-        hub.pane = crate::model_hub::Pane::Body;
-        hub.search = "gpt".to_owned();
-    }
+    app.open_provider_models("test");
+    app.model_hub.as_mut().unwrap().search = "gpt".to_owned();
     let escape = || KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
     handle_key(&mut app, escape());
     assert_eq!(
         app.model_hub.as_ref().map(|hub| hub.search.clone()),
         Some(String::new()),
         "the filter clears before the surface does"
+    );
+    handle_key(&mut app, escape());
+    assert_eq!(
+        app.model_hub.as_ref().map(|hub| hub.pane),
+        Some(crate::model_hub::Pane::Sidebar),
+        "then to the sidebar"
     );
     handle_key(&mut app, escape());
     assert!(app.model_hub.is_none(), "and then it closes");
@@ -1904,13 +1799,13 @@ async fn exit_command_quits() {
 #[test]
 fn completion_popup_navigates_and_inserts_the_highlighted_row() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    for ch in "/mod".chars() {
+    for ch in "/pro".chars() {
         let before = app.input.text();
         press(&mut app, KeyCode::Char(ch));
         app.sync_completion(&before);
     }
     let (items, _) = app.visible_completion().expect("command completion");
-    assert!(items.len() > 1, "expected /mode and /model");
+    assert!(items.len() > 1, "expected /profile and /providers");
     assert_eq!(app.completion_index, 0);
 
     // Down moves the highlight rather than reaching for prompt history.
@@ -1918,7 +1813,7 @@ fn completion_popup_navigates_and_inserts_the_highlighted_row() {
     press(&mut app, KeyCode::Down);
     app.sync_completion(&before);
     assert_eq!(app.completion_index, 1);
-    assert_eq!(app.input.text(), "/mod", "navigation must not edit the draft");
+    assert_eq!(app.input.text(), "/pro", "navigation must not edit the draft");
 
     // Enter inserts what is highlighted, not the first match.
     let before = app.input.text();
@@ -2048,7 +1943,7 @@ fn clicking_the_transcript_selects_then_unfolds_a_tool_row() {
 #[test]
 fn clicking_a_suggestion_inserts_it() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    app.input.insert_str("/mod");
+    app.input.insert_str("/pro");
     app.sync_completion("");
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -2071,7 +1966,7 @@ fn clicking_a_suggestion_inserts_it() {
 fn a_click_on_an_overlay_does_not_reach_the_transcript_beneath() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
     app.entries = vec![Entry::new(EntryKind::User, "hello")];
-    app.config_panel = Some(ConfigPanel { selected: 0, editing: None });
+    app.config_panel = Some(panel());
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -2140,22 +2035,6 @@ async fn ctrl_c_arm_resets_so_a_later_interrupt_is_not_a_quit() {
     // So the next Ctrl+C starts over rather than quitting.
     app.handle_ctrl_c();
     assert!(!app.quit);
-}
-
-#[tokio::test]
-async fn swarm_command_turns_an_objective_into_a_delegation_prompt() {
-    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
-    // An empty objective only prints usage; it must not start a turn.
-    app.swarm_command("   ");
-    assert!(app.running.is_none());
-    assert!(app.entries.iter().any(|entry| entry.text.contains("Usage: /swarm")));
-    // A real objective is expanded into a spawn_subagents instruction that
-    // still carries the user's words, and it starts a turn.
-    app.swarm_command("port modules A and B independently");
-    let sent = app.messages.last().unwrap()["content"].as_str().unwrap().to_owned();
-    assert!(sent.contains("spawn_subagents"));
-    assert!(sent.contains("port modules A and B independently"));
-    assert!(app.running.is_some());
 }
 
 #[tokio::test]
@@ -2530,7 +2409,7 @@ async fn snapshots_are_sent_on_connect_and_on_request() {
     assert_eq!(reasons, ["connect", "requested", "reconnect"]);
     let payload = &snapshots[0]["payload"];
     assert_eq!(payload["session"]["mode"], "auto");
-    assert_eq!(payload["session"]["model"], "test-model");
+    assert_eq!(payload["session"]["model"], "test/test-model", "the phone shows which provider too");
     let texts: Vec<&str> = payload["entries"].as_array().unwrap().iter().map(|e| e["text"].as_str().unwrap()).collect();
     assert_eq!(texts, ["earlier", "reply"]);
 }
@@ -2805,8 +2684,7 @@ fn auto_share_is_a_config_row() {
     app.cycle_config_value(ConfigKey::RemoteAutoShare).unwrap();
     assert!(!app.settings.remote.auto_share);
     assert_eq!(app.config_value(ConfigKey::RemoteAutoShare), on_off(false));
-    let (_, row) = setting(ConfigKey::RemoteAutoShare);
-    assert_eq!(row.label, "Auto-share sessions");
+    assert_eq!(setting(ConfigKey::RemoteAutoShare).label, "Auto-share sessions");
 }
 
 fn test_app(base_url: &str) -> (TempDir, App) {
@@ -2816,24 +2694,29 @@ fn test_app(base_url: &str) -> (TempDir, App) {
     let workspace = workspace.canonicalize().unwrap();
     let paths = AbacusPaths::under(directory.path().join("home"));
     let mut settings = Settings { default_profile: "test".into(), ..Settings::default() };
-    settings.profiles.insert(
-        "test".into(),
-        ProviderProfile {
-            name: "Test".into(),
-            base_url: base_url.into(),
-            model: "test-model".into(),
-            ..Default::default()
-        },
-    );
+    let provider = ProviderConfig { name: "Test".into(), base_url: base_url.into(), ..Default::default() };
+    settings.providers.insert("test".into(), provider.clone());
+    settings.profiles.insert("test".into(), Profile::for_model("test/test-model"));
     let config = Config {
         profile: "test".into(),
         max_steps: 8,
         no_session: true,
+        connection: crate::providers::Connection::resolve("test", &provider, &Credentials::default()),
         ..Config::for_endpoint(workspace.clone(), base_url.into(), "test-model".into(), paths)
     };
     let app = App::new(config, settings, Credentials::default(), None, None, Arc::new(AgentServices::empty(workspace)))
         .unwrap();
     (directory, app)
+}
+
+/// A closed config panel's fields, for a test to open one with.
+fn panel() -> ConfigPanel {
+    ConfigPanel { tab: 0, selected: 0, editing: None, provider: None, confirm_remove: false }
+}
+
+/// Shift+Tab.
+fn press_back_tab(app: &mut App) {
+    handle_key(app, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 }
 
 /// Draw one frame at `width` x `height` and return what is on screen.
@@ -2895,7 +2778,7 @@ fn content_width_and_composer_height_follow_the_settings() {
     let edit = |app: &mut App, key, text: &str| {
         let mut input = InputBuffer::new();
         input.insert_str(text);
-        app.config_panel = Some(ConfigPanel { selected: 0, editing: Some((key, input)) });
+        app.config_panel = Some(ConfigPanel { editing: Some((key, input)), ..panel() });
         app.commit_config_edit();
     };
     edit(&mut app, ConfigKey::ContentWidth, "full");

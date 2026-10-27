@@ -73,35 +73,33 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-/// The colour that stands for an agent mode, used consistently by the header
-/// badge, the welcome screen, and the mode-change notices.
-pub(super) fn mode_color(mode: AgentMode) -> Color {
+/// The colour that stands for a mode, used consistently by the header badge
+/// and the welcome screen: YOLO in the warning colour, since nothing checks
+/// what it does.
+pub(super) fn mode_color(mode: Permission) -> Color {
     match mode {
-        AgentMode::Auto => primary(),
-        AgentMode::Plan => warning(),
-        AgentMode::Build => success(),
+        Permission::Auto => primary(),
+        Permission::Yolo => warning(),
     }
 }
 
 /// Two rows: identity and target on the left, model and mode on the right, over
 /// a hairline that separates the chrome from the conversation.
 pub(super) fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let mode = app.resolved_agent_mode.unwrap_or(app.agent_mode);
+    let mode = app.mode();
 
     let mut left = vec![ui::badge("ABACUS", secondary()), bold(format!("  {}", app.config.workspace_name()), text())];
     if let Some(branch) = &app.git_branch {
         left.push(fg(format!("  {} {}", ui::glyphs().branch, ui::truncate(branch, 24)), muted()));
     }
-    if app.config.profile != "default" {
+    // The profile only earns a place when it says more than the model does.
+    let model = app.config.model_ref();
+    if app.config.profile != model && !app.config.profile.is_empty() {
         left.push(ui::dot());
-        left.push(fg(ui::truncate(&app.config.profile, 18), muted()));
+        left.push(fg(ui::truncate(&app.config.profile, 24), muted()));
     }
 
-    let right = vec![
-        fg(ui::truncate(&app.config.model, 34), muted()),
-        Span::raw("  "),
-        ui::badge(mode.label(), mode_color(mode)),
-    ];
+    let right = vec![fg(ui::truncate(&model, 40), muted()), Span::raw("  "), ui::badge(mode.label(), mode_color(mode))];
 
     // Give the left cluster its own clipped rect rather than letting the
     // right-aligned one paint over it. Overlapping them truncates the branch
@@ -238,11 +236,12 @@ pub(super) fn draw_follow_pill(frame: &mut Frame<'_>, area: Rect) {
 /// marketing page, a left-aligned facts block looks like a tool.
 pub(super) fn draw_welcome(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let compact = area.width < 64 || area.height < 18;
-    let mode = app.resolved_agent_mode.unwrap_or(app.agent_mode);
+    let mode = app.mode();
+    let model = app.config.model_ref();
     let info = ui::Welcome {
         version: env!("CARGO_PKG_VERSION"),
         workspace: &app.config.workspace.to_string_lossy(),
-        model: &app.config.model,
+        model: &model,
         mode: mode.label(),
         branch: app.git_branch.as_deref(),
         tips: app.settings.ui.show_tooltips && !compact,
@@ -620,9 +619,7 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 bold(format!(" {}  ", approval.tool), warning()),
                 fg(ui::truncate(&approval.summary, area.width.saturating_sub(46) as usize), muted()),
                 bold("  y", success()),
-                fg(" once ", muted()),
-                bold("a", primary()),
-                fg(" session ", muted()),
+                fg(" allow ", muted()),
                 bold("n", danger()),
                 fg(" reject", muted()),
             ])),
@@ -966,8 +963,9 @@ pub(super) fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         (
             "SESSION",
             &[
-                ("Shift+Tab", "cycle AUTO / PLAN / BUILD"),
+                ("Shift+Tab", "switch AUTO (risky actions reviewed) / YOLO (nothing reviewed)"),
                 ("Ctrl+T", "cycle reasoning effort: auto, low, medium, high"),
+                ("F3", "show or hide the model's reasoning"),
                 ("Ctrl+C", "interrupt the turn; twice to exit"),
                 ("Ctrl+Q", "quit"),
             ],
@@ -1005,76 +1003,119 @@ pub(super) fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(panel) = &app.config_panel else {
         return;
     };
-    // Sized to the content, so the panel never leaves a band of dead space:
-    // a row per heading and setting, two of chrome, two for the help line.
-    let body_rows = (SETTINGS.len() + settings().count()) as u16;
-    let popup = ui::centered(area.width.saturating_sub(8).min(96), body_rows + 4, area);
-    let inner = open_overlay(
-        frame,
-        popup,
-        "CONFIGURATION",
-        secondary(),
-        &[("↑↓", "move"), ("enter", "edit"), ("esc", "close"), ("", "saved immediately")],
-    );
-    let help_height = 2u16.min(inner.height);
-    let list = Rect { height: inner.height.saturating_sub(help_height), ..inner };
-    let width = list.width as usize;
+    let rows = app.config_rows();
+    // Sized to the longest tab, so stepping through the tabs does not make the
+    // panel jump: a row per setting, the tab bar and its rule, the provider
+    // editor's heading, two of chrome, two for the help line.
+    let tallest = SETTINGS
+        .iter()
+        .map(|(_, rows)| rows.len())
+        .chain([PROVIDER_FIELDS.len() + 1, app.settings.providers.len() + 1])
+        .max()
+        .unwrap_or(0) as u16;
+    let popup = ui::centered(area.width.saturating_sub(8).min(104), tallest + 7, area);
+    let hints: &[(&str, &str)] = if panel.provider.is_some() {
+        &[("↑↓", "move"), ("enter", "edit"), ("esc", "back to providers"), ("", "saved immediately")]
+    } else {
+        &[("←→", "tab"), ("↑↓", "move"), ("enter", "edit"), ("del", "inherit"), ("esc", "close")]
+    };
+    let inner = open_overlay(frame, popup, "CONFIGURATION", secondary(), hints);
 
-    // Build every row first, then window around the cursor. Rows stay as
-    // spans until then: a row cannot know whether the pointer is over it
-    // before the window fixes where it lands on screen.
-    let mut rows: Vec<(Option<usize>, Vec<Span<'static>>)> = Vec::new();
-    let mut selected_row = 0;
-    let mut index = 0;
-    for (heading, section) in SETTINGS {
-        rows.push((None, vec![bold(format!("  {heading}"), rail())]));
-        for setting in *section {
-            let selected = index == panel.selected;
-            if selected {
-                selected_row = rows.len();
-            }
-            let mut content = vec![Span::styled(format!("{:<26}", setting.label), emphasis(selected))];
-            let value = app.config_value(setting.key);
-            content.extend(config_value_spans(&value, width.saturating_sub(30), selected));
-            rows.push((Some(index), content));
-            index += 1;
-        }
+    // The tab bar: each label is a hit region, so a click switches to it.
+    let mut tabs: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut x = inner.x + 1;
+    for (index, (name, _)) in SETTINGS.iter().enumerate() {
+        let label = format!(" {name} ");
+        let width = label.chars().count() as u16;
+        app.hits.borrow_mut().config_tabs.push((Rect { x, y: inner.y, width, height: 1 }, index));
+        tabs.push(if index == panel.tab { Span::styled(label, ui::fill_style(primary())) } else { fg(label, muted()) });
+        tabs.push(Span::raw(" "));
+        x += width + 1;
     }
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![Line::from(tabs), ui::rule(inner.width)])),
+        Rect { height: 2.min(inner.height), ..inner },
+    );
+
+    let help_height = 2u16.min(inner.height.saturating_sub(2));
+    let mut list = Rect { y: inner.y + 2, height: inner.height.saturating_sub(2 + help_height), ..inner };
+    let width = list.width as usize;
+    // The provider editor says which provider it is editing.
+    if let Some(id) = &panel.provider {
+        let name = app.settings.providers.get(id).map_or(id.as_str(), |provider| provider.display_name(id));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![bold(format!("  {name}"), text()), fg(format!("  ({id})"), rail())])),
+            Rect { height: 1, ..list },
+        );
+        list = Rect { y: list.y + 1, height: list.height.saturating_sub(1), ..list };
+    }
+
     let visible = list.height as usize;
-    let first =
-        selected_row.saturating_sub(visible.saturating_sub(1)).min(rows.len().saturating_sub(visible.min(rows.len())));
+    let first = panel.selected.saturating_sub(visible.saturating_sub(1)).min(rows.len().saturating_sub(visible));
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (offset, (index, content)) in rows.into_iter().skip(first).take(visible).enumerate() {
-        let rect = Rect { y: list.y + offset as u16, height: 1, ..list };
-        lines.push(match index {
-            Some(index) => {
-                app.hits.borrow_mut().config.push((rect, index));
-                ui::list_row(app.row_state(rect, index == panel.selected), width, content)
+    for (offset, row) in rows.iter().enumerate().skip(first).take(visible) {
+        let rect = Rect { y: list.y + (offset - first) as u16, height: 1, ..list };
+        let selected = offset == panel.selected;
+        app.hits.borrow_mut().config.push((rect, offset));
+        let content = match row {
+            ConfigRow::Setting(setting) => {
+                let mut content = vec![Span::styled(format!("{:<26}", setting.label), emphasis(selected))];
+                content.extend(config_value_spans(&app.config_value(setting.key), width.saturating_sub(30), selected));
+                content
             }
-            None => Line::from(content),
-        });
+            ConfigRow::Provider(id) => vec![
+                ui::state_mark(app.settings.active_profile().is_some_and(|profile| profile.provider() == id)),
+                Span::raw(" "),
+                Span::styled(format!("{id:<16}"), emphasis(selected)),
+                fg(
+                    ui::truncate(&app.provider_row_label(id), width.saturating_sub(22)),
+                    if selected { text() } else { muted() },
+                ),
+            ],
+            ConfigRow::AddProvider => vec![Span::styled("+ Add a provider…".to_owned(), emphasis(selected))],
+        };
+        lines.push(ui::list_row(app.row_state(rect, selected), width, content));
+    }
+    if rows.len() == 1 && matches!(rows.first(), Some(ConfigRow::AddProvider)) {
+        lines.push(Line::default());
+        lines.push(Line::from(fg("  No providers yet. Add one: a preset, or any endpoint by URL.", muted())));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), list);
 
-    if let Some(setting) = settings().nth(panel.selected).filter(|_| help_height == 2) {
-        let help = ui::truncate(setting.help, inner.width as usize);
+    let help = match rows.get(panel.selected) {
+        Some(ConfigRow::Setting(setting)) => setting.help,
+        Some(ConfigRow::Provider(_)) => "Enter opens the provider: its URL, key, headers, body overrides and models.",
+        Some(ConfigRow::AddProvider) => {
+            "A preset (Kojo, OpenRouter, Ollama, llama.cpp, LM Studio) or any endpoint by URL."
+        }
+        None => "",
+    };
+    if help_height == 2 {
         frame.render_widget(
-            Paragraph::new(Text::from(vec![ui::rule(inner.width), Line::from(fg(help, muted()))])),
-            Rect { y: list.bottom(), height: 2, ..inner },
+            Paragraph::new(Text::from(vec![
+                ui::rule(inner.width),
+                Line::from(fg(ui::truncate(help, inner.width as usize), muted())),
+            ])),
+            Rect { y: inner.bottom().saturating_sub(2), height: 2, ..inner },
         );
     }
 
     if let Some((key, input)) = &panel.editing {
         let editor = ui::centered(popup.width.saturating_sub(10), 3, popup);
         frame.render_widget(Clear, editor);
-        let block = ui::overlay_block(setting(*key).1.label, primary(), None);
+        let block = ui::overlay_block(setting(*key).label, primary(), None);
         let field = block.inner(editor);
         frame.render_widget(block, editor);
         let value = input.text();
         let shown = if *key == ConfigKey::ApiKey { "•".repeat(value.chars().count()) } else { value.clone() };
-        frame.render_widget(Paragraph::new(shown.as_str()), field);
+        // Long values (a token command, a body) slide so the cursor stays in
+        // view rather than typing off the edge.
         let (_, column) = input.cursor_position();
-        frame.set_cursor_position(((field.x + column as u16).min(field.right().saturating_sub(1)), field.y));
+        let room = field.width.max(1) as usize;
+        let skip = column.saturating_sub(room.saturating_sub(1));
+        let visible: String = shown.chars().skip(skip).take(room).collect();
+        frame.render_widget(Paragraph::new(visible), field);
+        frame.set_cursor_position(((field.x + (column - skip) as u16).min(field.right().saturating_sub(1)), field.y));
     }
 }
 
@@ -1305,17 +1346,12 @@ pub(super) fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
     let popup = ui::centered(area.width.saturating_sub(4).min(120), area.height.saturating_sub(2).max(10), area);
-    let mut hints: Vec<(&str, &str)> = vec![
-        ("y", "allow once"),
-        ("a", "allow session"),
-        ("n", "reject"),
-        ("j/k", "scroll"),
-        ("^O", "open latest output"),
-    ];
+    let mut hints: Vec<(&str, &str)> =
+        vec![("y", "allow"), ("n", "reject"), ("j/k", "scroll"), ("^O", "open latest output")];
     if approval.diff.is_some() {
         hints.push(("v", "raw/unified"));
     }
-    let inner = open_overlay(frame, popup, "APPROVAL REQUIRED", warning(), &hints);
+    let inner = open_overlay(frame, popup, "YOUR CALL", warning(), &hints);
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
@@ -1341,7 +1377,10 @@ pub(super) fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ),
         ]));
     } else {
-        header.push(Line::from(fg("Review the operation below before allowing it to run.", muted())));
+        header.push(Line::from(fg(
+            "The safety review could not decide on this one. Read it before allowing it to run.",
+            muted(),
+        )));
     }
     frame.render_widget(Paragraph::new(Text::from(header)), sections[0]);
 
@@ -1372,8 +1411,7 @@ pub(super) fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(Text::from(vec![
             Line::from(""),
-            option("y", "Yes, run it once", true),
-            option("a", "Yes, and allow this for the rest of the session", false),
+            option("y", "Yes, run it", true),
             option("n", "No — reject it, then tell Abacus in chat what to do instead", false),
         ])),
         sections[2],
@@ -1456,20 +1494,12 @@ pub(super) fn draw_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(picker) = &app.picker else {
         return;
     };
-    let hints: &[(&str, &str)] = if picker.prompt.is_some() {
-        &[("enter", "confirm"), ("esc", "cancel")]
-    } else if picker.action == PickerAction::SwitchProfile {
-        &[("↑↓", "select"), ("enter", "switch"), ("r", "rename"), ("d", "delete"), ("n", "add"), ("esc", "close")]
-    } else {
-        &[("↑↓", "select"), ("enter", "open"), ("esc", "close")]
-    };
-    let extra = if picker.prompt.is_some() { 3 } else { 0 };
-    let height = (picker.items.len() as u16 + 2 + extra).min(area.height.saturating_sub(4)).max(3 + extra);
+    let hints: &[(&str, &str)] = &[("↑↓", "select"), ("enter", "open"), ("esc", "close")];
+    let height = (picker.items.len() as u16 + 2).min(area.height.saturating_sub(4)).max(3);
     let popup = ui::centered(area.width.saturating_sub(12).min(100), height, area);
     let inner = open_overlay(frame, popup, &picker.title.to_uppercase(), primary(), hints);
 
-    let prompt_rows = if picker.prompt.is_some() { 3usize } else { 0 };
-    let rows = inner.height.saturating_sub(prompt_rows as u16) as usize;
+    let rows = inner.height as usize;
     let width = inner.width as usize;
     let start = picker.selected.saturating_sub(rows.saturating_sub(1));
     let mut lines = Vec::new();
@@ -1486,38 +1516,7 @@ pub(super) fn draw_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
             vec![Span::styled(ui::truncate(label, width.saturating_sub(3)), emphasis(selected))],
         ));
     }
-    let list = Rect { height: inner.height.saturating_sub(prompt_rows as u16), ..inner };
-    frame.render_widget(Paragraph::new(Text::from(lines)), list);
-    if let Some(prompt) = &picker.prompt {
-        let field = Rect { y: list.bottom(), height: prompt_rows as u16, ..inner };
-        match prompt {
-            PickerPrompt::Rename { id, input } => {
-                frame.render_widget(
-                    Paragraph::new(Text::from(vec![
-                        ui::rule(inner.width),
-                        Line::from(fg(format!(" rename {id} →"), muted())),
-                        Line::from(fg(format!(" {}", input.text()), text())),
-                    ])),
-                    field,
-                );
-                let (_, column) = input.cursor_position();
-                frame.set_cursor_position((
-                    (field.x + 1 + column as u16).min(field.right().saturating_sub(1)),
-                    field.y + 2,
-                ));
-            }
-            PickerPrompt::ConfirmDelete { id } => {
-                frame.render_widget(
-                    Paragraph::new(Text::from(vec![
-                        ui::rule(inner.width),
-                        Line::from(bold(format!(" delete {id}?"), danger())),
-                        Line::from(fg(" enter confirms · esc cancels", muted())),
-                    ])),
-                    field,
-                );
-            }
-        }
-    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// The value column of a config row.

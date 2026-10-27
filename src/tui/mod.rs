@@ -1,10 +1,10 @@
 use crate::{
     activity::ActivityReporter,
     agent::{
-        AgentEvent, AgentMode, ApprovalDecision, ApprovalRequest, DoneReason, TurnOptions, UserQuestionRequest,
-        compact_messages, initial_messages, message_chars, run_turn,
+        AgentEvent, ApprovalDecision, ApprovalRequest, DoneReason, TurnOptions, UserQuestionRequest, compact_messages,
+        initial_messages, message_chars, run_turn,
     },
-    config::{Config, Credentials, PermissionMode, ProviderProtocol, SETTINGS_VERSION, Settings},
+    config::{Config, Credentials, Permission, ProviderProtocol, SETTINGS_VERSION, Settings},
     context::expand_file_references,
     diff::{DiffDocument, DiffLineKind},
     input::{InputBuffer, InputMode},
@@ -62,40 +62,28 @@ mod usage;
 use self::{draw::*, hub::*, keys::*, settings::*, usage::*};
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/profile", "Switch profile, or pick any model a provider serves"),
+    ("/providers", "Add or edit providers: URL, key, headers"),
+    ("/mode", "AUTO reviews risky actions; YOLO runs everything"),
+    ("/effort", "Reasoning effort: minimal, low, medium, high, xhigh, max, auto"),
+    ("/config", "Settings, by tab"),
     ("/goal", "Set or manage a persistent goal"),
-    ("/loop", "Start or inspect a Ralph loop"),
-    ("/cancel-loop", "Cancel the active Ralph loop"),
-    ("/swarm", "Delegate an objective to parallel subagents"),
-    ("/config", "Change live settings"),
-    ("/theme", "Switch dark, light, or auto theme"),
-    ("/feedback", "Send product feedback"),
-    ("/remote", "Share this session live, or pair a phone: on, off, qr, url, status"),
-    ("/mode", "Set auto, plan, or build mode"),
-    ("/plan", "Toggle plan pin"),
-    ("/thinking", "Show or hide the model's reasoning"),
-    ("/effort", "Set reasoning effort: minimal, low, medium, high, xhigh, max, auto"),
-    ("/btw", "Note a side question without derailing the running turn"),
-    ("/model", "Inspect or switch model"),
-    ("/models", "Browse every model and assign the roles they serve"),
-    ("/profile", "List, switch, rename, or delete a provider profile"),
-    ("/providers", "Pin which upstream providers may serve the model"),
-    ("/usage", "View local usage and activity"),
-    ("/sessions", "Browse saved sessions"),
+    ("/loop", "Repeat a prompt until it prints a completion word"),
+    ("/btw", "Note something for the running turn without derailing it"),
     ("/new", "Start a new session"),
-    ("/fork", "Fork the session — conversation continues in a new one"),
-    ("/compact", "Compact conversation context"),
-    ("/repair", "Fix corrupted session history"),
-    ("/papercuts", "List or delete recorded lessons"),
-    ("/memories", "List or delete stored memories"),
-    ("/harness", "Inspect the continual harness, its log, and revert"),
-    ("/refine", "Update the harness from this conversation now"),
-    ("/skills", "Browse Agent Skills"),
-    ("/plugins", "Inspect plugins"),
-    ("/mcps", "Inspect MCP tools"),
-    ("/tools", "List all active tools"),
-    ("/help", "Show shortcuts and commands"),
+    ("/fork", "Continue this conversation in a new session"),
+    ("/resume", "Resume a saved session"),
+    ("/rename", "Rename this session"),
+    ("/compact", "Compact the conversation's context"),
+    ("/repair", "Fix session history a provider keeps rejecting"),
+    ("/memory", "What Abacus learned here: list, forget, log, revert, refine"),
+    ("/tools", "Tools, skills, plugin commands and MCP tools"),
+    ("/usage", "Local usage and activity"),
+    ("/theme", "Switch theme, or export one to edit"),
+    ("/remote", "Share this session live, or pair a phone: on, off, qr, url, status"),
+    ("/feedback", "Send product feedback"),
+    ("/help", "Keys and commands"),
     ("/quit", "Exit Abacus"),
-    ("/exit", "Exit Abacus"),
 ];
 
 /// Clickable regions recorded while drawing, so the mouse handler can act on
@@ -105,6 +93,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 struct Hits {
     completion: Vec<(Rect, usize)>,
     config: Vec<(Rect, usize)>,
+    config_tabs: Vec<(Rect, usize)>,
     picker: Vec<(Rect, usize)>,
     transcript: Vec<(Rect, usize)>,
     hub_scope: Vec<(Rect, usize)>,
@@ -115,6 +104,7 @@ impl Hits {
     fn clear(&mut self) {
         self.completion.clear();
         self.config.clear();
+        self.config_tabs.clear();
         self.picker.clear();
         self.transcript.clear();
         self.hub_scope.clear();
@@ -130,22 +120,8 @@ enum TurnOutcome {
     Interrupted,
 }
 
-/// A provider mid-creation: which profile was added, and what to restore if
-/// the user backs out before giving it a model.
-struct PendingProvider {
-    profile: String,
-    previous: String,
-}
-
-/// Picker values that mean "not a real row" — they open a further step rather
-/// than selecting something.
-const NEW_PROVIDER_SENTINEL: &str = "\u{0}new-provider";
-
-const CUSTOM_PROVIDER_SENTINEL: &str = "\u{0}custom-provider";
-
-/// Prefix marking a provider-picker row that selects a scripted endpoint from
-/// ~/.abacus/endpoints; the rest of the value is the endpoint name.
-const ENDPOINT_SENTINEL_PREFIX: &str = "\u{0}endpoint:";
+/// The provider picker's value for "a custom endpoint", which no preset has.
+const CUSTOM_PROVIDER: &str = "\u{0}custom";
 
 /// Fingerprint deciding whether the memoised transcript is still valid: the
 /// entries revision, the render width, and the spinner phase. The phase only
@@ -230,12 +206,11 @@ impl PendingUserQuestion {
 }
 
 /// What accepting a picker row does. The picker itself is a plain list; this
-/// is how one list widget serves sessions, profiles, and providers without
-/// three near-identical modals.
+/// is how one list widget serves sessions and provider presets without two
+/// near-identical modals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerAction {
     ResumeSession,
-    SwitchProfile,
     AddProvider,
 }
 
@@ -244,13 +219,6 @@ struct Picker {
     items: Vec<(String, String)>,
     selected: usize,
     action: PickerAction,
-    /// Inline prompt on top of the list (profile rename / delete confirm).
-    prompt: Option<PickerPrompt>,
-}
-
-enum PickerPrompt {
-    Rename { id: String, input: InputBuffer },
-    ConfirmDelete { id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,18 +273,53 @@ struct UsageStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigKey {
+    // Profile tab: the active profile.
     Profile,
+    ProfileName,
     Model,
-    AuxModel,
     Effort,
-    BaseUrl,
-    Protocol,
-    Providers,
-    Fallbacks,
-    ApiKey,
-    Permission,
     ContextWindow,
     MaxOutput,
+    ToolFormat,
+    AuxModel,
+    ReviewModel,
+    SubagentModel,
+    CompactionModel,
+    Upstreams,
+    Fallbacks,
+    // A provider, in the Providers tab's editor.
+    ProviderName,
+    ProviderUrl,
+    ProviderProtocol,
+    ApiKey,
+    ApiKeyEnv,
+    AuthHeader,
+    AuthFormat,
+    TokenCommand,
+    Headers,
+    Body,
+    RemoveFields,
+    SystemPrefix,
+    RequestUrl,
+    ModelsUrl,
+    ExtraModels,
+    Discover,
+    RemoveProvider,
+    // Agent tab.
+    Mode,
+    MaxSteps,
+    ToolOutputLimit,
+    ProjectTrust,
+    TokenCompression,
+    OneStream,
+    TraceLogging,
+    // Search tab.
+    SearchEnabled,
+    SearchBackend,
+    SearchInstanceUrl,
+    SearchApiKeyEnv,
+    SearchSharedInstance,
+    // Interface tab.
     Theme,
     Glyphs,
     ContentWidth,
@@ -327,19 +330,8 @@ enum ConfigKey {
     Animations,
     Tooltips,
     DraftReplies,
-    TokenCompression,
-    OneStream,
     CheckUpdates,
-    SafetyModel,
-    TraceLogging,
-    MaxSteps,
-    ToolOutputLimit,
-    ProjectTrust,
-    SearchEnabled,
-    SearchBackend,
-    SearchInstanceUrl,
-    SearchApiKeyEnv,
-    SearchSharedInstance,
+    // Privacy tab.
     FeedbackEnabled,
     FeedbackDiagnostics,
     FeedbackEndpoint,
@@ -355,18 +347,27 @@ const fn toggled(key: ConfigKey, label: &'static str, help: &'static str) -> Set
     Setting { key, label, typed: false, help }
 }
 
+/// Every setting row there is, in every tab and the provider editor.
 fn settings() -> impl Iterator<Item = &'static Setting> {
-    SETTINGS.iter().flat_map(|(_, rows)| rows.iter())
+    SETTINGS.iter().flat_map(|(_, rows)| rows.iter()).chain(PROVIDER_FIELDS.iter())
 }
 
-/// The setting for `key`, and where the cursor has to be to select it.
-fn setting(key: ConfigKey) -> (usize, &'static Setting) {
-    settings().enumerate().find(|(_, setting)| setting.key == key).expect("every key has a row")
+/// The row for `key`.
+fn setting(key: ConfigKey) -> &'static Setting {
+    settings().find(|setting| setting.key == key).expect("every key has a row")
 }
 
 struct ConfigPanel {
+    /// Which tab of [`SETTINGS`] is showing.
+    tab: usize,
     selected: usize,
     editing: Option<(ConfigKey, InputBuffer)>,
+    /// The provider open in the Providers tab's editor, by id. `None` lists
+    /// them.
+    provider: Option<String>,
+    /// The provider editor's delete row has been pressed once; a second press
+    /// removes the provider and its profiles.
+    confirm_remove: bool,
 }
 
 struct RawConfigEditor {
@@ -388,9 +389,9 @@ const FEEDBACK_CATEGORIES: &[&str] = &["General", "Bug", "Feature", "Performance
 enum Background {
     /// A predicted next message for the empty composer.
     Draft(Option<String>),
-    /// A profile's model list, for the `/models` hub.
+    /// A provider's model list, for the `/profile` hub and the config panel.
     Catalog {
-        profile: String,
+        provider: String,
         result: Result<Vec<crate::model_info::ModelCard>, String>,
     },
     Feedback(Result<crate::feedback::FeedbackReceipt, String>),
@@ -453,8 +454,6 @@ struct App {
     state: SessionState,
     papercuts: crate::papercuts::PapercutStore,
     hive: crate::hive::HiveHandle,
-    /// Mode-discipline counts behind the escalating reminder.
-    modes: crate::modes::ModeCoach,
     /// Whether Abacus is holding the mouse. Holding it enables wheel scrolling
     /// and clickable rows but takes click-drag away from the terminal on
     /// terminals without a Shift-drag bypass, which is how you select and copy
@@ -487,8 +486,8 @@ struct App {
     /// Body rows the last frame had room for. Keyboard paging needs the
     /// measure the renderer arrived at, and only the renderer knows it.
     hub_rows: std::cell::Cell<usize>,
-    /// Model catalogs by profile id, fetched on first visit and kept for the
-    /// session so reopening the hub is instant.
+    /// Model lists by provider id: the cached ones at first, replaced by what
+    /// the provider says once a visit refreshes a stale one.
     catalogs: HashMap<String, crate::model_hub::Catalog>,
     /// Where the pointer last was, so a row under it can paint a hover band.
     /// Cleared on any keystroke: once you are back on the keyboard, a stale
@@ -518,7 +517,14 @@ struct App {
     refining: bool,
     /// Safety verdicts, kept for the session rather than the turn.
     safety: crate::safety::SafetyCache,
-    allow_mutations: Arc<AtomicBool>,
+    /// YOLO when set, AUTO otherwise — for this session, starting from the
+    /// configured default. Shared with the running turn, so Shift+Tab takes
+    /// effect at its next tool call.
+    yolo: Arc<AtomicBool>,
+    /// Whether the session runs the default profile and follows changes to
+    /// it. False for an endpoint given on the command line, until a profile
+    /// is picked.
+    follows_profile: bool,
     receiving_delta: bool,
     /// When the in-flight tool call started, so the settled row can report how
     /// long it took.
@@ -560,10 +566,6 @@ struct App {
     /// Raised to ask a running turn to stop. The turn finishes reporting what
     /// it did instead of being killed, which is what kept its tool results.
     cancel: Arc<AtomicBool>,
-    /// A provider added but not yet given a model. Abandoning the prompt rolls
-    /// it back rather than leaving the session pointed at a profile that
-    /// cannot run.
-    pending_provider: Option<PendingProvider>,
     /// Selected transcript block, when the user is navigating the scrollback.
     /// `None` means the transcript is just being read, not steered.
     cursor: Option<usize>,
@@ -603,8 +605,6 @@ struct App {
     input_history_index: Option<usize>,
     show_help: bool,
     normal_prefix: Option<char>,
-    agent_mode: AgentMode,
-    resolved_agent_mode: Option<AgentMode>,
     /// Shared session token ledger; reused when the provider is rebuilt on a
     /// model switch so the running totals survive.
     tokens: Arc<crate::provider::TokenLedger>,
@@ -962,8 +962,8 @@ async fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut
                         if !form.sending {
                             form.input.insert_str(&text);
                         }
-                    } else if let Some(input) = app.picker.as_mut().and_then(|picker| match picker.prompt.as_mut() {
-                        Some(PickerPrompt::Rename { input, .. }) => Some(input),
+                    } else if let Some(input) = app.model_hub.as_mut().and_then(|hub| match hub.prompt.as_mut() {
+                        Some(crate::model_hub::HubPrompt::Rename { input, .. }) => Some(input),
                         _ => None,
                     }) {
                         input.insert_str(&text);
@@ -1040,7 +1040,7 @@ fn explore_verb(name: &str) -> &'static str {
         "list_files" => "list",
         "glob" => "glob",
         "grep" => "grep",
-        "tool_search" | "skill_search" => "search",
+        "tool_search" => "search",
         "git_status" => "git status",
         "git_diff" => "git diff",
         "git_log" => "git log",
@@ -1153,35 +1153,20 @@ impl App {
         session_store: Option<SessionStore>,
         services: Arc<AgentServices>,
     ) -> Result<Self> {
-        if let Some(profile) = settings.profiles.get_mut(&config.profile) {
-            profile.model = config.model.clone();
-            profile.base_url = config.base_url.clone();
-            profile.protocol = config.protocol;
-        } else {
-            settings.profiles.insert(
-                config.profile.clone(),
-                crate::config::ProviderProfile {
-                    name: "Current CLI overrides".to_owned(),
-                    base_url: config.base_url.clone(),
-                    model: config.model.clone(),
-                    protocol: config.protocol,
-                    ..Default::default()
-                },
-            );
+        // `--profile` picks the session's profile; a switch in /profile also
+        // makes the one switched to the default.
+        let follows_profile = settings.profiles.contains_key(&config.profile);
+        if follows_profile {
+            settings.default_profile = config.profile.clone();
         }
-        settings.default_profile = config.profile.clone();
         settings.agent.max_steps = config.max_steps;
         settings.agent.tool_output_limit = config.tool_output_limit;
-        if config.yes {
-            settings.ui.permission_mode = PermissionMode::AlwaysApprove;
-        }
         let initial_tokens = session.as_ref().map(|session| session.tokens_used).unwrap_or(0);
         let session_initial_active_secs = session.as_ref().map(|session| session.active_secs).unwrap_or(0);
         let tokens = Arc::new(crate::provider::TokenLedger::new(initial_tokens));
         let provider = Provider::with_tokens(&config, tokens.clone())?;
-        let aux_provider = provider.for_role(config.aux_model.as_deref());
+        let aux_provider = provider.for_role(config.roles.aux.as_ref());
         let hive = crate::hive::HiveHandle::load(config.paths.hive_file.clone());
-        let modes = crate::modes::ModeCoach::load(config.paths.modes_file.clone());
         let ralph_loop = session.as_ref().and_then(|session| session.ralph_loop.clone());
         let messages =
             session.as_ref().map(|value| value.messages.clone()).unwrap_or_else(|| initial_messages(&config.workspace));
@@ -1212,10 +1197,19 @@ impl App {
                 }
             });
         }
-        let yes = config.yes;
+        let yolo = config.permission == Permission::Yolo;
         let branch = git_branch(&config.workspace);
         let papercuts = crate::papercuts::PapercutStore::load(config.paths.papercuts_file.clone(), &config.workspace);
         let state = SessionState::open(&config, session.as_ref(), session_key(session.as_ref()));
+        // The model lists on disk, so pickers open on something at once.
+        let catalogs = settings
+            .providers
+            .keys()
+            .filter_map(|id| {
+                let catalog = crate::providers::cached_catalog(&config.paths, id)?;
+                Some((id.clone(), crate::model_hub::Catalog::Ready(catalog.models)))
+            })
+            .collect();
         if let Some(store) = &session_store
             && let Ok(summaries) = store.list()
         {
@@ -1261,7 +1255,6 @@ impl App {
             state,
             papercuts,
             hive,
-            modes,
             mouse_captured: true,
             hive_overlay: false,
             hive_scroll: 0,
@@ -1286,7 +1279,7 @@ impl App {
             feedback_form: None,
             model_hub: None,
             hub_rows: std::cell::Cell::new(1),
-            catalogs: HashMap::new(),
+            catalogs,
             pointer: None,
             remote: None,
             remote_generation: 0,
@@ -1302,7 +1295,8 @@ impl App {
             services_reloading: false,
             refining: false,
             safety: crate::safety::SafetyCache::default(),
-            allow_mutations: Arc::new(AtomicBool::new(yes)),
+            yolo: Arc::new(AtomicBool::new(yolo)),
+            follows_profile,
             receiving_delta: false,
             tool_started: None,
             turn_started: None,
@@ -1318,7 +1312,6 @@ impl App {
             draft: None,
             draft_task: None,
             cancel: Arc::new(AtomicBool::new(false)),
-            pending_provider: None,
             hits: RefCell::new(Hits::default()),
             cursor: None,
             cursor_pending: false,
@@ -1337,8 +1330,6 @@ impl App {
             input_history_index: None,
             show_help: false,
             normal_prefix: None,
-            agent_mode: AgentMode::Auto,
-            resolved_agent_mode: None,
             tokens,
             session_initial_active_secs,
             started: Instant::now(),
@@ -1632,11 +1623,6 @@ impl App {
                     self.group_exploration();
                     self.status = "thinking".to_owned();
                 }
-                AgentEvent::ModeChanged { mode, reason } => {
-                    self.resolved_agent_mode = Some(mode);
-                    self.say(format!("{} mode — {reason}", mode.label()));
-                    self.status = format!("{} mode", mode.label().to_ascii_lowercase());
-                }
                 AgentEvent::Done { messages, reason } => {
                     let assistant_output = crate::text::last_reply(&messages).to_owned();
                     self.messages = messages;
@@ -1768,7 +1754,6 @@ impl App {
         self.running = None;
         self.turn_started = None;
         self.tool_started = None;
-        self.resolved_agent_mode = None;
         self.receiving_delta = false;
         self.receiving_thinking = false;
     }
@@ -2022,24 +2007,18 @@ impl App {
         self.receiving_delta = false;
         self.follow = true;
         self.status = "connecting".to_owned();
-        self.resolved_agent_mode = Some(self.agent_mode);
 
         let provider = self.provider.clone();
         let messages = self.messages.clone();
-        let agent_mode = self.agent_mode;
-        let allow_mutations = self.allow_mutations.clone();
         let events = self.event_tx.clone();
         let options = TurnOptions {
             safety: self.safety.clone(),
-            safety_uses_main: self.settings.ui.safety_uses_main,
             trace: self.trace.clone(),
             cancel: self.cancel.clone(),
-            mode: agent_mode,
-            allow_mutations,
+            yolo: self.yolo.clone(),
             session_id: self.session.as_ref().map(|session| session.id.to_string()),
             papercuts: self.papercuts.clone(),
             hive: self.hive.clone(),
-            modes: self.modes.clone(),
             ..self.state.turn(&self.config, self.services.clone())
         };
         self.running = Some(tokio::spawn(async move {
@@ -2062,7 +2041,7 @@ impl App {
         // sending anything doesn't leave an empty session behind.
         if self.session.is_none() {
             self.session = store
-                .create(self.config.profile.clone(), self.config.model.clone(), self.messages.clone())
+                .create(self.config.profile.clone(), self.config.model_ref(), self.messages.clone())
                 .map_err(|error| self.status = format!("session create failed: {error}"))
                 .ok();
             // Open from here on, so sync leaves the file to this process.
@@ -2160,10 +2139,9 @@ impl App {
         if let Some(next) = &session {
             crate::sync::session_opened(next.id);
         }
-        // "Always" approves for the session it was given in, whether it came
-        // from the keyboard or a phone; another session asks again.
+        // YOLO switched on for one session does not carry into another.
         if !same {
-            self.allow_mutations.store(self.config.yes, Ordering::Relaxed);
+            self.yolo.store(self.settings.agent.mode == Permission::Yolo, Ordering::Relaxed);
         }
         // Traces are keyed by session id: the next persist opens the right one
         // instead of appending this session's calls to the previous trace.
@@ -2216,7 +2194,7 @@ impl App {
                 return;
             };
             let mut fork =
-                match store.create(self.config.profile.clone(), self.config.model.clone(), self.messages.clone()) {
+                match store.create(self.config.profile.clone(), self.config.model_ref(), self.messages.clone()) {
                     Ok(fork) => fork,
                     Err(error) => {
                         self.status = format!("fork failed: {error}");
@@ -2270,7 +2248,6 @@ impl App {
                 self.picker = Some(Picker {
                     title: "sessions".to_owned(),
                     action: PickerAction::ResumeSession,
-                    prompt: None,
                     items: sessions
                         .into_iter()
                         .take(50)
@@ -2417,10 +2394,23 @@ impl App {
                 Background::Draft(draft) => {
                     self.draft = draft.filter(|_| self.input.is_empty() && self.running.is_none());
                 }
-                Background::Catalog { profile, result } => {
+                Background::Catalog { provider, result } => {
                     use crate::model_hub::Catalog;
-                    let state = result.map_or_else(Catalog::Failed, Catalog::Ready);
-                    self.catalogs.insert(profile, state);
+                    // A failed refresh keeps the list that was showing: an
+                    // old list beats an error where models were.
+                    match result {
+                        Ok(cards) => {
+                            self.catalogs.insert(provider, Catalog::Ready(cards));
+                        }
+                        Err(error) => {
+                            if !matches!(self.catalogs.get(&provider), Some(Catalog::Ready(cards)) if !cards.is_empty())
+                            {
+                                self.catalogs.insert(provider, Catalog::Failed(error));
+                            } else {
+                                self.status = format!("could not refresh {provider}'s models: {error}");
+                            }
+                        }
+                    }
                 }
                 // A notice, not a prompt: nothing is downloaded or blocked.
                 Background::Update(available) => self.say(available.message()),
@@ -2582,6 +2572,7 @@ impl App {
     }
 
     fn send_remote_snapshot(&mut self, reason: SnapshotReason) {
+        let mode = self.mode().label().to_ascii_lowercase();
         let Some(bridge) = &mut self.remote else {
             return;
         };
@@ -2590,8 +2581,8 @@ impl App {
             id: bridge.session_id().to_owned(),
             title: session.map(|session| session.title.clone()).unwrap_or_default(),
             workspace: self.config.workspace.display().to_string(),
-            model: self.config.model.clone(),
-            mode: self.agent_mode.label().to_ascii_lowercase(),
+            model: self.config.model_ref(),
+            mode,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             started_at: session.map(|session| session.created_at.to_rfc3339()).unwrap_or_default(),
         };

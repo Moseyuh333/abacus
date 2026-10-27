@@ -33,7 +33,7 @@ pub mod protocol;
 pub mod qr;
 
 use crate::{
-    agent::{AgentEvent, AgentMode, ApprovalDecision, DoneReason as TurnEnd},
+    agent::{AgentEvent, ApprovalDecision, DoneReason as TurnEnd},
     config::AbacusPaths,
     provider::TokenUsage,
     session::Session,
@@ -380,7 +380,6 @@ impl Bridge {
             AgentEvent::Approval(_) | AgentEvent::UserQuestion(_) => self.close_text(),
             AgentEvent::ToolStarted { name, summary } => self.tool_started(name, summary, entry),
             AgentEvent::ToolFinished { name, output } => self.tool_finished(name, output, entry),
-            AgentEvent::ModeChanged { mode, reason } => self.mode_changed(*mode, reason),
             AgentEvent::Notice(text) => self.notice(text, Level::Info),
             AgentEvent::TraceFailed { error } => {
                 self.notice(&format!("Trace capture stopped: {error}"), Level::Warning)
@@ -455,7 +454,7 @@ impl Bridge {
         self.set_status(State::Thinking, label);
     }
 
-    pub fn mode_changed(&mut self, mode: AgentMode, reason: &str) {
+    pub fn mode_changed(&mut self, mode: crate::config::Permission, reason: &str) {
         let mode = mode.label().to_ascii_lowercase();
         self.emit(Outbound::Mode(ModeFrame { mode, reason: protocol::clip_text(reason, MAX_ERROR).0 }));
     }

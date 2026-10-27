@@ -173,11 +173,6 @@ impl HandleStore {
     pub fn tool_specs() -> Vec<Value> {
         vec![
             function(
-                "handle_list",
-                "List the large payloads bound in this session, with their sizes and shapes.",
-                json!({"type":"object","properties":{}}),
-            ),
-            function(
                 "handle_info",
                 "Describe one bound payload — size, line count, detected shape, and a short head and tail sample — without pulling the whole thing into context.",
                 json!({
@@ -234,7 +229,6 @@ impl HandleStore {
     /// model calls, so it lives in [`recurse`].
     pub fn execute(&self, tool: &str, arguments: &str) -> Option<String> {
         let result = match tool {
-            "handle_list" => Ok(self.list()),
             "handle_info" => self.info(arguments),
             "handle_slice" => self.slice(arguments),
             "handle_grep" => self.grep(arguments),
@@ -264,8 +258,10 @@ impl HandleStore {
         lines.join("\n")
     }
 
+    /// The handle `id` names, or an error that lists the ones that exist —
+    /// the only way the model learns it has the wrong name.
     fn handle_from(&self, id: &str) -> Result<Handle> {
-        self.get(id).with_context(|| format!("no bound payload `{id}` — use handle_list to see what exists"))
+        self.get(id).with_context(|| format!("no bound payload `{id}`. {}", self.list()))
     }
 
     fn info(&self, arguments: &str) -> Result<String> {
@@ -591,7 +587,7 @@ mod tests {
     fn a_missing_handle_says_how_to_find_the_right_one() {
         let (store, _) = store_with("x");
         let output = store.execute("handle_info", &json!({"id":"nope"}).to_string()).unwrap();
-        assert!(output.contains("handle_list"), "{output}");
+        assert!(output.contains("Bound payloads:") && output.contains("$h1"), "{output}");
     }
 
     #[test]
@@ -662,12 +658,12 @@ mod tests {
         let store = HandleStore::default();
         store.bind("grep: TODO", log(10));
         store.bind("read_file: notes.md", log(20));
-        let listing = store.execute("handle_list", "{}").unwrap();
+        let listing = store.list();
         assert!(listing.contains("$h1"), "{listing}");
         assert!(listing.contains("$h2"), "{listing}");
         assert!(listing.contains("notes.md"), "{listing}");
 
-        assert!(HandleStore::default().execute("handle_list", "{}").unwrap().contains("No payloads"));
+        assert!(HandleStore::default().list().contains("No payloads"));
     }
 
     #[test]

@@ -44,7 +44,7 @@ impl Project {
         Config {
             profile: "test".into(),
             max_steps: 4,
-            yes: true,
+            permission: abacus_agent::config::Permission::Yolo,
             no_session: true,
             ..Config::for_endpoint(
                 self.workspace.clone(),

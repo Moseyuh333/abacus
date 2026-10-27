@@ -60,7 +60,7 @@ pub async fn run(
     }
     let heartbeat = reporter.as_ref().map(|reporter| reporter.heartbeat(activity_session.clone(), tokens.clone()));
     let (events, mut receiver) = mpsc::unbounded_channel();
-    let allow = Arc::new(AtomicBool::new(config.yes));
+    let yolo = Arc::new(AtomicBool::new(config.permission == crate::config::Permission::Yolo));
     // Keyed by the session id so promotion counts distinct sessions rather
     // than distinct processes.
     let state = SessionState::open(&config, session.as_ref(), activity_session.clone());
@@ -78,7 +78,7 @@ pub async fn run(
         && session.is_none()
         && let Some(store) = &store
     {
-        match store.create(config.profile.clone(), config.model.clone(), final_messages.clone()) {
+        match store.create(config.profile.clone(), config.model_ref(), final_messages.clone()) {
             Ok(created) => session = Some(created),
             Err(error) => eprintln!("warning: could not create session — {error:#}"),
         }
@@ -115,7 +115,7 @@ pub async fn run(
     }
 
     let start = |messages: Vec<Value>| {
-        let options = turn_options(&config, &allow, &services, &state, session_id.clone(), trace.clone());
+        let options = turn_options(&config, &yolo, &services, &state, session_id.clone(), trace.clone());
         tokio::spawn(run_turn(provider.clone(), messages, options, events.clone()))
     };
     let mut current_task = failure.is_none().then(|| start(final_messages.clone()));
@@ -135,12 +135,14 @@ pub async fn run(
                     OutputFormat::Json => {}
                 }
             }
+            // AUTO asks only when its reviewer could not decide, and there is
+            // nobody here to answer.
             AgentEvent::Approval(request) => {
                 let _ = request.respond.send(ApprovalDecision::Reject);
                 let (tool, summary) = (request.tool, request.summary);
                 announce(
                     format,
-                    &format!("rejected {tool}: {summary}; use --always-approve for headless mutations"),
+                    &format!("not run, the safety review could not decide: {tool}: {summary} (--yolo runs everything)"),
                     json!({"type": "approval.rejected", "tool": tool, "summary": summary}),
                 )?;
             }
@@ -167,15 +169,6 @@ pub async fn run(
                     emit(json!({"type": "tool.finished", "tool": name, "output": output}))?;
                 }
             }
-            AgentEvent::ModeChanged { mode, reason } => announce(
-                format,
-                &format!("mode: {} · {reason}", mode.label()),
-                json!({
-                    "type": "mode.changed",
-                    "mode": mode.label().to_ascii_lowercase(),
-                    "reason": reason
-                }),
-            )?,
             AgentEvent::Done { messages, .. } => {
                 final_messages = messages;
                 let Some(state) = ralph.as_mut() else { break };
@@ -230,7 +223,7 @@ pub async fn run(
             state: &state,
             ralph: &ralph,
             profile: &config.profile,
-            model: &config.model,
+            model: &config.model_ref(),
             tokens_used: provider.tokens_used(),
             active_secs: started.elapsed().as_secs(),
         },
@@ -348,17 +341,17 @@ fn persist_session(
 
 fn turn_options(
     config: &Config,
-    allow: &Arc<AtomicBool>,
+    yolo: &Arc<AtomicBool>,
     services: &Arc<AgentServices>,
     state: &SessionState,
     session_id: Option<String>,
     trace: Option<crate::sft::TraceWriter>,
 ) -> TurnOptions {
-    // A headless run defaults to AUTO so the model chooses; `--mode` pins it,
-    // which is what makes a read-only CI check expressible.
+    // AUTO unless `--yolo`: what the reviewer clears runs, the rest is
+    // refused, and nothing waits on a person who is not there.
     TurnOptions {
         trace,
-        allow_mutations: allow.clone(),
+        yolo: yolo.clone(),
         session_id,
         ..state.turn(config, services.clone()).with_workspace_stores(config)
     }

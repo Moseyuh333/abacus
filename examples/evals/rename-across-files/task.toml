@@ -6,4 +6,4 @@ repository — the definition, every call site, and the documentation. \
 """
 max_steps = 30
 timeout_seconds = 240
-mode = "build"
+mode = "yolo"

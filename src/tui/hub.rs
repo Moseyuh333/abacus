@@ -1,36 +1,52 @@
-//! The `/models` hub: a sidebar of scopes beside a searchable model list.
+//! The `/profile` hub: the profiles, and every provider's searchable model
+//! list, in one surface.
 
 use super::*;
 
-/// The `/models` hub: a sidebar of scopes beside a searchable model list.
+/// The `/profile` hub: a sidebar of scopes beside a list.
 ///
 /// Both columns live inside one bordered surface, joined by `┬`/`┴` junctions
 /// punched into the border after the block is drawn — ratatui has no notion of
 /// an interior rule, and drawing two blocks side by side would fence the
 /// columns apart instead of tying them together.
 pub(super) fn draw_model_hub(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    use crate::model_hub::{Catalog, Pane, Scope};
+    use crate::model_hub::{Pane, Pick, Scope};
     let Some(hub) = &app.model_hub else {
         return;
     };
-    let assigning = hub.assigning.as_deref();
-    let hints: &[(&str, &str)] = match (hub.pane, hub.current_scope(), assigning) {
-        (Pane::Sidebar, _, _) => &[("↑↓", "scope"), ("→ enter", "browse"), ("esc", "close")],
-        (Pane::Body, Scope::Roles, _) => {
-            &[("↑↓", "role"), ("enter", "assign"), ("del", "inherit"), ("←", "scopes"), ("esc", "close")]
-        }
-        (Pane::Body, _, Some(_)) => &[("↑↓", "select"), ("enter", "assign"), ("type", "filter"), ("esc", "back")],
-        (Pane::Body, _, None) => {
-            &[("↑↓", "select"), ("enter", "switch"), ("type", "filter"), ("←", "scopes"), ("esc", "close")]
-        }
+    let assigning = match &hub.pick {
+        Pick::Assign(role) => Some(crate::roles::role(role).map_or(role.as_str(), |role| role.label)),
+        Pick::Use => None,
+    };
+    let hints: &[(&str, &str)] = match (hub.pane, hub.current_scope(), assigning, hub.prompt.is_some()) {
+        (_, _, _, true) => &[("enter", "confirm"), ("esc", "cancel")],
+        (Pane::Sidebar, _, _, _) => &[("↑↓", "scope"), ("→ enter", "open"), ("esc", "close")],
+        (Pane::Body, Scope::Profiles, _, _) => &[
+            ("↑↓", "select"),
+            ("enter", "switch"),
+            ("e", "edit"),
+            ("r", "rename"),
+            ("d", "delete"),
+            ("n", "new"),
+            ("esc", "close"),
+        ],
+        (Pane::Body, _, Some(_), _) => &[("↑↓", "select"), ("enter", "assign"), ("type", "filter"), ("esc", "back")],
+        (Pane::Body, _, None, _) => &[
+            ("↑↓", "select"),
+            ("enter", "use"),
+            ("type", "filter"),
+            ("^R", "refresh"),
+            ("←", "scopes"),
+            ("esc", "close"),
+        ],
     };
     // Full-bleed rather than a centred card: this is a surface you go *to*,
     // and a floating panel with the composer showing around its edges reads as
     // a dialog you are meant to dismiss.
     let popup = area;
     let title = match assigning {
-        Some(role) => format!("MODELS · assign {role}"),
-        None => "MODELS".to_owned(),
+        Some(role) => format!("PROFILE · choose the {}", role.to_ascii_lowercase()),
+        None => "PROFILES".to_owned(),
     };
     // The hint strip is a row of the body, not a caption on the bottom border:
     // the column rule has to land somewhere, and it lands on the rule above
@@ -40,19 +56,20 @@ pub(super) fn draw_model_hub(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let footer = Rect { y: inner.bottom().saturating_sub(2), height: 2, ..inner };
 
     // Sidebar width is content-driven within bounds: wide enough for the
-    // longest profile name and its count, never wide enough to starve the
+    // longest provider name and its count, never wide enough to starve the
     // list of the columns that carry the metadata.
     let widest = hub
         .scopes
         .iter()
         .map(|scope| match scope {
-            Scope::Roles => "roles".len(),
+            Scope::Profiles => "profiles".len() + 4,
             Scope::Separator => 0,
-            Scope::Profile { name, .. } => name.chars().count() + 4,
+            Scope::Provider { name, .. } => name.chars().count() + 4,
+            Scope::AddProvider => "+ add provider".len(),
         })
         .max()
         .unwrap_or(0);
-    let sidebar_width = (widest as u16 + 8).clamp(16, 30);
+    let sidebar_width = (widest as u16 + 6).clamp(18, 30);
     let split = ui::split(columns, sidebar_width);
     let narrow = split.body.width < ui::MIN_SPLIT_BODY;
 
@@ -63,11 +80,19 @@ pub(super) fn draw_model_hub(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let body = if narrow { columns } else { split.body };
     match hub.current_scope() {
-        Scope::Roles => draw_hub_roles(frame, body, app, hub),
+        Scope::Profiles => draw_hub_profiles(frame, body, app, hub),
         Scope::Separator => {}
-        Scope::Profile { id, .. } => {
-            let catalog = app.catalogs.get(id).unwrap_or(&Catalog::Idle);
-            draw_hub_models(frame, body, app, hub, catalog);
+        Scope::Provider { id, .. } => {
+            let catalog = app.catalogs.get(id).unwrap_or(&crate::model_hub::Catalog::Idle);
+            draw_hub_models(frame, body, app, hub, id, catalog);
+        }
+        Scope::AddProvider => {
+            let lines = vec![
+                Line::from(fg("  Connect another provider: a preset, or any endpoint by URL.", text())),
+                Line::default(),
+                Line::from(fg("  Enter opens the list.", muted())),
+            ];
+            frame.render_widget(Paragraph::new(Text::from(lines)), body);
         }
     }
 }
@@ -95,6 +120,8 @@ pub(super) fn draw_hub_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, hub
     use crate::model_hub::{Catalog, Pane, Scope};
     let width = area.width as usize;
     let focused = hub.pane == Pane::Sidebar;
+    let active_provider =
+        app.settings.active_profile().map(|profile| profile.provider().to_owned()).unwrap_or_default();
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (index, scope) in hub.scopes.iter().enumerate() {
         if lines.len() >= area.height as usize {
@@ -111,19 +138,12 @@ pub(super) fn draw_hub_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, hub
         // always unambiguous which list the arrow keys are driving.
         let state = app.row_state(rect, selected && focused);
         let (label, annotation, mark) = match scope {
-            Scope::Roles => {
-                let (assigned, total) = app
-                    .settings
-                    .profiles
-                    .get(&app.settings.default_profile)
-                    .map(|profile| profile.assigned_roles())
-                    .unwrap_or((0, 0));
-                ("roles".to_owned(), format!("{assigned}/{total}"), None)
-            }
-            Scope::Profile { id, name } => {
+            Scope::Profiles => ("profiles".to_owned(), app.settings.profiles.len().to_string(), None),
+            Scope::Provider { id, name } => {
                 let catalog = app.catalogs.get(id).unwrap_or(&Catalog::Idle);
-                (name.clone(), catalog.annotation(), Some(*id == app.settings.default_profile))
+                (name.clone(), catalog.annotation(), Some(*id == active_provider))
             }
+            Scope::AddProvider => ("+ add provider".to_owned(), String::new(), None),
             Scope::Separator => unreachable!("handled above"),
         };
         let mut content: Vec<Span<'static>> = Vec::new();
@@ -145,46 +165,55 @@ pub(super) fn draw_hub_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, hub
 /// Rows reserved below a hub list for the rule and the detail block.
 pub(super) const HUB_DETAIL_ROWS: u16 = 3;
 
-pub(super) fn draw_hub_roles(frame: &mut Frame<'_>, area: Rect, app: &App, hub: &crate::model_hub::ModelHub) {
-    use crate::model_hub::Pane;
-    let rows = crate::model_hub::role_rows(&app.settings, &app.settings.default_profile);
+pub(super) fn draw_hub_profiles(frame: &mut Frame<'_>, area: Rect, app: &App, hub: &crate::model_hub::ModelHub) {
+    use crate::model_hub::{HubPrompt, Pane};
+    let rows = crate::model_hub::profile_rows(&app.settings);
     let width = area.width as usize;
     let focused = hub.pane == Pane::Body;
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let label_width = rows.iter().map(|row| row.label.chars().count()).max().unwrap_or(0).max(8);
-    for (index, row) in rows.iter().enumerate() {
+    if rows.is_empty() {
+        lines.push(Line::from(fg("  No profiles yet — pick a model in a provider's list to make one.", muted())));
+    }
+    let name_width = rows.iter().map(|row| row.name.chars().count()).max().unwrap_or(0).min(width / 2);
+    let visible = area.height.saturating_sub(HUB_DETAIL_ROWS) as usize;
+    app.hub_rows.set(visible.max(1));
+    for (index, row) in rows.iter().enumerate().skip(hub.window).take(visible) {
         let rect = Rect { y: area.y + lines.len() as u16, height: 1, ..area };
         app.hits.borrow_mut().hub_body.push((rect, index));
         let selected = index == hub.selected;
         let state = app.row_state(rect, selected && focused);
-        // An inherited model is shown, not hidden — you need to know what the
-        // role will actually use — but dimmed, so "chosen" and "came along for
-        // the ride" never look the same.
-        let model_style = if row.inherited {
-            Style::default().fg(rail())
-        } else if selected {
-            Style::default().fg(primary())
-        } else {
-            Style::default().fg(text())
-        };
-        let model = if row.inherited { format!("{} (inherited)", row.model) } else { row.model.clone() };
-        lines.push(ui::list_row(
-            state,
-            width,
-            vec![
-                Span::styled(format!("{:<label_width$}  ", row.label), emphasis(selected)),
-                Span::styled(ui::truncate(&model, width.saturating_sub(label_width + 5)), model_style),
-            ],
-        ));
+        let mut content = vec![ui::state_mark(row.active), Span::raw(" ")];
+        content.push(Span::styled(format!("{:<name_width$}", ui::truncate(&row.name, name_width)), emphasis(selected)));
+        // A profile named after its model says it once.
+        if row.model != row.name {
+            content.push(fg(format!("  {}", row.model), rail()));
+        }
+        if !row.settings.is_empty() {
+            content.push(fg(format!("  {}", row.settings), muted()));
+        }
+        lines.push(ui::list_row(state, width, ui::fit(content, width.saturating_sub(3))));
     }
-    app.hub_rows.set(area.height.saturating_sub(HUB_DETAIL_ROWS).max(1) as usize);
-    let detail = rows.get(hub.selected).map(|row| row.help.to_owned()).unwrap_or_default();
     while lines.len() + HUB_DETAIL_ROWS as usize <= area.height as usize {
         lines.push(Line::default());
     }
     lines.truncate(area.height.saturating_sub(2) as usize);
     lines.push(ui::rule(area.width));
-    lines.push(Line::from(fg(format!("  {}", ui::truncate(&detail, width.saturating_sub(2))), muted())));
+    lines.push(match &hub.prompt {
+        Some(HubPrompt::Rename { name, input }) => {
+            let field = Line::from(vec![fg(format!("  rename {name} → "), muted()), fg(input.text(), text())]);
+            let (_, column) = input.cursor_position();
+            let x = area.x + 2 + format!("rename {name} → ").chars().count() as u16 + column as u16;
+            frame.set_cursor_position((x.min(area.right().saturating_sub(1)), area.bottom().saturating_sub(1)));
+            field
+        }
+        Some(HubPrompt::ConfirmDelete { name }) => {
+            Line::from(vec![bold(format!("  delete {name}?"), danger()), fg("  enter confirms · esc cancels", muted())])
+        }
+        None => {
+            let model = rows.get(hub.selected).map(|row| row.model.as_str()).unwrap_or_default();
+            Line::from(fg(format!("  {}", ui::truncate(model, width.saturating_sub(2))), muted()))
+        }
+    });
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
@@ -193,9 +222,10 @@ pub(super) fn draw_hub_models(
     area: Rect,
     app: &App,
     hub: &crate::model_hub::ModelHub,
+    provider: &str,
     catalog: &crate::model_hub::Catalog,
 ) {
-    use crate::model_hub::{Catalog, Pane};
+    use crate::model_hub::{Catalog, Pane, Pick};
     let width = area.width as usize;
     let focused = hub.pane == Pane::Body;
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -209,12 +239,16 @@ pub(super) fn draw_hub_models(
     let list_height = area.height.saturating_sub(lines.len() as u16 + HUB_DETAIL_ROWS) as usize;
     app.hub_rows.set(list_height.max(1));
     let matched = crate::model_hub::filter(catalog.cards(), &hub.search);
-    let current = app
-        .settings
-        .profiles
-        .get(hub.scoped_profile().unwrap_or_default())
-        .map(|profile| profile.model.clone())
-        .unwrap_or_default();
+    // The model marked is the one Enter would replace: the role's when
+    // assigning, the session's otherwise.
+    let current = match &hub.pick {
+        Pick::Assign(role) => {
+            app.settings.active_profile().and_then(|profile| profile.resolve_role(role)).map(|r| r.model)
+        }
+        Pick::Use => Some(app.config.model_ref()),
+    }
+    .unwrap_or_default();
+    let has_profile = |model: &str| app.settings.profile_for(&crate::providers::join_ref(provider, model)).is_some();
 
     // Column widths are measured over the visible window alone, so scrolling
     // through a stretch of unpriced models closes the price column instead of
@@ -228,11 +262,13 @@ pub(super) fn draw_hub_models(
     if visible.is_empty() {
         lines.push(Line::from(fg(
             match catalog {
-                Catalog::Loading => "  Asking the endpoint what it serves…".to_owned(),
+                Catalog::Loading => "  Asking the provider what it serves…".to_owned(),
                 Catalog::Failed(error) => format!("  {error}"),
-                Catalog::Idle => "  Nothing loaded yet.".to_owned(),
+                Catalog::Idle => "  Nothing listed yet.".to_owned(),
                 Catalog::Ready(_) if !hub.search.is_empty() => "  Nothing matches that filter.".to_owned(),
-                Catalog::Ready(_) => "  The endpoint listed no models.".to_owned(),
+                Catalog::Ready(_) => {
+                    "  The provider lists no models. Add some under /config → Providers → Extra models.".to_owned()
+                }
             },
             if matches!(catalog, Catalog::Failed(_)) { danger() } else { muted() },
         )));
@@ -246,8 +282,8 @@ pub(super) fn draw_hub_models(
         let mut content: Vec<Span<'static>> = Vec::new();
         // The supplier is a dim prefix rather than an indent level: it groups
         // a long list visually while every id still starts at the same column.
-        if let Some(provider) = &card.provider {
-            content.push(fg(format!("{provider}/"), rail()));
+        if let Some(owner) = &card.provider {
+            content.push(fg(format!("{owner}/"), rail()));
         }
         content.push(Span::styled(
             card.short_id().to_owned(),
@@ -257,8 +293,10 @@ pub(super) fn draw_hub_models(
                 Modifier::empty()
             }),
         ));
-        if card.id == current {
+        if crate::providers::join_ref(provider, &card.id) == current {
             content.push(fg(format!(" {}", ui::glyphs().ok), success()));
+        } else if hub.pick == Pick::Use && has_profile(&card.id) {
+            content.push(fg(" ·profile", rail()));
         }
         let label_width = width.saturating_sub(metrics + 4);
         let mut row = ui::fit(content, label_width);
@@ -286,7 +324,10 @@ pub(super) fn hub_detail(card: Option<&crate::model_info::ModelCard>, width: usi
         return Line::default();
     };
     let mut facts = vec![card.name.clone().unwrap_or_else(|| card.id.clone())];
-    facts.push(card.context_label());
+    let context = card.context_label();
+    if !context.is_empty() {
+        facts.push(context);
+    }
     if let Some(output) = card.max_output_tokens {
         facts.push(format!("{} out", ui::format_count(output as u64)));
     }
@@ -310,26 +351,33 @@ pub(super) fn hub_detail(card: Option<&crate::model_info::ModelCard>, width: usi
     Line::from(spans)
 }
 
-/// Keys for the `/models` hub.
+/// Keys for the `/profile` hub.
 ///
-/// The body list is searchable, so plain letters type rather than navigate —
+/// A model list is searchable, so plain letters type rather than navigate —
 /// there is no vim-style `j`/`k` there, because a model list is something you
-/// filter your way through, not something you walk. The sidebar has no search
-/// and keeps them.
+/// filter your way through, not something you walk. The sidebar and the
+/// profiles list have no search and keep them; the profiles list also takes
+/// single-letter actions.
 pub(super) fn handle_model_hub_key(app: &mut App, key: KeyEvent) {
-    use crate::model_hub::{Pane, Scope};
+    use crate::model_hub::{HubPrompt, Pane, Pick, Scope};
     let Some(hub) = &app.model_hub else {
         return;
     };
+    if hub.prompt.is_some() {
+        return hub_prompt_key(app, key);
+    }
     let visible = app.hub_rows.get().max(1);
-    let in_roles = matches!(hub.current_scope(), Scope::Roles);
+    let scope = hub.current_scope().clone();
     let in_body = hub.pane == Pane::Body;
-    let len = if in_roles {
-        crate::roles::ROLES.len()
-    } else {
-        let cards = app.hub_catalog().cards();
-        crate::model_hub::filter(cards, &hub.search).len()
+    let in_profiles = matches!(scope, Scope::Profiles);
+    let in_models = matches!(scope, Scope::Provider { .. });
+    let len = match &scope {
+        Scope::Profiles => app.settings.profiles.len(),
+        Scope::Provider { .. } => crate::model_hub::filter(app.hub_catalog().cards(), &hub.search).len(),
+        _ => 0,
     };
+    let selected_profile =
+        || crate::model_hub::profile_rows(&app.settings).get(hub.selected).map(|row| row.name.clone());
 
     match key.code {
         KeyCode::Esc => {
@@ -337,18 +385,13 @@ pub(super) fn handle_model_hub_key(app: &mut App, key: KeyEvent) {
             if in_body && !hub.search.is_empty() {
                 hub.search.clear();
                 hub.reset_body();
-            } else if hub.assigning.is_some() {
-                // Back out of an assignment to the roles list it came from,
-                // rather than closing the surface out from under a half-made
-                // decision.
-                hub.assigning = None;
-                hub.scope = 0;
-                hub.reset_body();
+            } else if hub.pane == Pane::Body && hub.pick == Pick::Use && !in_profiles {
+                hub.pane = Pane::Sidebar;
             } else {
                 app.model_hub = None;
             }
         }
-        KeyCode::Tab | KeyCode::Right => {
+        KeyCode::Tab | KeyCode::Right if !in_body => {
             if let Some(hub) = app.model_hub.as_mut() {
                 hub.pane = Pane::Body;
             }
@@ -360,7 +403,7 @@ pub(super) fn handle_model_hub_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
-            let page = visible.max(1) as isize;
+            let page = visible as isize;
             let delta = match key.code {
                 KeyCode::Up => -1,
                 KeyCode::Down => 1,
@@ -375,25 +418,66 @@ pub(super) fn handle_model_hub_key(app: &mut App, key: KeyEvent) {
                 app.enter_hub_scope();
             }
         }
-        KeyCode::Char('k') | KeyCode::Char('j') if !in_body => {
+        KeyCode::Char('k') | KeyCode::Char('j') if !in_body || in_profiles => {
             let delta = if key.code == KeyCode::Char('k') { -1 } else { 1 };
-            app.model_hub.as_mut().expect("checked above").move_scope(delta);
-            app.enter_hub_scope();
+            let hub = app.model_hub.as_mut().expect("checked above");
+            if in_body {
+                hub.move_selection(delta, len, visible);
+            } else {
+                hub.move_scope(delta);
+                app.enter_hub_scope();
+            }
         }
         KeyCode::Enter => app.accept_model_hub(),
-        KeyCode::Backspace if in_body && !in_roles => {
+        KeyCode::Char('r') if ctrl(key, 'r') && in_models => {
+            if let Some(id) = app.model_hub.as_ref().and_then(|hub| hub.scoped_provider()).map(str::to_owned) {
+                app.refresh_catalog(&id, true);
+                app.status = format!("asking {id} for its models again");
+            }
+        }
+        KeyCode::Char('r') if in_body && in_profiles => {
+            if let Some(name) = selected_profile() {
+                let mut input = InputBuffer::new();
+                input.insert_str(&name);
+                app.model_hub.as_mut().expect("checked above").prompt = Some(HubPrompt::Rename { name, input });
+            }
+        }
+        KeyCode::Char('d') if in_body && in_profiles => {
+            if app.settings.profiles.len() <= 1 {
+                app.status = "that is the only profile; add another before deleting it".to_owned();
+            } else if let Some(name) = selected_profile() {
+                app.model_hub.as_mut().expect("checked above").prompt = Some(HubPrompt::ConfirmDelete { name });
+            }
+        }
+        KeyCode::Char('e') if in_body && in_profiles => {
+            if let Some(name) = selected_profile() {
+                if name != app.settings.default_profile || !app.follows_profile {
+                    app.switch_profile(&name);
+                }
+                app.model_hub = None;
+                app.open_config_tab(0);
+            }
+        }
+        KeyCode::Char('n') if in_body && in_profiles => {
+            let hub = app.model_hub.as_mut().expect("checked above");
+            if let Some(index) = hub.scopes.iter().position(|scope| matches!(scope, Scope::Provider { .. })) {
+                hub.scope = index;
+                hub.pane = Pane::Body;
+                hub.search.clear();
+                hub.reset_body();
+                app.enter_hub_scope();
+                app.status = "pick a model — Enter makes a profile for it".to_owned();
+            } else {
+                app.model_hub = None;
+                app.open_provider_picker();
+            }
+        }
+        KeyCode::Backspace if in_body && in_models => {
             let hub = app.model_hub.as_mut().expect("checked above");
             hub.search.pop();
             hub.reset_body();
         }
-        KeyCode::Delete if in_body && in_roles => {
-            let role =
-                crate::roles::ROLES.get(app.model_hub.as_ref().expect("checked above").selected).map(|role| role.id);
-            if let Some(role) = role {
-                app.assign_role(role, None);
-            }
-        }
-        KeyCode::Char(ch) if in_body && !in_roles && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(ch) if in_body && in_models && !key.modifiers.contains(KeyModifiers::CONTROL) => {
             let hub = app.model_hub.as_mut().expect("checked above");
             hub.search.push(ch);
             hub.reset_body();
@@ -402,110 +486,203 @@ pub(super) fn handle_model_hub_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Keys while the hub asks about a profile: a new name, or a yes to delete.
+fn hub_prompt_key(app: &mut App, key: KeyEvent) {
+    use crate::model_hub::HubPrompt;
+    let Some(prompt) = app.model_hub.as_mut().and_then(|hub| hub.prompt.as_mut()) else {
+        return;
+    };
+    match (prompt, key.code) {
+        (_, KeyCode::Esc) => {
+            if let Some(hub) = app.model_hub.as_mut() {
+                hub.prompt = None;
+            }
+        }
+        (HubPrompt::Rename { name, input }, KeyCode::Enter) => {
+            let (from, to) = (name.clone(), input.text());
+            if let Some(hub) = app.model_hub.as_mut() {
+                hub.prompt = None;
+            }
+            let result = app.settings.rename_profile(&from, &to).and_then(|to| {
+                app.save_and_apply_settings()?;
+                Ok(to)
+            });
+            match result {
+                Ok(to) => app.status = format!("renamed to {to}"),
+                Err(error) => app.status = format!("could not rename: {error:#}"),
+            }
+        }
+        (HubPrompt::Rename { input, .. }, _) => edit_buffer(input, key, false),
+        (HubPrompt::ConfirmDelete { name }, KeyCode::Enter | KeyCode::Char('y')) => {
+            let name = name.clone();
+            if let Some(hub) = app.model_hub.as_mut() {
+                hub.prompt = None;
+                hub.reset_body();
+            }
+            let result = app.settings.remove_profile(&name).and_then(|()| app.save_and_apply_settings());
+            match result {
+                Ok(()) => app.status = format!("profile {name} deleted"),
+                Err(error) => app.status = format!("could not delete: {error:#}"),
+            }
+        }
+        (HubPrompt::ConfirmDelete { .. }, KeyCode::Char('n')) => {
+            if let Some(hub) = app.model_hub.as_mut() {
+                hub.prompt = None;
+            }
+        }
+        _ => {}
+    }
+}
+
 impl App {
-    /// Open the model hub, scoped to the active profile's catalog.
+    /// The session's mode, as the shared flag has it now.
+    pub(super) fn mode(&self) -> Permission {
+        if self.yolo.load(Ordering::Relaxed) { Permission::Yolo } else { Permission::Auto }
+    }
+
+    /// Open the hub on the profiles.
     pub(super) fn open_model_hub(&mut self) {
         let mut hub = crate::model_hub::ModelHub::new(&self.settings);
-        // Land on the active profile rather than on the roles list: the
-        // common reason to open this is to change the model, and the roles
-        // view is one keypress up from there.
-        let active = self.settings.default_profile.clone();
+        hub.selected =
+            crate::model_hub::profile_rows(&self.settings).iter().position(|row| row.active).unwrap_or_default();
+        self.model_hub = Some(hub);
+    }
+
+    /// Open the hub to choose the model for `role` of the active profile.
+    pub(super) fn open_role_picker(&mut self, role: &str) {
+        self.model_hub = Some(crate::model_hub::ModelHub::assigning(&self.settings, role));
+        self.enter_hub_scope();
+    }
+
+    /// Open the hub on one provider's models, to run one of them.
+    pub(super) fn open_provider_models(&mut self, provider: &str) {
+        let mut hub = crate::model_hub::ModelHub::new(&self.settings);
         if let Some(index) = hub
             .scopes
             .iter()
-            .position(|scope| matches!(scope, crate::model_hub::Scope::Profile { id, .. } if *id == active))
+            .position(|scope| matches!(scope, crate::model_hub::Scope::Provider { id, .. } if id == provider))
         {
             hub.scope = index;
-            hub.pane = crate::model_hub::Pane::Body;
         }
         self.model_hub = Some(hub);
-        self.fetch_catalog(&active);
+        self.enter_hub_scope();
     }
 
-    /// Fetch a profile's model list, unless it is already loaded or in flight.
-    pub(super) fn fetch_catalog(&mut self, profile_id: &str) {
+    /// Ask `provider` for its models in the background. Unless `force`d, a
+    /// list already showing is only refreshed once the copy on disk is a day
+    /// old; one being fetched is never fetched twice.
+    pub(super) fn refresh_catalog(&mut self, provider: &str, force: bool) {
         use crate::model_hub::Catalog;
-        if matches!(self.catalogs.get(profile_id), Some(Catalog::Loading | Catalog::Ready(_))) {
-            return;
-        }
-        let Some(profile) = self.settings.profiles.get(profile_id) else {
+        let Some(config) = self.settings.providers.get(provider) else {
             return;
         };
-        let base_url = profile.base_url.clone();
-        if base_url.trim().is_empty() {
-            self.catalogs.insert(profile_id.to_owned(), Catalog::Failed("this profile has no base URL".to_owned()));
+        let showing = matches!(self.catalogs.get(provider), Some(Catalog::Ready(_)));
+        if matches!(self.catalogs.get(provider), Some(Catalog::Loading)) {
             return;
         }
-        // The key for the *active* profile is already resolved on `config`;
-        // any other profile's key comes from its own environment variable.
-        let api_key = if profile_id == self.settings.default_profile {
-            self.config.api_key.clone()
+        let stale =
+            crate::providers::cached_catalog(&self.config.paths, provider).is_none_or(|catalog| catalog.is_stale());
+        if !force && showing && !stale {
+            return;
+        }
+        // `try_current` rather than `spawn`: the app is also driven by
+        // synchronous tests, where there is no reactor to fetch on.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // The session's own provider is resolved already, with a key given on
+        // the command line where there was one.
+        let connection = if self.config.connection.provider == provider {
+            self.config.connection.clone()
         } else {
-            profile.api_key_env.as_deref().and_then(|name| std::env::var(name).ok())
+            crate::providers::Connection::resolve(provider, config, &self.credentials)
         };
-        self.catalogs.insert(profile_id.to_owned(), Catalog::Loading);
+        if !showing {
+            self.catalogs.insert(provider.to_owned(), Catalog::Loading);
+        }
+        let paths = self.config.paths.clone();
         let sender = self.background_tx.clone();
-        let profile = profile_id.to_owned();
-        tokio::spawn(async move {
-            let result = crate::setup::discover_model_cards(&base_url, api_key.as_deref())
+        let provider = provider.to_owned();
+        runtime.spawn(async move {
+            let result = crate::providers::catalog(&paths, &connection, force)
                 .await
+                .map(|catalog| catalog.models)
                 .map_err(|error| format!("{error:#}"));
-            let _ = sender.send(Background::Catalog { profile, result });
+            let _ = sender.send(Background::Catalog { provider, result });
         });
     }
 
-    /// The catalog for whichever profile the hub is scoped to.
+    /// The catalog for whichever provider the hub is scoped to.
     pub(super) fn hub_catalog(&self) -> &crate::model_hub::Catalog {
         const IDLE: crate::model_hub::Catalog = crate::model_hub::Catalog::Idle;
         self.model_hub
             .as_ref()
-            .and_then(|hub| hub.scoped_profile())
+            .and_then(|hub| hub.scoped_provider())
             .and_then(|id| self.catalogs.get(id))
             .unwrap_or(&IDLE)
     }
 
-    /// Assign `model` to `role` on the hub's scoped profile (or the active one
-    /// when the hub is on the roles view) and persist.
-    pub(super) fn assign_role(&mut self, role: &str, model: Option<String>) {
-        let profile_id = self
-            .model_hub
-            .as_ref()
-            .and_then(|hub| hub.scoped_profile())
-            .map(str::to_owned)
-            .unwrap_or_else(|| self.settings.default_profile.clone());
-        let Some(profile) = self.settings.profiles.get_mut(&profile_id) else {
-            self.status = format!("profile {profile_id} no longer exists");
-            return;
-        };
-        profile.set_role_model(role, model.clone());
+    /// Make sure the provider under the sidebar cursor has a list on the way.
+    pub(super) fn enter_hub_scope(&mut self) {
+        let provider = self.model_hub.as_ref().and_then(|hub| hub.scoped_provider()).map(str::to_owned);
+        if let Some(provider) = provider {
+            self.refresh_catalog(&provider, false);
+        }
+    }
+
+    /// Switch the session to profile `name`, and make it the default.
+    pub(super) fn switch_profile(&mut self, name: &str) {
+        let previous = std::mem::replace(&mut self.settings.default_profile, name.to_owned());
+        let followed = std::mem::replace(&mut self.follows_profile, true);
         match self.save_and_apply_settings() {
+            Ok(()) => self.status = format!("profile {name} · {}", self.config.model_ref()),
+            Err(error) => {
+                self.settings.default_profile = previous;
+                self.follows_profile = followed;
+                self.status = format!("could not switch profile: {error:#}");
+            }
+        }
+    }
+
+    /// Run `reference`: switch to the profile that runs it, or make one named
+    /// after it.
+    pub(super) fn use_model(&mut self, reference: &str) {
+        let (name, created) = match self.settings.profile_for(reference) {
+            Some(name) => (name.to_owned(), false),
+            None => (self.settings.add_profile(reference), true),
+        };
+        self.switch_profile(&name);
+        if created && self.config.profile == name {
+            self.status = format!("new profile {name} · /config tunes its limits");
+        } else if created {
+            self.settings.profiles.remove(&name);
+        }
+    }
+
+    /// Give `reference` to `role` of the active profile — `default` being the
+    /// profile's own model.
+    pub(super) fn assign_role(&mut self, role: &str, reference: Option<String>) {
+        let label = crate::roles::role(role).map_or(role, |role| role.label);
+        let result = self.active_profile_mut().map(|profile| profile.set_role_model(role, reference.clone()));
+        match result.and_then(|()| self.save_and_apply_settings()) {
             Ok(()) => {
-                let label = crate::roles::role(role).map_or(role, |role| role.label);
-                self.status = match model {
-                    Some(model) => format!("{label}: {model} · saved"),
-                    None => format!("{label}: cleared, inherits again"),
+                self.status = match reference {
+                    Some(model) => format!("{label}: {model}"),
+                    None => format!("{label}: inherits again"),
                 };
             }
             Err(error) => self.status = format!("could not save: {error:#}"),
         }
     }
 
-    /// Make sure the scope under the sidebar cursor has a catalog on the way.
-    pub(super) fn enter_hub_scope(&mut self) {
-        let profile = self.model_hub.as_ref().and_then(|hub| hub.scoped_profile()).map(str::to_owned);
-        if let Some(profile) = profile {
-            self.fetch_catalog(&profile);
-        }
-    }
-
-    /// Enter on the hub: step into a scope, open a role for assignment, or
-    /// commit the model under the cursor.
+    /// Enter on the hub: step into a scope, switch to a profile, or use or
+    /// assign the model under the cursor.
     pub(super) fn accept_model_hub(&mut self) {
-        use crate::model_hub::{Pane, Scope};
+        use crate::model_hub::{Pane, Pick, Scope};
         let Some(hub) = &self.model_hub else {
             return;
         };
-        if hub.pane == Pane::Sidebar {
+        if hub.pane == Pane::Sidebar && !matches!(hub.current_scope(), Scope::AddProvider) {
             if let Some(hub) = self.model_hub.as_mut() {
                 hub.pane = Pane::Body;
                 hub.reset_body();
@@ -513,52 +690,32 @@ impl App {
             self.enter_hub_scope();
             return;
         }
-        match hub.current_scope() {
+        match hub.current_scope().clone() {
             Scope::Separator => {}
-            Scope::Roles => {
-                // Picking a role opens the active profile's catalog with the
-                // role held in `assigning`, so the next Enter lands on it.
-                let Some(role) = crate::roles::ROLES.get(hub.selected) else {
-                    return;
-                };
-                let active = self.settings.default_profile.clone();
-                let target = self.model_hub.as_ref().and_then(|hub| {
-                    hub.scopes.iter().position(|scope| matches!(scope, Scope::Profile { id, .. } if *id == active))
-                });
-                let Some(target) = target else {
-                    self.status = "no profile to pick a model from".to_owned();
-                    return;
-                };
-                if let Some(hub) = self.model_hub.as_mut() {
-                    hub.assigning = Some(role.id.to_owned());
-                    hub.scope = target;
-                    hub.pane = Pane::Body;
-                    hub.search.clear();
-                    hub.reset_body();
-                }
-                self.enter_hub_scope();
+            Scope::AddProvider => {
+                self.model_hub = None;
+                self.open_provider_picker();
             }
-            Scope::Profile { .. } => {
+            Scope::Profiles => {
+                let Some(row) = crate::model_hub::profile_rows(&self.settings).get(hub.selected).cloned() else {
+                    return;
+                };
+                self.model_hub = None;
+                self.switch_profile(&row.name);
+            }
+            Scope::Provider { id, .. } => {
                 let cards = self.hub_catalog().cards();
                 let Some(model) =
                     crate::model_hub::filter(cards, &hub.search).get(hub.selected).map(|card| card.id.clone())
                 else {
                     return;
                 };
-                // Without a role in hand, Enter means "switch this profile's
-                // model" — which is the `default` role by another name.
-                let role = hub.assigning.clone().unwrap_or_else(|| "default".to_owned());
-                self.assign_role(&role, Some(model));
-                if let Some(hub) = self.model_hub.as_mut()
-                    && let Some(assigned) = hub.assigning.take()
-                {
-                    hub.scope = 0;
-                    hub.search.clear();
-                    hub.reset_body();
-                    // Land back on the role that was just set rather than at
-                    // the top: assigning two roles in a row is the common
-                    // case, and the eye is already there.
-                    hub.selected = crate::roles::ROLES.iter().position(|role| role.id == assigned).unwrap_or(0);
+                let reference = crate::providers::join_ref(&id, &model);
+                let pick = hub.pick.clone();
+                self.model_hub = None;
+                match pick {
+                    Pick::Use => self.use_model(&reference),
+                    Pick::Assign(role) => self.assign_role(&role, Some(reference)),
                 }
             }
         }

@@ -20,6 +20,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Conservative fallbacks when nothing else is known. Safe for most modern
@@ -274,17 +275,27 @@ fn known_limits(model: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Best-effort detection of a model's context window and output cap from the
-/// provider's `/models` endpoint. Returns `None` on any failure — callers fall
-/// back to the heuristic/default. Supports common response shapes: OpenAI /
-/// OpenRouter (`data`), servers that key the list under `models`, a bare root
-/// array, and per-model `context_length` as either a number or a `k`/`m`-
-/// suffixed string.
-pub async fn detect_limits(models_url: &str, api_key: Option<&str>, model: &str) -> Option<(usize, Option<usize>)> {
-    // Short timeout: this is a non-blocking best-effort pre-flight, and a server
-    // that doesn't implement /models would otherwise stall every launch.
-    let timeout = Duration::from_secs(2);
-    let value = crate::setup::get_json(models_url, api_key, timeout).await.ok()?;
+/// Best-effort detection of a model's context window and output cap: from the
+/// provider's cached model list when it has the model, otherwise from a quick
+/// look at its `/models` endpoint. Returns `None` on any failure — callers
+/// fall back to the heuristic/default. Supports common response shapes: OpenAI
+/// / OpenRouter (`data`), servers that key the list under `models`, a bare
+/// root array, and per-model `context_length` as either a number or a
+/// `k`/`m`-suffixed string.
+pub async fn detect_limits(
+    paths: &crate::config::AbacusPaths,
+    connection: &crate::providers::Connection,
+    model: &str,
+) -> Option<(usize, Option<usize>)> {
+    if let Some(card) =
+        crate::providers::cached_catalog(paths, &connection.provider).and_then(|catalog| catalog.card(model).cloned())
+        && let Some(context) = card.context_length
+    {
+        return Some((context, card.max_output_tokens));
+    }
+    // Short timeout: this is a non-blocking best-effort pre-flight, and a
+    // server that doesn't implement /models would otherwise stall every launch.
+    let value = connection.get_json(&connection.models_url(), Duration::from_secs(2)).await.ok()?;
     extract_limits_from_models(&value, model)
 }
 
@@ -309,8 +320,9 @@ fn entries(value: &Value) -> &[Value] {
 
 /// The context window and output cap an entry reports for its model.
 fn reported_limits(entry: &Value) -> (Option<usize>, Option<usize>) {
-    const OUTPUT: &[&str] = &["max_completion_tokens", "max_output_tokens"];
-    let context = read_usize(entry, &["context_length", "max_context_length", "context_window"]);
+    const OUTPUT: &[&str] = &["max_completion_tokens", "max_output_tokens", "max_tokens"];
+    // `max_input_tokens` and `max_tokens` are how the Messages API lists them.
+    let context = read_usize(entry, &["context_length", "max_context_length", "context_window", "max_input_tokens"]);
     let output = read_usize(entry, OUTPUT).or_else(|| read_usize(entry.get("top_provider")?, OUTPUT));
     (context, output)
 }
@@ -324,7 +336,8 @@ fn reported_limits(entry: &Value) -> (Option<usize>, Option<usize>) {
 /// OpenAI-compatible endpoint typically reports nothing but the id, and the
 /// interface collapses the columns it has no data for rather than inventing
 /// any.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ModelCard {
     pub id: String,
     /// The upstream supplier, taken from an `owner/model` id. Rendered as a
@@ -342,6 +355,13 @@ pub struct ModelCard {
 }
 
 impl ModelCard {
+    /// A card that knows nothing but the id: a model added by hand.
+    pub fn named(id: &str) -> Self {
+        let provider =
+            id.split_once('/').map(|(provider, _)| provider.to_owned()).filter(|provider| !provider.is_empty());
+        Self { id: id.to_owned(), provider, ..Self::default() }
+    }
+
     /// The id with any `owner/` prefix removed — what the row's label shows.
     pub fn short_id(&self) -> &str {
         match self.provider {
@@ -395,7 +415,7 @@ impl ModelCard {
         let (context_length, max_output_tokens) = reported_limits(entry);
         Some(ModelCard {
             provider,
-            name: entry["name"].as_str().map(str::to_owned),
+            name: entry["name"].as_str().or(entry["display_name"].as_str()).map(str::to_owned),
             description: entry["description"].as_str().map(crate::text::squeeze).filter(|text| !text.is_empty()),
             context_length,
             max_output_tokens,
@@ -420,7 +440,7 @@ pub fn parse_model_cards(value: &Value) -> Vec<ModelCard> {
 
 /// `128k`, `1m`, `4096` — the scale a context window is quoted at, lowercase so
 /// it sits quietly beside its unit.
-fn compact_count(value: usize) -> String {
+pub(crate) fn compact_count(value: usize) -> String {
     if value >= 1_000_000 {
         let millions = value as f64 / 1_000_000.0;
         format!("{}m", trim_zeros(millions))

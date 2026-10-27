@@ -344,8 +344,10 @@ async fn run_job(job: &CronJob, store: &CronStore) -> Result<bool> {
     if let Some(profile) = &job.profile {
         command.args(["--profile", profile]);
     }
+    // Stored under its old name, so jobs saved before AUTO and YOLO still
+    // mean what they meant: unattended edits and commands, unreviewed.
     if job.always_approve {
-        command.arg("--always-approve");
+        command.arg("--yolo");
     }
     let output =
         match tokio::time::timeout(Duration::from_secs(job.timeout_seconds.clamp(60, 24 * 60 * 60)), command.output())

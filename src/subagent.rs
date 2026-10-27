@@ -17,7 +17,7 @@ use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc};
 use uuid::Uuid;
 
 use crate::{
-    agent::{AgentEvent, AgentMode, TurnOptions, initial_messages, run_turn},
+    agent::{AgentEvent, TurnOptions, initial_messages, run_turn},
     provider::Provider,
     services::AgentServices,
 };
@@ -124,6 +124,11 @@ pub struct SubagentRuntime {
     harness: crate::harness::HarnessStore,
     /// Where a background swarm delivers its report when it finishes.
     injections: crate::agent::InjectionQueue,
+    /// The session's mode, shared: workers are reviewed in AUTO just as the
+    /// session is, and a switch to YOLO reaches them too.
+    yolo: Arc<AtomicBool>,
+    /// The reviewer AUTO puts a worker's actions to.
+    review: Option<crate::config::Target>,
 }
 
 /// A worker's resolved role: what to call it, what to tell it, and whether it
@@ -176,6 +181,8 @@ impl SubagentRuntime {
             hive: options.hive.clone(),
             harness: options.harness.clone(),
             injections: options.injections.clone(),
+            yolo: options.yolo.clone(),
+            review: options.review.clone().or_else(|| options.aux.clone()),
         }
     }
 
@@ -549,10 +556,11 @@ impl SubagentRuntime {
                 max_steps: self.max_steps,
                 tool_output_limit: self.tool_output_limit,
                 // Scouts are mechanically read-only, not just instructed so:
-                // PLAN mode plus a mutation lock that nothing in the worker
-                // can flip.
-                mode: if role.read_only { AgentMode::Plan } else { AgentMode::Build },
-                allow_mutations: Arc::new(AtomicBool::new(!role.read_only)),
+                // a lock that nothing in the worker can flip. Everyone else
+                // works under the session's own mode.
+                read_only: role.read_only,
+                yolo: self.yolo.clone(),
+                review: self.review.clone(),
                 web_search: self.web_search.clone(),
                 injections,
                 // The board's stop button reaches the worker through this.
@@ -659,8 +667,10 @@ async fn coerce_to_schema(provider: &Provider, report: &str, schema: &Value) -> 
 
 fn capture_event(event: AgentEvent, final_messages: &mut Option<Vec<Value>>, failure: &mut Option<String>) {
     match event {
+        // A worker only asks when AUTO's reviewer could not decide, and nobody
+        // is there to answer: that is a no, not a yes.
         AgentEvent::Approval(request) => {
-            let _ = request.respond.send(crate::agent::ApprovalDecision::Once);
+            let _ = request.respond.send(crate::agent::ApprovalDecision::Reject);
         }
         AgentEvent::Done { messages, .. } => *final_messages = Some(messages),
         AgentEvent::Failed { error, messages } => {
