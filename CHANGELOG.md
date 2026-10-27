@@ -94,13 +94,26 @@ run.
   session's agent. A message reaches a working session at its next step and
   starts a turn in an idle one. A closed session gets it when it is next
   opened, and the message then waits for what you send first. In AUTO the
-  reviewer checks each message before it goes. Other projects' sessions are
-  reached only when you ask. If messages start six turns in a row without you,
-  the next ones wait for you, so two agents cannot keep each other going
-  unattended. The transcript shows each message with its sender.
+  reviewer checks each message before it goes, unless it is to a related
+  session (see below). Other projects' sessions are reached only when you ask.
+  If messages start six turns in a row without you, the next ones wait for
+  you, so two agents cannot keep each other going unattended. The transcript
+  shows each message with its sender.
   `abacus sessions --json` and `thread/list` add `forkedFrom` and `live`. The
   app server adds `thread/fork` and the `fork` and `sessionMessages`
   capabilities.
+
+- **Related sessions keep each other informed.** The agent is told which
+  sessions are related to the one it works in (the one it was forked from,
+  its forks and theirs, and those forked from the same session) and whether
+  each is closed, open or working. Before it changes files that a working
+  one may be changing, it tells that session what it is about to change, and
+  it leaves that session's uncommitted work alone. When it finishes a piece of
+  work, it tells the session it was forked from what it did and where it
+  stands, and a closed session reads that when it is next opened. In AUTO a
+  message to a related session in the same project goes without a review: it
+  stays on this machine, and the session receiving it judges what it does
+  about it.
 
 - **Fewer commands and tools.** The terminal's commands are now `/profile`,
   `/providers`, `/mode`, `/effort`, `/config`, `/goal`, `/loop`, `/btw`, `/new`,

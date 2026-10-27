@@ -28,6 +28,16 @@ const READ_MAX: usize = 60;
 /// pick up from, not something to re-read in full.
 const READ_MESSAGE_CHARS: usize = 1_500;
 const READ_BUDGET: usize = 16_000;
+/// Related sessions the context names at most; the nearest come first.
+const KIN_LIMIT: usize = 12;
+
+/// How the agent works beside its related sessions, said after their list.
+const KIN_GUIDANCE: &str = "These share this project's files with you. While one of them is working, it may \
+     be changing the same files: before you change files it may be changing, tell it with session_message what \
+     you are about to change, and leave alone what it is changing — never overwrite another session's \
+     uncommitted work. When you finish a piece of work, tell the session this one was forked from, and any \
+     other it concerns, what you did and where it stands, with session_message; a closed one reads it when it \
+     is next opened. Message for those two reasons only, not to report routine progress.";
 
 /// The session tools for one conversation: where its sessions are kept, which
 /// project it is in, and which session it is.
@@ -41,6 +51,9 @@ struct Context {
     workspace: PathBuf,
     /// None until the conversation is saved, which its first prompt does.
     session: Option<Uuid>,
+    /// The related sessions as the context names them, worked out once: a
+    /// turn builds its own `Peers`, and listing reads every session here.
+    kin: std::sync::OnceLock<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,7 +70,31 @@ struct Found {
 
 impl Peers {
     pub fn new(paths: AbacusPaths, workspace: PathBuf, session: Option<Uuid>) -> Self {
-        Self { context: Some(Arc::new(Context { paths, workspace, session })) }
+        Self { context: Some(Arc::new(Context { paths, workspace, session, kin: Default::default() })) }
+    }
+
+    /// The sessions related to this one in its project — the one it was
+    /// forked from, its forks and theirs, and those forked from the same
+    /// session — as a context layer: who they are, whether they are open or
+    /// working, and how to work beside them. Empty when there are none.
+    pub fn kin_layer(&self) -> String {
+        self.context
+            .as_ref()
+            .map(|context| context.kin.get_or_init(|| context.describe_kin()).clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether a `session_message` call goes to a session related to this
+    /// one, in this project. That is the coordination the kin layer asks for,
+    /// so AUTO sends it without a review: it stays on this machine, and the
+    /// session receiving it judges what it does about it.
+    pub fn messages_kin(&self, arguments: &str) -> bool {
+        let Some(context) = &self.context else { return false };
+        let arguments = serde_json::from_str::<Value>(arguments).unwrap_or(Value::Null);
+        let Some(reference) = arguments["session"].as_str() else { return false };
+        let Ok(found) = context.find(reference, Scope::Project) else { return false };
+        let sessions = context.store(&context.workspace).list().unwrap_or_default();
+        Family::of(context.session, &sessions).relation(found.summary.id).is_kin()
     }
 
     /// Whether this conversation can reach other sessions: it has a session
@@ -150,6 +187,38 @@ impl Peers {
 impl Context {
     fn store(&self, workspace: &std::path::Path) -> SessionStore {
         SessionStore::new(&self.paths, workspace.to_path_buf())
+    }
+
+    fn describe_kin(&self) -> String {
+        if self.session.is_none() {
+            return String::new();
+        }
+        let sessions = self.store(&self.workspace).list().unwrap_or_default();
+        let family = Family::of(self.session, &sessions);
+        let mut kin: Vec<(Relation, &SessionSummary)> = sessions
+            .iter()
+            .map(|summary| (family.relation(summary.id), summary))
+            .filter(|(relation, _)| relation.is_kin())
+            .collect();
+        if kin.is_empty() {
+            return String::new();
+        }
+        kin.sort_by_key(|(relation, _)| *relation);
+        let live = live_sessions(&self.paths);
+        let rows: Vec<String> = kin
+            .into_iter()
+            .take(KIN_LIMIT)
+            .map(|(relation, summary)| {
+                let state = live.get(&summary.id).map_or_else(|| "closed".to_owned(), Live::describe);
+                format!(
+                    "- {} \"{}\" — {} · {state}",
+                    short(summary.id),
+                    summary.title,
+                    relation.label().unwrap_or_default()
+                )
+            })
+            .collect();
+        format!("Sessions related to this one:\n{}\n\n{KIN_GUIDANCE}", rows.join("\n"))
     }
 
     /// Every session in `scope`, by project, this project first.
@@ -390,6 +459,11 @@ enum Relation {
 }
 
 impl Relation {
+    /// The one it was forked from, its forks and theirs, and its siblings.
+    fn is_kin(self) -> bool {
+        matches!(self, Self::Parent | Self::Fork | Self::ForkOfFork | Self::Sibling)
+    }
+
     fn label(self) -> Option<&'static str> {
         match self {
             Self::Itself => Some("this session"),
@@ -570,6 +644,38 @@ mod tests {
         let own = world.ids["main"].to_string();
         let refused = call(&peers(&world, "main"), "session_message", json!({"session": own, "message": "hi"}));
         assert!(refused.contains("this session"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn a_session_is_told_its_kin_and_how_to_work_beside_them() {
+        let world = world();
+        let presence = Presence::open(&world.paths, world.ids["main"], FrontEnd::Tui, &world.api);
+        presence.set_working(true);
+        let layer = peers(&world, "fork-a").kin_layer();
+        assert!(layer.contains("\"main\" — this session was forked from it · working in a terminal"), "{layer}");
+        assert!(layer.contains("\"fork-of-a\" — fork of this session · closed"), "{layer}");
+        assert!(layer.contains("\"fork-b\" — forked from the same session as this one"), "{layer}");
+        assert!(!layer.contains("unrelated") && !layer.contains("elsewhere"), "kin only: {layer}");
+        assert!(layer.find("\"main\"").unwrap() < layer.find("\"fork-b\"").unwrap(), "nearest first");
+        assert!(layer.contains("before you change files it may be changing"), "{layer}");
+        assert!(layer.contains("When you finish a piece of work"), "{layer}");
+
+        assert_eq!(peers(&world, "unrelated").kin_layer(), "", "no kin, nothing to say");
+        assert_eq!(Peers::new(world.paths.clone(), world.api.clone(), None).kin_layer(), "", "not saved yet");
+    }
+
+    #[test]
+    fn only_a_message_to_kin_skips_the_review() {
+        let world = world();
+        let to = |name: &str| json!({"session": short(world.ids[name]), "message": "done", "scope": "all"}).to_string();
+        let fork_a = peers(&world, "fork-a");
+        assert!(fork_a.messages_kin(&to("main")), "the session it was forked from");
+        assert!(fork_a.messages_kin(&to("fork-of-a")), "its fork");
+        assert!(fork_a.messages_kin(&to("fork-b")), "a sibling");
+        assert!(!fork_a.messages_kin(&to("unrelated")));
+        assert!(!fork_a.messages_kin(&to("elsewhere")), "another project is never kin");
+        assert!(!fork_a.messages_kin("not json"));
+        assert!(!Peers::default().messages_kin(&to("main")));
     }
 
     #[test]

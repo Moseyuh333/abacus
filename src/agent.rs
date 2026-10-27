@@ -641,7 +641,10 @@ async fn run_turn_inner(
             let repeated = repeated.or_default();
             *repeated += 1;
             let loop_blocked = *repeated >= 3 && !is_read_only(&call) && !options.services.is_client_tool(&call.name);
-            let requires_approval = tool_requires_approval(&call, &options.services);
+            // A message to a related session is the coordination its layer
+            // asks for, and the session receiving it judges what it does.
+            let requires_approval = tool_requires_approval(&call, &options.services)
+                && !(call.name == "session_message" && options.peers.messages_kin(&call.arguments));
             let yolo = options.yolo.load(Ordering::Relaxed);
             let judge = Judge { model: &reviewer, cache: &safety, workspace: &options.workspace, yolo };
             let path_refusal = judge.refuse_read(&call, &outside_reads).await;
@@ -1287,6 +1290,7 @@ fn context_layers(options: &TurnOptions) -> Vec<(&'static str, String)> {
         ("summary", options.compaction.prompt_context()),
         ("memory", options.memories.prompt_context()),
         ("delegation", if options.allow_subagents { options.workers.in_flight() } else { String::new() }),
+        ("sessions", options.peers.kin_layer()),
         ("goal", options.goal.prompt_context()),
         ("tasks", options.tasks.prompt_context()),
         ("permissions", permission_prompt(options).to_owned()),

@@ -224,6 +224,44 @@ async fn auto_review_blocks_an_action_the_user_did_not_ask_for() {
     assert!(review.contains("touch marker.txt"), "and the action");
 }
 
+/// A fork tells the session it came from what it did without the reviewer in
+/// the way: that is how related sessions keep out of each other's way, and the
+/// session receiving the message judges what it does about it. A message to a
+/// session that is not related is still reviewed.
+#[tokio::test]
+async fn auto_lets_a_fork_report_to_its_origin_but_reviews_other_messages() {
+    let project = project(&[]);
+    let paths = abacus_agent::config::AbacusPaths::under(project.directory.path().join("home"));
+    let store = abacus_agent::session::SessionStore::new(&paths, project.workspace.clone());
+    let origin = store.create("test".into(), "m".into(), project.asks("fix the importer")).unwrap();
+    let fork = store.fork(&origin, "test".into(), "m".into(), origin.messages.clone()).unwrap();
+    let stranger = store.create("test".into(), "m".into(), project.asks("something else")).unwrap();
+    let message = |to: &abacus_agent::session::Session| {
+        calls(&[("c1", "session_message", json!({"session": to.id.to_string(), "message": "the importer is fixed"}))])
+    };
+    let options = || TurnOptions {
+        yolo: auto(),
+        peers: abacus_agent::peers::Peers::new(paths.clone(), project.workspace.clone(), Some(fork.id)),
+        ..project.options()
+    };
+
+    let mock = Mock::script([message(&origin), says("Told it.")]).await;
+    turn(project.provider(&mock), project.asks("fix the importer"), options(), |_| {}).await;
+    let requests = mock.finish().await;
+    assert!(requests[0].contains("Sessions related to this one"), "the model is told its kin");
+    assert!(requests[0].contains("this session was forked from it"), "and how they are related");
+    assert!(!requests.iter().any(|request| request.contains("permission check")), "no review for kin");
+    let delivered = abacus_agent::inbox::take(&paths, origin.id);
+    assert_eq!(delivered.len(), 1, "it reached the session the fork came from");
+    assert_eq!(delivered[0].from.session, Some(fork.id));
+
+    let mock = Mock::script([message(&stranger), says("BLOCK: nobody asked to message it."), says("Left it.")]).await;
+    turn(project.provider(&mock), project.asks("fix the importer"), options(), |_| {}).await;
+    let requests = mock.finish().await;
+    assert!(requests[1].contains("permission check"), "a message to a stranger is reviewed");
+    assert!(abacus_agent::inbox::take(&paths, stranger.id).is_empty(), "and a blocked one is not sent");
+}
+
 #[tokio::test]
 async fn auto_review_lets_an_allowed_action_run() {
     let project = project(&[]);

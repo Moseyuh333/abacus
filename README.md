@@ -152,6 +152,14 @@ Sessions are saved per workspace. `abacus --continue` reopens the latest one,
 lists them. `abacus sessions --all` lists every workspace that has sessions, and
 `--json` prints either list for a front end.
 
+The agent can list, read and message the other sessions of a project. It knows
+which are related to the one it works in (the session it was forked from with
+`/fork`, its forks, and those forked from the same session) and whether each is
+open or working. Since they share the project's files, it tells a working one
+before it changes files that session may be changing, and when it finishes a
+piece of work it tells the session it was forked from what it did. A closed
+session reads its messages when it is next opened.
+
 ## Headless runs
 
 `-p` runs one prompt without the UI and prints the result. Headless runs use
