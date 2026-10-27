@@ -349,6 +349,13 @@ impl Provider {
         self.context_tokens.load(Ordering::Relaxed)
     }
 
+    /// Forget the last prompt's size, so the gauge estimates from the history
+    /// until the next reply reports one. For a history replaced between
+    /// requests — idle compaction — whose last count is of what is gone.
+    pub fn clear_context_tokens(&self) {
+        self.context_tokens.store(0, Ordering::Relaxed);
+    }
+
     pub async fn complete(
         &self,
         messages: &[Value],

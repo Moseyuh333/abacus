@@ -100,6 +100,11 @@ pub(super) const SETTINGS: &[(&str, &[Setting])] = &[
                 "Balanced high-savings mode: tighter context, fewer background checks, and no draft or routine refine calls.",
             ),
             toggled(
+                ConfigKey::IdleCompaction,
+                "Idle compaction",
+                "When a long session sits idle for about 4½ minutes, summarise it while the prompt cache is still warm, so the next message does not resend the whole history. Not for local servers.",
+            ),
+            toggled(
                 ConfigKey::OneStream,
                 "One stream",
                 "Serialize main and auxiliary upstream requests. Explicit subagents keep their own streams.",
@@ -525,6 +530,7 @@ impl App {
         self.config.token_compression = self.settings.agent.token_compression;
         self.config.one_stream = self.settings.agent.one_stream;
         self.config.prompt_cache = self.settings.agent.prompt_cache;
+        self.config.idle_compaction = self.settings.agent.idle_compaction;
         self.config.trace_enabled = self.settings.trace.enabled;
         // The resolved search backend is what turns use; without this a
         // change here would only take effect on the next launch.
@@ -537,6 +543,10 @@ impl App {
             && before.1 != self.config.model_ref()
         {
             usage.note_model(&self.config.model);
+        }
+        // Another model has none of this session cached.
+        if before.1 != self.config.model_ref() {
+            self.cancel_idle_compaction();
         }
         let mut provider = Provider::with_tokens(&self.config, self.tokens.clone())?;
         // Same conversation, new configuration: keep the session id so a host
@@ -726,6 +736,12 @@ impl App {
                 toggle(&mut self.settings.agent.token_compression);
                 if self.settings.agent.token_compression {
                     self.clear_draft();
+                }
+            }
+            ConfigKey::IdleCompaction => {
+                toggle(&mut self.settings.agent.idle_compaction);
+                if !self.settings.agent.idle_compaction {
+                    self.cancel_idle_compaction();
                 }
             }
             ConfigKey::OneStream => toggle(&mut self.settings.agent.one_stream),
@@ -1193,6 +1209,7 @@ impl App {
             }
             ConfigKey::SearchSharedInstance => on_off(self.settings.search.use_shared_instance),
             ConfigKey::TokenCompression => on_off(self.settings.agent.token_compression),
+            ConfigKey::IdleCompaction => on_off(self.settings.agent.idle_compaction),
             ConfigKey::OneStream => on_off(self.settings.agent.one_stream),
             ConfigKey::TraceLogging => match (&self.trace, self.settings.trace.enabled) {
                 (Some(trace), true) => format!("On · {} records", trace.steps()),

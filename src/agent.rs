@@ -358,6 +358,65 @@ impl TurnOptions {
     }
 }
 
+/// The tools a turn over `options` offers the model.
+fn turn_tool_specs(options: &TurnOptions) -> Vec<Value> {
+    let mut specs = options.services.tool_specs();
+    specs.extend(GoalState::tool_specs());
+    specs.extend(TaskList::tool_specs());
+    specs.extend(crate::papercuts::PapercutStore::tool_specs());
+    specs.extend(crate::harness::HarnessStore::tool_specs());
+    specs.extend(crate::handles::HandleStore::tool_specs());
+    if options.web_search.enabled {
+        specs.extend(crate::web::tool_specs());
+    }
+    if options.allow_subagents {
+        specs.push(SubagentRuntime::tool_spec());
+        specs.push(SubagentRuntime::message_tool_spec());
+    }
+    specs
+}
+
+/// What idle compaction made of a quiet session: the shorter history, the
+/// summary that stands in for what it dropped, and about how many tokens every
+/// request from here on no longer carries.
+pub struct IdleCompaction {
+    pub messages: Vec<Value>,
+    pub summary: String,
+    pub saved_tokens: usize,
+}
+
+/// Compact a session that has gone quiet, before the person comes back.
+///
+/// Once the prompt cache the last turn left warm expires, the next message
+/// would send the whole history at full price; after this, it sends the
+/// summary and the last exchange. The summariser is the one a turn would use
+/// under pressure, and when it is the conversation's own model the request is
+/// the conversation plus one instruction, carrying the turn's tools — so it
+/// still reads the history from that cache.
+///
+/// There is no reflection pass first, as there is mid-turn: the turns being
+/// summarised have ended, and a long one already looked back on itself then.
+pub async fn compact_idle(provider: &Provider, messages: &[Value], options: &TurnOptions) -> Option<IdleCompaction> {
+    let summariser = provider.for_role(options.summariser.as_ref());
+    let specs = turn_tool_specs(options);
+    let (compacted, summary) = crate::compaction::compact_idle(
+        &crate::compaction::Summariser {
+            provider: &summariser,
+            in_context: summariser.model() == provider.model(),
+            tools: &specs,
+        },
+        messages,
+        &options.compaction,
+        &options.compaction_budget,
+        &options.cancel,
+    )
+    .await?;
+    let before = message_chars(messages) + options.compaction.snapshot().map_or(0, |summary| summary.len());
+    let after = message_chars(&compacted) + summary.len();
+    let saved_tokens = before.saturating_sub(after) / crate::model_info::CHARS_PER_TOKEN;
+    Some(IdleCompaction { messages: compacted, summary, saved_tokens })
+}
+
 pub fn run_turn(
     provider: Provider,
     messages: Vec<Value>,
@@ -370,7 +429,7 @@ pub fn run_turn(
 async fn run_turn_inner(
     provider: Provider,
     mut messages: Vec<Value>,
-    mut options: TurnOptions,
+    options: TurnOptions,
     events: mpsc::UnboundedSender<AgentEvent>,
 ) {
     // The auxiliary model, on whichever provider it is: secondary calls
@@ -392,19 +451,7 @@ async fn run_turn_inner(
         // The auxiliary model reads fetched pages for the tools.
         .with_web(options.web_search.clone().with_extractor(aux.clone()))
         .with_outside_reads(outside_reads.clone());
-    let mut specs = options.services.tool_specs();
-    specs.extend(GoalState::tool_specs());
-    specs.extend(TaskList::tool_specs());
-    specs.extend(crate::papercuts::PapercutStore::tool_specs());
-    specs.extend(crate::harness::HarnessStore::tool_specs());
-    specs.extend(crate::handles::HandleStore::tool_specs());
-    if options.web_search.enabled {
-        specs.extend(crate::web::tool_specs());
-    }
-    if options.allow_subagents {
-        specs.push(SubagentRuntime::tool_spec());
-        specs.push(SubagentRuntime::message_tool_spec());
-    }
+    let specs = turn_tool_specs(&options);
     let subagents = SubagentRuntime::for_turn(delegate, &options);
     let mut repeated_calls: HashMap<String, usize> = HashMap::new();
     // Consecutive failed tool results this turn — two in a row triggers a
@@ -488,7 +535,7 @@ async fn run_turn_inner(
                 tools: &specs,
             },
             &mut messages,
-            &mut options.compaction,
+            &options.compaction,
             &options.compaction_budget,
             &options.cancel,
         )

@@ -192,6 +192,29 @@ struct App {
     /// outlive the turn that spawned them, and the next turn (and the front
     /// end) must still see them.
     hive: crate::hive::HiveHandle,
+    /// When idle compaction is due: set by a turn that finished, cleared by
+    /// anything that replaces the thread or starts a turn.
+    idle_due: Option<tokio::time::Instant>,
+    /// Raised to stop the idle compaction in flight, if there is one.
+    idle_compaction: Option<Arc<AtomicBool>>,
+    /// Where idle compaction reports back to the serving loop.
+    idle_done: mpsc::UnboundedSender<IdleDone>,
+}
+
+/// Idle compaction finished, written from `basis`. `job` is the flag it could
+/// be stopped by, which tells it apart from one that was.
+struct IdleDone {
+    job: Arc<AtomicBool>,
+    basis: Vec<Value>,
+    result: Option<crate::agent::IdleCompaction>,
+}
+
+/// Wait for `deadline`, or forever when there is none.
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Run the server until stdin closes.
@@ -209,6 +232,7 @@ pub async fn run(
     let credentials = Credentials::load(&config.paths).unwrap_or_default();
     let usage = UsageReporter::new(&config.paths, &credentials, "app-server");
     let hive = crate::hive::HiveHandle::load(config.paths.hive_file.clone());
+    let (idle_done, mut idle_rx) = mpsc::unbounded_channel::<IdleDone>();
     let mut app = App {
         thread: ThreadState::new(&config, session),
         config,
@@ -231,6 +255,9 @@ pub async fn run(
         usage,
         sync_warned: Arc::default(),
         hive,
+        idle_due: None,
+        idle_compaction: None,
+        idle_done,
     };
     app.thread_opened();
     let usage_task = app.usage.as_ref().map(UsageReporter::spawn_periodic);
@@ -323,6 +350,11 @@ pub async fn run(
             call = client_call_rx.recv() => {
                 let Some(call) = call else { continue };
                 app.forward_client_call(call);
+            }
+            () = until(app.idle_due) => app.start_idle_compaction(),
+            done = idle_rx.recv() => {
+                let Some(done) = done else { continue };
+                app.idle_compacted(done);
             }
         }
     }
@@ -429,7 +461,12 @@ impl App {
                     // profile/remove; the profile picker replaces the
                     // model picker.
                     "profiles": true,
+                    // A long thread left idle is compacted before the
+                    // person comes back (`thread/compacted`); the
+                    // `idle_compaction` config key turns it off.
+                    "idleCompaction": true,
                 },
+                "idleCompaction": self.config.idle_compaction,
                 "thread": self.thread_snapshot(),
             })),
             "shutdown" => Ok(json!({})),
@@ -454,6 +491,7 @@ impl App {
             }
             "thread/start" => {
                 self.require_idle()?;
+                self.stop_idle_compaction();
                 self.thread_closed();
                 self.thread = ThreadState::new(&self.config, None);
                 self.tokens.store_total(0);
@@ -466,6 +504,7 @@ impl App {
                 let id = params["threadId"].as_str().ok_or_else(|| anyhow!("threadId required"))?;
                 let store = self.store.as_ref().ok_or_else(|| anyhow!("sessions off"))?;
                 let session = store.load(id)?;
+                self.stop_idle_compaction();
                 self.thread_closed();
                 self.tokens.store_total(session.tokens_used);
                 self.thread = ThreadState::new(&self.config, Some(session));
@@ -829,6 +868,16 @@ impl App {
             "autoApprove" => {
                 self.set_mode(if value.as_bool().unwrap_or(false) { Permission::Yolo } else { Permission::Auto });
             }
+            // Saved for every session, as `/config` saves it in the terminal.
+            "idle_compaction" => {
+                let enabled = value.as_bool().ok_or_else(|| anyhow!("idle_compaction must be true or false"))?;
+                self.settings.agent.idle_compaction = enabled;
+                self.settings.save(&self.config.paths)?;
+                self.config.idle_compaction = enabled;
+                if !enabled {
+                    self.stop_idle_compaction();
+                }
+            }
             other => return Err(anyhow!("`{other}` is not a writable key")),
         }
         Ok(self.config_state())
@@ -853,6 +902,7 @@ impl App {
             "reasoningEffort": self.config.reasoning_effort.map(|effort| effort.label()),
             "contextWindow": self.config.model_limits.context_window,
             "needsSetup": !self.config.is_configured(),
+            "idleCompaction": self.config.idle_compaction,
         })
     }
 
@@ -882,6 +932,10 @@ impl App {
             && previous != self.config.model_ref()
         {
             usage.note_model(&self.config.model);
+        }
+        // Another model has none of this thread cached.
+        if previous != self.config.model_ref() {
+            self.stop_idle_compaction();
         }
         let mut provider = Provider::with_tokens(&self.config, self.tokens.clone())?;
         provider.adopt_session(&self.provider);
@@ -1233,6 +1287,7 @@ impl App {
 
     /// Start the agent on `content`, announcing `item` as the person's message.
     fn begin_turn(&mut self, content: Value, mut item: Value, events: &mpsc::UnboundedSender<AgentEvent>) {
+        self.stop_idle_compaction();
         self.thread.messages.push(json!({"role": "user", "content": content}));
         let turn = self.next("turn");
         self.turn_id = Some(turn.clone());
@@ -1244,15 +1299,75 @@ impl App {
         item["id"] = json!(self.next("item"));
         self.item("completed", item);
 
-        let options = TurnOptions {
+        let options = self.turn_options();
+        tokio::spawn(run_turn(self.provider.clone(), self.thread.messages.clone(), options, events.clone()));
+    }
+
+    /// The options the next turn runs with. Idle compaction uses them too, so
+    /// its summary request carries the same tools as the turns before it.
+    fn turn_options(&self) -> TurnOptions {
+        TurnOptions {
             yolo: self.yolo.clone(),
             session_id: Some(self.thread_id()),
             trace: self.thread.trace.clone(),
             cancel: self.cancel.clone(),
             hive: self.hive.clone(),
             ..self.thread.state.turn(&self.config, self.services.clone()).with_workspace_stores(&self.config)
+        }
+    }
+
+    /// Summarise a long thread left idle since its last turn, while the
+    /// provider still has it cached (see [`crate::compaction::IDLE_AFTER`]).
+    fn start_idle_compaction(&mut self) {
+        self.idle_due = None;
+        if self.turn_id.is_some() || self.idle_compaction.is_some() || !self.config.compacts_when_idle() {
+            return;
+        }
+        let options = self.turn_options();
+        if !crate::compaction::idle_worthwhile(&self.thread.messages, &options.compaction, &options.compaction_budget) {
+            return;
+        }
+        let job = Arc::new(AtomicBool::new(false));
+        let options = TurnOptions { cancel: job.clone(), ..options };
+        self.idle_compaction = Some(job.clone());
+        let (provider, basis, done) = (self.provider.clone(), self.thread.messages.clone(), self.idle_done.clone());
+        tokio::spawn(async move {
+            let result = crate::agent::compact_idle(&provider, &basis, &options).await;
+            let _ = done.send(IdleDone { job, basis, result });
+        });
+    }
+
+    /// Stop idle compaction: a turn is starting, or the thread it was
+    /// summarising is being replaced.
+    fn stop_idle_compaction(&mut self) {
+        if let Some(job) = self.idle_compaction.take() {
+            job.store(true, Ordering::Relaxed);
+        }
+        self.idle_due = None;
+    }
+
+    /// Take idle compaction's result, if it is still the summary of the
+    /// thread as it stands.
+    fn idle_compacted(&mut self, done: IdleDone) {
+        // A stopped job reports too. It is not the one in flight, if any is.
+        if !self.idle_compaction.as_ref().is_some_and(|current| Arc::ptr_eq(current, &done.job)) {
+            return;
+        }
+        self.idle_compaction = None;
+        // `thread/compact` since then makes it the summary of something else.
+        let Some(compacted) = done.result.filter(|_| self.turn_id.is_none() && self.thread.messages == done.basis)
+        else {
+            return;
         };
-        tokio::spawn(run_turn(self.provider.clone(), self.thread.messages.clone(), options, events.clone()));
+        self.thread.messages = compacted.messages;
+        self.thread.state.compaction.set(compacted.summary);
+        self.provider.clear_context_tokens();
+        self.persist();
+        notify(
+            "thread/compacted",
+            json!({"threadId": self.thread_id(), "reason": "idle", "savedTokens": compacted.saved_tokens}),
+        );
+        self.report_usage();
     }
 
     /// Announce an item of the running turn opening (`started`) or closing
@@ -1431,6 +1546,11 @@ impl App {
             self.item("completed", open.tool(&name, "aborted"));
         }
         let turn = self.turn_id.take().unwrap_or_default();
+        // The provider has the conversation cached now; a failed turn may
+        // never have reached it.
+        if status != "failed" {
+            self.idle_due = Some(tokio::time::Instant::now() + crate::compaction::IDLE_AFTER);
+        }
         self.persist();
         self.report_diff(&turn);
         if let Some(usage) = &self.usage {

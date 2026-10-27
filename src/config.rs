@@ -466,6 +466,9 @@ pub struct Config {
     pub one_stream: bool,
     /// Mark prompt-cache breakpoints on requests that support them.
     pub prompt_cache: bool,
+    /// Summarise a long session that sits idle while its prompt cache is
+    /// still warm (see [`Config::compacts_when_idle`]).
+    pub idle_compaction: bool,
     pub paths: AbacusPaths,
 }
 
@@ -492,6 +495,7 @@ impl Config {
             token_compression: false,
             one_stream: false,
             prompt_cache: true,
+            idle_compaction: true,
             paths,
         }
     }
@@ -575,6 +579,14 @@ impl Config {
         self.token_compression = settings.agent.token_compression;
         self.one_stream = settings.agent.one_stream;
         self.prompt_cache = settings.agent.prompt_cache;
+        self.idle_compaction = settings.agent.idle_compaction;
+    }
+
+    /// Whether a long session that goes quiet is compacted before the person
+    /// comes back. Not on a local server: it bills nothing for resending the
+    /// history and keeps its own cache, so a summary would only lose detail.
+    pub fn compacts_when_idle(&self) -> bool {
+        self.idle_compaction && !crate::providers::is_local_url(&self.connection.base_url)
     }
 
     /// Point this configuration at another profile, the way `/profile` and
@@ -1402,6 +1414,11 @@ pub struct AgentSettings {
     /// claims the Anthropic protocol and chokes on the field.
     #[serde(default = "yes")]
     pub prompt_cache: bool,
+    /// When a long session sits idle, summarise it while the provider's
+    /// prompt cache is still warm, so the next message does not send the whole
+    /// history again at full price. Claude Code's `idleCompaction`.
+    #[serde(default = "yes")]
+    pub idle_compaction: bool,
 }
 
 /// `serde(default)` for a bool that defaults to true.
@@ -1466,6 +1483,7 @@ impl Default for AgentSettings {
             token_compression: false,
             one_stream: false,
             prompt_cache: true,
+            idle_compaction: true,
         }
     }
 }

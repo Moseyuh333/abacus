@@ -54,7 +54,10 @@ impl SessionState {
         Self {
             goal: crate::goal::GoalState::new(session.and_then(|session| session.goal.clone())),
             tasks: crate::task::TaskList::new(session.map(|session| session.tasks.clone()).unwrap_or_default()),
-            compaction: session.and_then(|session| session.compaction.clone()).unwrap_or_default(),
+            compaction: session
+                .and_then(|session| session.compaction.as_ref())
+                .map(CompactionState::detached)
+                .unwrap_or_default(),
             tether: crate::tether::TetherState::new(session.and_then(|session| session.intent.clone())),
             harness,
             handles: Default::default(),
@@ -68,7 +71,7 @@ impl SessionState {
         session.harness = Some(self.harness.session_snapshot());
         session.goal = self.goal.snapshot();
         session.tasks = self.tasks.snapshot();
-        session.compaction = Some(self.compaction.clone());
+        session.compaction = Some(self.compaction.detached());
     }
 
     /// The options for a turn over this state, shaped by `config`.

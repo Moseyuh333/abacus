@@ -72,6 +72,18 @@ run.
   before then. One the turn ended before reaching starts the next turn, as it
   does in the terminal, and `turn/completed` says `continues` when it will.
 
+- **Idle compaction.** When a long session (about 100k tokens, or half the
+  compaction threshold on a smaller window) sits idle for 4½ minutes after a
+  turn, Abacus summarises it while the provider still has it cached, keeping
+  the opening and the last exchange. The next message then does not send the
+  whole history again at full price. The transcript says "Compacted while you
+  were away" and how many tokens it saved. Typing in the terminal holds it off,
+  and sending a message stops one in progress. It is off for local servers and
+  can be turned off with `idle_compaction` under `[agent]`, in `/config`, or in
+  the desktop's settings. In the app server it is the `idleCompaction`
+  capability, the `thread/compacted` notification and the `idle_compaction`
+  config key.
+
 - **Fewer commands and tools.** The terminal's commands are now `/profile`,
   `/providers`, `/mode`, `/effort`, `/config`, `/goal`, `/loop`, `/btw`, `/new`,
   `/fork`, `/resume`, `/rename`, `/compact`, `/repair`, `/memory`, `/tools`,
@@ -87,6 +99,9 @@ run.
 
 Also since 0.7.0:
 
+- The rolling summary written when a turn compacts the context now carries
+  into the next turn. It used to be lost when the turn ended, and the next turn
+  told the model the summary no longer applied.
 - `read_page` refuses a page whose host resolves to a private address.
 - The `git_diff` and `git_log` path filters cannot reach `.env` files.
 - `Ctrl+T` cycles the reasoning effort.

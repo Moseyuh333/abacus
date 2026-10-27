@@ -312,6 +312,7 @@ enum ConfigKey {
     ToolOutputLimit,
     ProjectTrust,
     TokenCompression,
+    IdleCompaction,
     OneStream,
     TraceLogging,
     // Search tab.
@@ -412,6 +413,14 @@ enum Background {
     },
     /// A sync pass finished.
     Sync(anyhow::Result<crate::sync::SyncOutcome>),
+    /// Idle compaction finished, written from `basis`. `job` is the flag it
+    /// could be stopped by, which tells it apart from one that was. `None`
+    /// when there was nothing worth compacting, or it failed or was stopped.
+    IdleCompacted {
+        job: Arc<AtomicBool>,
+        basis: Vec<Value>,
+        result: Option<crate::agent::IdleCompaction>,
+    },
     /// A newer release exists.
     Update(crate::update::Available),
 }
@@ -511,6 +520,12 @@ struct App {
     usage_session: Option<String>,
     sync_idle_since: Option<Instant>,
     last_auto_push: Option<Instant>,
+    /// When the last turn finished, while nobody has typed since: the clock
+    /// idle compaction runs on. Never set by opening a session, whose prompt
+    /// cache went cold long ago — only by a turn that finished here.
+    quiet_since: Option<Instant>,
+    /// Raised to stop the idle compaction in flight, if there is one.
+    idle_compaction: Option<Arc<AtomicBool>>,
     last_board_version: u64,
     reload_services: bool,
     services_reloading: bool,
@@ -906,6 +921,7 @@ async fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut
         dirty |= app.drain_background();
         app.tick_remote();
         app.maybe_idle_sync();
+        app.maybe_idle_compact();
         // A worker that finished after its turn ended delivers here.
         dirty |= app.deliver_pending_injections();
         // A running turn animates (spinner, shimmer, elapsed) even while the
@@ -924,6 +940,10 @@ async fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if app.sync_idle_since.is_some() {
                         app.sync_idle_since = Some(Instant::now());
+                    }
+                    // Someone typing is someone here.
+                    if app.quiet_since.is_some() {
+                        app.quiet_since = Some(Instant::now());
                     }
                     let before = app.input.text();
                     app.pointer = None;
@@ -1291,6 +1311,8 @@ impl App {
             usage_session: None,
             sync_idle_since: None,
             last_auto_push: None,
+            quiet_since: None,
+            idle_compaction: None,
             last_board_version: 0,
             reload_services: false,
             services_reloading: false,
@@ -1649,6 +1671,7 @@ impl App {
                     self.report_usage();
                     if !continue_loop {
                         self.sync_idle_since = Some(Instant::now());
+                        self.quiet_since = Some(Instant::now());
                     }
                     self.last_outcome = match reason {
                         DoneReason::Complete => None,
@@ -2006,6 +2029,7 @@ impl App {
             crate::recovery::set_session(Some(session.id.to_string()));
         }
         self.sync_idle_since = None;
+        self.cancel_idle_compaction();
         self.receiving_delta = false;
         self.follow = true;
         self.status = "connecting".to_owned();
@@ -2013,7 +2037,18 @@ impl App {
         let provider = self.provider.clone();
         let messages = self.messages.clone();
         let events = self.event_tx.clone();
-        let options = TurnOptions {
+        let options = self.turn_options();
+        self.running = Some(tokio::spawn(async move {
+            run_turn(provider, messages, options, events).await;
+        }));
+        // The first prompt is what makes a session worth sharing.
+        self.maybe_auto_share();
+    }
+
+    /// The options the next turn runs with. Idle compaction uses them too, so
+    /// its summary request carries the same tools as the turns before it.
+    fn turn_options(&self) -> TurnOptions {
+        TurnOptions {
             safety: self.safety.clone(),
             trace: self.trace.clone(),
             cancel: self.cancel.clone(),
@@ -2022,12 +2057,70 @@ impl App {
             papercuts: self.papercuts.clone(),
             hive: self.hive.clone(),
             ..self.state.turn(&self.config, self.services.clone())
+        }
+    }
+
+    /// Summarise a long session nobody has typed in since its last turn,
+    /// while the provider still has it cached (see
+    /// [`crate::compaction::IDLE_AFTER`]). Once per quiet spell.
+    fn maybe_idle_compact(&mut self) {
+        if self.running.is_some() || self.idle_compaction.is_some() {
+            return;
+        }
+        let Some(quiet) = self.quiet_since else {
+            return;
         };
-        self.running = Some(tokio::spawn(async move {
-            run_turn(provider, messages, options, events).await;
-        }));
-        // The first prompt is what makes a session worth sharing.
-        self.maybe_auto_share();
+        if quiet.elapsed() < crate::compaction::IDLE_AFTER {
+            return;
+        }
+        self.quiet_since = None;
+        let options = self.turn_options();
+        if !self.config.compacts_when_idle()
+            || !crate::compaction::idle_worthwhile(&self.messages, &options.compaction, &options.compaction_budget)
+        {
+            return;
+        }
+        let job = Arc::new(AtomicBool::new(false));
+        let options = TurnOptions { cancel: job.clone(), ..options };
+        self.idle_compaction = Some(job.clone());
+        let (provider, basis, events) = (self.provider.clone(), self.messages.clone(), self.background_tx.clone());
+        tokio::spawn(async move {
+            let result = crate::agent::compact_idle(&provider, &basis, &options).await;
+            let _ = events.send(Background::IdleCompacted { job, basis, result });
+        });
+    }
+
+    /// Stop idle compaction: the person is back, or what it was summarising is
+    /// no longer open.
+    fn cancel_idle_compaction(&mut self) {
+        if let Some(job) = self.idle_compaction.take() {
+            job.store(true, Ordering::Relaxed);
+        }
+        self.quiet_since = None;
+    }
+
+    /// Take idle compaction's result, if it is still the summary of what is
+    /// here.
+    fn idle_compacted(&mut self, job: &Arc<AtomicBool>, basis: &[Value], result: Option<crate::agent::IdleCompaction>) {
+        // A stopped job reports too. It is not the one in flight, if any is.
+        if !self.idle_compaction.as_ref().is_some_and(|current| Arc::ptr_eq(current, job)) {
+            return;
+        }
+        self.idle_compaction = None;
+        // A rewind or a repair since then makes it the summary of something
+        // else.
+        let Some(compacted) = result.filter(|_| self.running.is_none() && self.messages == basis) else {
+            return;
+        };
+        self.messages = compacted.messages;
+        self.state.compaction.set(compacted.summary);
+        self.ctx_chars = message_chars(&self.messages);
+        self.provider.clear_context_tokens();
+        self.persist_session();
+        self.push_entry(Entry::new(
+            EntryKind::Rule,
+            format!("Compacted while you were away · saved {} tokens", ui::format_count(compacted.saved_tokens as u64)),
+        ));
     }
 
     fn persist_session(&mut self) {
@@ -2134,6 +2227,7 @@ impl App {
     /// that travels with one. Steering and worker reports already in flight
     /// stay queued: they belong to the process, not to a session.
     fn adopt(&mut self, session: Option<Session>) {
+        self.cancel_idle_compaction();
         let same = matches!((&self.session, &session), (Some(previous), Some(next)) if previous.id == next.id);
         if let Some(previous) = &self.session {
             crate::sync::session_closed(previous.id);
@@ -2450,6 +2544,7 @@ impl App {
                 Background::Remote { generation, event } => self.remote_event(generation, event),
                 Background::Pairing { view, result } => self.pairing_ready(view, result),
                 Background::Sync(result) => self.sync_finished(result),
+                Background::IdleCompacted { job, basis, result } => self.idle_compacted(&job, &basis, result),
             }
         }
         changed

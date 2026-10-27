@@ -33,7 +33,7 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8_192;
 /// compaction measures (`message_chars` is JSON byte length). JSON overhead
 /// makes this slightly conservative, which is the safe direction (compact a
 /// touch early rather than overflow).
-const CHARS_PER_TOKEN: usize = 4;
+pub(crate) const CHARS_PER_TOKEN: usize = 4;
 /// Tokens reserved for the system prompt, injected goal/task/summary context,
 /// and tool schemas before the model's input budget is computed.
 const RESERVED_TOKENS: usize = 6_000;

@@ -6,7 +6,8 @@ use std::sync::{
 };
 
 use abacus_agent::{
-    agent::{AgentEvent, ApprovalDecision, DoneReason, TurnOptions},
+    agent::{AgentEvent, ApprovalDecision, DoneReason, TurnOptions, compact_idle},
+    compaction::CompactionState,
     config::ProviderProtocol,
     provider::Provider,
     tools::tool_specs,
@@ -394,6 +395,99 @@ async fn rolling_summary_compaction_fires_on_large_context() {
     assert!(!contents.iter().any(|content| content.contains("BIGBLOB")), "compacted middle was not dropped");
     assert!(contents.contains(&"working on it"), "recent tail was not preserved");
     assert_eq!(completed.last().unwrap()["content"], "all done");
+}
+
+/// The summary a turn writes is the session's from then on. It used to live in
+/// the turn's own copy of the state and vanish with it, so the next turn found
+/// no summary and told the model the one it had just read no longer applied.
+#[tokio::test]
+async fn a_summary_written_mid_turn_carries_into_the_next_turn() {
+    let project = project(&[]);
+    let mock = Mock::answering(|request| match asked(request) {
+        Asked::Summary => Reply::Send(says("SUMMARY-OF-THE-THING")),
+        Asked::ReviewGate => Reply::Send(says(r#"{"should_refine": false, "rationale": "nothing to keep"}"#)),
+        _ => Reply::Send(says("all done")),
+    })
+    .await;
+    let state = CompactionState::default();
+    let options = || TurnOptions { compaction: state.clone(), ..project.options() };
+
+    let (mut messages, _) = turn(project.provider(&mock), oversized(&project), options(), |_| {}).await;
+    assert_eq!(state.snapshot().as_deref(), Some("SUMMARY-OF-THE-THING"));
+
+    messages.push(json!({"role":"user","content":"and now?"}));
+    let (messages, _) = turn(project.provider(&mock), messages, options(), |_| {}).await;
+    mock.abort();
+    let cleared = contents(&messages)
+        .into_iter()
+        .any(|content| content.contains("layer=\"summary\"") && content.contains("no longer applies"));
+    assert!(!cleared, "the next turn retracted the summary");
+    assert_eq!(state.snapshot().as_deref(), Some("SUMMARY-OF-THE-THING"));
+}
+
+/// A long session that went quiet after its last turn.
+fn finished(project: &support::Project) -> Vec<serde_json::Value> {
+    let mut messages = oversized(project);
+    messages.push(json!({"role":"assistant","content":"all done"}));
+    messages
+}
+
+/// A long session left idle is summarised from inside its own context — the
+/// request the provider still has cached — down to its opening and its last
+/// exchange. The session's state is left alone: committing is the front
+/// end's, if nothing moved meanwhile.
+#[tokio::test]
+async fn idle_compaction_summarises_in_context_down_to_the_last_exchange() {
+    let project = project(&[]);
+    let mock = Mock::answering(|request| match asked(request) {
+        Asked::Summary => Reply::Last(says("SUMMARY-OF-THE-THING")),
+        _ => Reply::Hang,
+    })
+    .await;
+    let options = project.options();
+    let compacted =
+        compact_idle(&project.provider(&mock), &finished(&project), &options).await.expect("the session was compacted");
+    let requests = mock.finish().await;
+
+    assert_eq!(requests.len(), 1, "one call: the summary");
+    assert!(requests[0].contains(IN_CONTEXT_SUMMARY) && requests[0].contains("BIGBLOB"), "asked in-context");
+    assert!(requests[0].contains("\"tools\""), "with the turns' tools, or the cached prefix moves");
+    assert_eq!(compacted.summary, "SUMMARY-OF-THE-THING");
+    let contents = contents(&compacted.messages);
+    assert!(!contents.iter().any(|content| content.contains("BIGBLOB")), "the middle was not dropped");
+    assert_eq!(
+        &contents[1..],
+        ["please do the thing", "continue", "all done"],
+        "the opening and the last exchange stay"
+    );
+    assert!(compacted.saved_tokens > 100_000, "saved {}", compacted.saved_tokens);
+    assert_eq!(options.compaction.snapshot(), None, "the state is the front end's to commit");
+}
+
+/// Under pressure a failed summary drops the middle anyway, to keep the turn
+/// going. Idle, nothing forces it: the history stays whole.
+#[tokio::test]
+async fn idle_compaction_without_a_summary_changes_nothing() {
+    let project = project(&[]);
+    let mock = Mock::answering(|_| Reply::Send(says(""))).await;
+    let options = project.options();
+    assert!(compact_idle(&project.provider(&mock), &finished(&project), &options).await.is_none());
+    mock.abort();
+    assert_eq!(options.compaction.snapshot(), None);
+}
+
+#[tokio::test]
+async fn idle_compaction_stops_when_the_person_comes_back() {
+    let project = project(&[]);
+    let mock = Mock::answering(|_| Reply::Hang).await;
+    let (provider, messages, options) = (project.provider(&mock), finished(&project), project.options());
+    let back = options.cancel.clone();
+    let compaction = tokio::spawn(async move { compact_idle(&provider, &messages, &options).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    back.store(true, Ordering::Relaxed);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), compaction).await;
+    mock.abort();
+    assert!(result.expect("it stops promptly").unwrap().is_none());
 }
 
 /// The tether's intent snapshot used to run *after* the answer, so every first

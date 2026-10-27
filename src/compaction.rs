@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use crate::agent::{message_chars, message_chars_one};
 use crate::model_info::CompactionBudget;
@@ -50,26 +52,68 @@ const COMPACTABLE_TOOLS: &[&str] = &[
     "git_log",
 ];
 
-/// Persisted rolling-summary state, carried across compactions and session resume.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Rolling-summary state, carried across compactions and session resume.
+///
+/// Shared, cloneable handle following the `GoalState` pattern: a turn writes
+/// the summary into the same state the front end holds, so the next turn
+/// starts from it. It used to be a plain value copied into each turn, so a
+/// summary written mid-turn was gone when the turn ended — and the next turn,
+/// finding no summary, marked the summary layer cleared while the history it
+/// stood in for stayed dropped.
+///
+/// Saved as `{"running_summary": …}`, the shape sessions have always had.
+#[derive(Debug, Clone, Default)]
 pub struct CompactionState {
+    summary: Arc<RwLock<Option<String>>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedCompaction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub running_summary: Option<String>,
+    running_summary: Option<String>,
+}
+
+impl Serialize for CompactionState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        SavedCompaction { running_summary: self.snapshot() }.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactionState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        SavedCompaction::deserialize(deserializer).map(|saved| Self::new(saved.running_summary))
+    }
 }
 
 impl CompactionState {
     pub fn new(running_summary: Option<String>) -> Self {
-        Self { running_summary }
+        Self { summary: Arc::new(RwLock::new(running_summary)) }
     }
 
     pub fn snapshot(&self) -> Option<String> {
-        self.running_summary.clone()
+        self.summary.read().expect("compaction lock").clone()
+    }
+
+    /// A separate state holding the same summary — for a session file, which
+    /// must not change behind its back when the live state moves on.
+    pub fn detached(&self) -> Self {
+        Self::new(self.snapshot())
+    }
+
+    pub fn set(&self, summary: String) {
+        *self.summary.write().expect("compaction lock") = Some(summary);
+    }
+
+    /// Characters the summary adds to every request: the summary is wrapped in
+    /// a template, so the wrapper's overhead counts too.
+    fn weight(&self) -> usize {
+        self.summary.read().expect("compaction lock").as_ref().map_or(0, |summary| summary.len() + 200)
     }
 
     /// Context injected as a system message every turn so the model retains the
     /// long-arc state of the goal/loop across compactions.
     pub fn prompt_context(&self) -> String {
-        match &self.running_summary {
+        match self.snapshot() {
             Some(summary) if !summary.trim().is_empty() => format!(
                 "<compaction_summary>\n{summary}\n</compaction_summary>\n\
                  This is a rolling summary of earlier conversation that was compacted to fit the context \
@@ -128,7 +172,7 @@ impl<'a> Summariser<'a> {
 pub async fn compact(
     summariser: &Summariser<'_>,
     messages: &mut Vec<Value>,
-    state: &mut CompactionState,
+    state: &CompactionState,
     budget: &CompactionBudget,
     cancel: &AtomicBool,
 ) {
@@ -168,13 +212,14 @@ pub async fn compact(
     }
 
     let to_summarize: Vec<Value> = messages[head_end..cut].to_vec();
-    let note = match summarize(summariser, state, messages, &to_summarize, budget, cancel).await {
+    let prior = state.snapshot();
+    let note = match summarize(summariser, prior.as_deref(), messages, &to_summarize, budget, cancel).await {
         Ok(summary) => {
             // Backstop: a model that ignores the compression directive must not
             // be able to reinstate the growth loop, so an oversized summary is
             // cut structurally. The tail is kept because the most recent state
             // is what the next turn needs.
-            state.running_summary = Some(bound_summary(summary, budget.summary_budget_chars));
+            state.set(bound_summary(summary, budget.summary_budget_chars));
             None
         }
         // Last-resort fallback: drop the middle with a local trace note so the
@@ -196,6 +241,70 @@ pub async fn compact(
     // still carry stale output.
     messages.splice(head_end..cut, note);
     microcompact(messages, budget);
+}
+
+/// How long a finished turn waits, with nobody typing, before idle compaction
+/// writes its summary: 90% of the five minutes a provider keeps a prompt cached
+/// (Anthropic's default lifetime, and about OpenAI's), so the summary call
+/// still reads the conversation from the cache. Written any later, the summary
+/// costs what the next message would have, and saves nothing.
+pub const IDLE_AFTER: Duration = Duration::from_secs(270);
+
+/// The smallest context idle compaction touches, in tokens. Below it, sending
+/// the history again uncached is cheap, and verbatim history is worth more than
+/// the saving.
+const IDLE_MIN_TOKENS: usize = 100_000;
+
+/// Whether a quiet session is worth compacting before the person comes back.
+///
+/// The bar is the smaller of `IDLE_MIN_TOKENS` and half the compaction trigger:
+/// on a small window, a context that far along is heading for a compaction
+/// anyway, and doing it now spares the person the wait.
+pub fn idle_worthwhile(messages: &[Value], state: &CompactionState, budget: &CompactionBudget) -> bool {
+    let bar = (IDLE_MIN_TOKENS * crate::model_info::CHARS_PER_TOKEN).min(budget.compact_at_chars / 2);
+    bar > 0 && message_chars(messages) + state.weight() >= bar && idle_cut(messages, budget).is_some()
+}
+
+/// The range idle compaction folds into the summary: everything between the
+/// verbatim head and a recent tail.
+///
+/// The tail is a third of the window a compaction under pressure keeps. That
+/// one is the working set of a turn still in flight; here the turn is over,
+/// and what the next message most likely refers to is the last exchange. The
+/// last reply stays whatever its size — it is what the person was reading when
+/// they left.
+fn idle_cut(messages: &[Value], budget: &CompactionBudget) -> Option<(usize, usize)> {
+    let head_end = first_legal_cut_at_or_after(messages, KEEP_FIRST);
+    let last = messages.iter().rposition(|message| message["role"] != "tool")?;
+    let cut = find_tail_cut(messages, budget.recent_budget_chars / 3, head_end).min(last);
+    (cut > head_end).then_some((head_end, cut))
+}
+
+/// The rolling summary, written ahead of time because the session went quiet.
+///
+/// Returns the shorter history and the summary that goes with it, and leaves
+/// `state` alone: the person may come back while it is being written, so the
+/// front end commits the pair only if nothing moved in the meantime. `None`
+/// when the session is not worth it or summarising failed — unlike compaction
+/// under pressure, nothing forces a drop, so a failure keeps the history whole.
+pub async fn compact_idle(
+    summariser: &Summariser<'_>,
+    messages: &[Value],
+    state: &CompactionState,
+    budget: &CompactionBudget,
+    cancel: &AtomicBool,
+) -> Option<(Vec<Value>, String)> {
+    if !idle_worthwhile(messages, state, budget) {
+        return None;
+    }
+    let (head_end, cut) = idle_cut(messages, budget)?;
+    let prior = state.snapshot();
+    let summary =
+        summarize(summariser, prior.as_deref(), messages, &messages[head_end..cut], budget, cancel).await.ok()?;
+    let mut compacted = messages.to_vec();
+    compacted.drain(head_end..cut);
+    microcompact(&mut compacted, budget);
+    Some((compacted, bound_summary(summary, budget.summary_budget_chars)))
 }
 
 /// Cap a summary at `budget` chars, keeping the end.
@@ -239,12 +348,7 @@ fn under_pressure(messages: &[Value], state: &CompactionState, budget: &Compacti
     if budget.compact_at_chars == 0 {
         return false;
     }
-    let mut total = message_chars(messages);
-    if let Some(summary) = &state.running_summary {
-        // The summary is wrapped in a template; add the wrapper overhead too.
-        total += summary.len() + 200;
-    }
-    total > budget.compact_at_chars
+    message_chars(messages) + state.weight() > budget.compact_at_chars
 }
 
 /// Index of the most recent `user` message, if any.
@@ -404,14 +508,14 @@ fn shrink_tool_result(name: &str, subject: &str, content: &str) -> String {
 /// never cost the session its compaction.
 async fn summarize(
     summariser: &Summariser<'_>,
-    state: &CompactionState,
+    prior: Option<&str>,
     conversation: &[Value],
     range: &[Value],
     budget: &CompactionBudget,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
     if summariser.in_context {
-        match summarize_in_context(summariser, state, conversation, budget, cancel).await {
+        match summarize_in_context(summariser, prior, conversation, budget, cancel).await {
             Ok(summary) => return Ok(summary),
             // Falling through is the point: an in-context call can fail for
             // reasons the detached one will not (a request one turn's worth
@@ -423,7 +527,7 @@ async fn summarize(
             Err(_) => {}
         }
     }
-    summarize_range(summariser.provider, state, range, budget, cancel).await
+    summarize_range(summariser.provider, prior, range, budget, cancel).await
 }
 
 /// Summarise by appending the instruction to the live conversation.
@@ -434,13 +538,13 @@ async fn summarize(
 /// about its own context, because that is what it is looking at.
 async fn summarize_in_context(
     summariser: &Summariser<'_>,
-    state: &CompactionState,
+    prior: Option<&str>,
     conversation: &[Value],
     budget: &CompactionBudget,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
     let mut directive = String::from(IN_CONTEXT_PROMPT);
-    if let Some(prior) = state.running_summary.as_deref().filter(|summary| !summary.trim().is_empty()) {
+    if let Some(prior) = prior.filter(|summary| !summary.trim().is_empty()) {
         directive.push_str(&format!(
             "\n\nEarlier conversation was already compacted into this summary. Fold everything \
              from it that still matters into the new one; do not lose a decision or constraint it \
@@ -475,13 +579,13 @@ async fn summarize_in_context(
 
 async fn summarize_range(
     provider: &Provider,
-    state: &CompactionState,
+    prior: Option<&str>,
     range: &[Value],
     budget: &CompactionBudget,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
     let prompt = json!({"role":"system","content": SUMMARY_PROMPT});
-    let prior = state.running_summary.as_deref().filter(|s| !s.trim().is_empty());
+    let prior = prior.filter(|s| !s.trim().is_empty());
     // Past its budget the summary has to be condensed rather than extended.
     // Extending unconditionally is what let it grow until it alone kept the
     // context over threshold, firing a summariser call every single turn.
@@ -923,5 +1027,96 @@ mod tests {
         let state = CompactionState::new(Some("did X".to_owned()));
         assert!(state.prompt_context().contains("did X"));
         assert!(CompactionState::default().prompt_context().is_empty());
+    }
+
+    /// A turn gets a clone of the session's state. When the clone was a copy,
+    /// the summary a turn wrote was gone when it ended.
+    #[test]
+    fn a_clone_shares_the_summary_and_a_detached_copy_does_not() {
+        let state = CompactionState::default();
+        let turn = state.clone();
+        let saved = state.detached();
+        turn.set("did X".to_owned());
+        assert_eq!(state.snapshot().as_deref(), Some("did X"));
+        assert_eq!(saved.snapshot(), None);
+    }
+
+    #[test]
+    fn the_saved_shape_is_unchanged() {
+        let state = CompactionState::new(Some("did X".to_owned()));
+        assert_eq!(serde_json::to_value(&state).unwrap(), json!({"running_summary": "did X"}));
+        assert_eq!(serde_json::to_value(CompactionState::default()).unwrap(), json!({}));
+        let loaded: CompactionState = serde_json::from_value(json!({"running_summary": "did Y"})).unwrap();
+        assert_eq!(loaded.snapshot().as_deref(), Some("did Y"));
+        let empty: CompactionState = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty.snapshot(), None);
+    }
+
+    /// system, opening prompt, a long middle of tool work, then the last
+    /// exchange.
+    fn long_session(body: usize) -> Vec<Value> {
+        let mut messages =
+            vec![json!({"role":"system","content":"rules"}), json!({"role":"user","content":"fix the importer"})];
+        tool_calls(&mut messages, 10, "edit_file", |_| "y".repeat(body));
+        messages.push(json!({"role":"user","content":"and the tests?"}));
+        messages.push(json!({"role":"assistant","content":"They pass."}));
+        messages
+    }
+
+    #[test]
+    fn idle_compaction_waits_for_a_context_worth_it() {
+        let budget = CompactionBudget {
+            compact_at_chars: 2_000_000,
+            recent_budget_chars: 600_000,
+            summary_budget_chars: 300_000,
+        };
+        let state = CompactionState::default();
+        // Under the 100k-token bar: resending it is cheap.
+        assert!(!idle_worthwhile(&long_session(30_000), &state, &budget));
+        assert!(idle_worthwhile(&long_session(45_000), &state, &budget));
+        // The summary is sent with every request, so it counts.
+        let carried = CompactionState::new(Some("z".repeat(200_000)));
+        assert!(idle_worthwhile(&long_session(30_000), &carried, &budget));
+
+        // On a small window the bar is half the compaction trigger.
+        let small =
+            CompactionBudget { compact_at_chars: 100_000, recent_budget_chars: 30_000, summary_budget_chars: 15_000 };
+        assert!(!idle_worthwhile(&long_session(4_000), &state, &small));
+        assert!(idle_worthwhile(&long_session(6_000), &state, &small));
+    }
+
+    #[test]
+    fn the_idle_cut_keeps_the_head_and_the_last_exchange() {
+        let budget =
+            CompactionBudget { compact_at_chars: 100_000, recent_budget_chars: 30_000, summary_budget_chars: 15_000 };
+        // Each tool result outgrows the 10k tail on its own.
+        let messages = long_session(12_000);
+        let (head_end, cut) = idle_cut(&messages, &budget).unwrap();
+        assert_eq!(head_end, KEEP_FIRST, "the system prompt and opening prompt stay");
+        assert_eq!(messages[cut]["content"], "and the tests?", "the last exchange stays whole");
+        assert_ne!(messages[cut]["role"], "tool", "a result never loses its call");
+    }
+
+    /// The tail budget is small, but the reply the person was reading when
+    /// they left is kept whatever its size.
+    #[test]
+    fn the_idle_cut_keeps_a_last_reply_larger_than_the_tail() {
+        let budget =
+            CompactionBudget { compact_at_chars: 100_000, recent_budget_chars: 30_000, summary_budget_chars: 15_000 };
+        let mut messages = long_session(6_000);
+        let last = messages.len() - 1;
+        messages[last]["content"] = json!("r".repeat(50_000));
+        let (_, cut) = idle_cut(&messages, &budget).unwrap();
+        assert!(cut <= last, "the last reply is never summarised away");
+    }
+
+    #[test]
+    fn a_short_session_has_nothing_to_fold() {
+        let budget =
+            CompactionBudget { compact_at_chars: 100_000, recent_budget_chars: 30_000, summary_budget_chars: 15_000 };
+        let messages =
+            vec![json!({"role":"system","content":"rules"}), json!({"role":"user","content":"x".repeat(80_000)})];
+        assert_eq!(idle_cut(&messages, &budget), None);
+        assert!(!idle_worthwhile(&messages, &CompactionState::default(), &budget));
     }
 }

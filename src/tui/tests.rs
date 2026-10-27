@@ -2863,3 +2863,82 @@ async fn ctrl_t_cycles_the_reasoning_effort() {
     handle_key(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
     assert_eq!(app.config.reasoning_effort, None);
 }
+
+/// What idle compaction hands back for a session whose history is `messages`.
+fn idle_result(messages: &[Value]) -> crate::agent::IdleCompaction {
+    crate::agent::IdleCompaction { messages: messages[..2].to_vec(), summary: "SUMMARY".into(), saved_tokens: 398_900 }
+}
+
+/// A session past the idle bar: an opening, a long middle, a last exchange.
+fn long_session(app: &mut App) {
+    app.messages.extend([
+        json!({"role":"user","content":"port the importer"}),
+        json!({"role":"assistant","content":"x".repeat(900_000)}),
+        json!({"role":"user","content":"and the tests?"}),
+        json!({"role":"assistant","content":"They pass."}),
+    ]);
+}
+
+/// The summary written while the person was away replaces the history, and
+/// the transcript says so.
+#[tokio::test]
+async fn idle_compaction_lands_when_nothing_moved() {
+    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
+    long_session(&mut app);
+    let job = Arc::new(AtomicBool::new(false));
+    app.idle_compaction = Some(job.clone());
+    let basis = app.messages.clone();
+    app.idle_compacted(&job, &basis, Some(idle_result(&basis)));
+
+    assert_eq!(app.messages, basis[..2]);
+    assert_eq!(app.state.compaction.snapshot().as_deref(), Some("SUMMARY"));
+    assert!(app.idle_compaction.is_none());
+    let rule = app.entries.last().unwrap();
+    assert_eq!(rule.kind, EntryKind::Rule);
+    assert_eq!(rule.text, "Compacted while you were away · saved 398.9k tokens");
+}
+
+/// Anything since — the history moving on, the person coming back — makes it
+/// the summary of something else.
+#[tokio::test]
+async fn a_stale_idle_compaction_is_dropped() {
+    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
+    long_session(&mut app);
+    let basis = app.messages.clone();
+
+    let job = Arc::new(AtomicBool::new(false));
+    app.idle_compaction = Some(job.clone());
+    app.messages.pop();
+    let moved = app.messages.clone();
+    app.idle_compacted(&job, &basis, Some(idle_result(&basis)));
+    assert_eq!(app.messages, moved, "a rewind since then wins");
+
+    app.messages = basis.clone();
+    let stopped = Arc::new(AtomicBool::new(false));
+    app.idle_compaction = Some(stopped.clone());
+    app.cancel_idle_compaction();
+    assert!(stopped.load(Ordering::Relaxed), "the job is told to stop");
+    app.idle_compacted(&stopped, &basis, Some(idle_result(&basis)));
+    assert_eq!(app.messages, basis, "a stopped job's result is not used");
+    assert_eq!(app.state.compaction.snapshot(), None);
+}
+
+/// A local server keeps its own cache and bills nothing for the history, so a
+/// summary would only lose detail; a short session is not worth one either.
+#[tokio::test]
+async fn idle_compaction_skips_local_servers_and_short_sessions() {
+    let long_ago = Instant::now().checked_sub(crate::compaction::IDLE_AFTER + Duration::from_secs(1)).unwrap();
+
+    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
+    long_session(&mut app);
+    app.quiet_since = Some(long_ago);
+    app.maybe_idle_compact();
+    assert!(app.idle_compaction.is_none());
+    assert!(app.quiet_since.is_none(), "once per quiet spell");
+
+    let (_directory, mut app) = test_app("https://models.invalid/v1");
+    app.messages.push(json!({"role":"user","content":"hi"}));
+    app.quiet_since = Some(long_ago);
+    app.maybe_idle_compact();
+    assert!(app.idle_compaction.is_none());
+}
