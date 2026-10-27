@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.7.1 — unreleased
+
+This release reworks how Abacus is configured and how it asks permission. It
+goes with an Abacus Desktop release that needs it: the desktop's model picker
+becomes a profile picker, and the window sets up a provider itself on first
+run.
+
+- **Providers and profiles.** Settings now have two parts. A provider is an API
+  connection: its URL, protocol and key, and anything else it needs (headers,
+  body fields, fields to remove, a token command or file, a system prompt
+  prefix, its own request or models URL), all set in one place: `/providers`,
+  the desktop's provider editor, or `[providers.<id>]`. Abacus asks each
+  provider for its models and names them `provider/model`
+  (`openrouter/openai/gpt-5`, `llama/qwen-3-4b`), caching the lists for a day
+  in `~/.abacus/models/`. A profile is one of those models with its settings
+  (context window, max output tokens, reasoning effort, tool format, upstream
+  routing, and the models its roles use), each with a default, and is named
+  after its model unless you name it. `abacus models`, `abacus providers` and
+  `abacus profiles` list them, with `--json` for a front end.
+
+- **Roles on any provider.** The auxiliary, safety reviewer, subagent and
+  compaction roles each take any provider's model, so a profile can hold the
+  conversation on one provider and run its background calls on a local model.
+
+- **Two modes: AUTO and YOLO.** PLAN, BUILD and the old AUTO are gone. AUTO, the
+  default, runs reading, edits inside the workspace and read-only commands at
+  once, and sends everything else to a reviewer model. The reviewer compares the
+  action with what you asked for in the session and blocks what you did not ask
+  for, and the agent is told why. You are asked only when the reviewer cannot
+  decide or cannot be reached. YOLO runs everything. `Shift+Tab` and
+  `/mode auto|yolo` switch between them, and `-y`/`--yolo` or `--mode` set the
+  mode for a run (`--always-approve` still works). Headless runs, scheduled jobs
+  and subagents cannot ask anyone, so in AUTO an action the reviewer cannot
+  clear is not run. "Allow for the rest of the session" is gone, since the
+  reviewer judges each action.
+
+- **A shorter setup.** `abacus setup` asks two things: the provider, and the
+  model to start with, from that provider's own list. The providers it offers
+  are Kojo, OpenRouter, Ollama, llama.cpp and LM Studio, with those that will
+  work straight away marked, or any other endpoint by its URL. Everything else
+  has a default. Running setup again adds a provider instead of replacing one.
+  The OpenAI, Anthropic, Gemini, xAI, DeepSeek, Mistral, Groq, Together,
+  Fireworks, Cerebras and vLLM presets are gone; each still works as a custom
+  provider by its URL.
+
+- **Old configurations convert themselves.** A version 2 `config.toml` becomes
+  providers and profiles the first time it is loaded, and the original is kept
+  as `config.toml.v2.bak`. Profiles that shared an endpoint and a key share a
+  provider, keys are copied to the provider's id in `credentials.toml`, and a
+  scripted endpoint's YAML file is folded into its provider. The examples that
+  were in `docs/endpoints` are in `docs/providers`.
+
+- **Renamed: upstream routing.** `/providers` and `abacus providers` used to pin
+  and list OpenRouter's upstreams. That routing is now a profile setting
+  (`upstreams`, `allow_fallbacks`, in `/config`), and `abacus upstreams` lists
+  the upstreams that can serve the active model.
+
+- **App server: providers and profiles.** `presets/list`, `providers/list`,
+  `provider/save`, `provider/remove`, `provider/models`, `profiles/list`,
+  `profile/select`, `profile/save` and `profile/remove` manage them;
+  `thread/profile/updated` announces a change of profile, and `initialize`
+  reports `needsSetup` when there is no provider yet. `config/value/write` takes
+  `profile`, the modes are `auto` and `yolo`, and approvals offer `accept`,
+  `decline` and `cancel`.
+
+- **Fewer commands and tools.** The terminal's commands are now `/profile`,
+  `/providers`, `/mode`, `/effort`, `/config`, `/goal`, `/loop`, `/btw`, `/new`,
+  `/fork`, `/resume`, `/rename`, `/compact`, `/repair`, `/memory`, `/tools`,
+  `/usage`, `/theme`, `/remote`, `/feedback`, `/help` and `/quit`. `/memory`
+  covers memories, papercuts and the harness log; `/tools` also lists skills,
+  plugin commands and MCP tools. `/plan`, `/swarm` and `/thinking` are gone:
+  `F3` still shows or hides reasoning, and parallel work is a plain request.
+  The older names of the commands that remain still work as aliases. The agent
+  no longer has `append_file`, `create_directory`, `git_show`, `git_blame`,
+  `git_restore`, `git_checkout`, `mode_set`, `handle_list`, `skill_search`,
+  `skill_reload`, `memory_list` or `papercut_list`, each of which repeated
+  another tool or what the prompt already carries.
+
+Also since 0.7.0:
+
+- `read_page` refuses a page whose host resolves to a private address.
+- The `git_diff` and `git_log` path filters cannot reach `.env` files.
+- `Ctrl+T` cycles the reasoning effort.
+- The content width and the input box height can be set.
+- The composer wraps by display width.
+- Skills installed as symlinks are found.
+- The app server reports how full the context is.
+- A front end's tools may repeat their arguments.
+- The check for a new release no longer needs the GitHub API.
+
 ## 0.7.0 — 2026-10-14
 
 This release goes with the first release of
