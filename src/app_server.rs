@@ -679,6 +679,13 @@ impl App {
                 self.persist();
                 Ok(json!({"before": before, "after": self.thread.messages.len()}))
             }
+            // The person is writing in the window, which nothing else tells
+            // the app server, so idle compaction waits, as it does for a
+            // keystroke in the terminal.
+            "thread/typing" => {
+                self.hold_idle_compaction();
+                Ok(json!({}))
+            }
             "turn/interrupt" => {
                 self.cancel.store(true, Ordering::Relaxed);
                 Ok(json!({"interrupting": self.turn_id.is_some()}))
@@ -1403,6 +1410,15 @@ impl App {
             let result = crate::agent::compact_idle(&provider, &basis, &options).await;
             let _ = done.send(IdleDone { job, basis, result });
         });
+    }
+
+    /// Start the quiet spell idle compaction waits for over again: the person
+    /// is writing. One already writing its summary goes on; sending the
+    /// message stops it.
+    fn hold_idle_compaction(&mut self) {
+        if self.idle_due.is_some() {
+            self.idle_due = Some(tokio::time::Instant::now() + crate::compaction::IDLE_AFTER);
+        }
     }
 
     /// Stop idle compaction: a turn is starting, or the thread it was

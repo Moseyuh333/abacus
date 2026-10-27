@@ -239,16 +239,39 @@ pub fn key_in_env(preset: &Preset) -> bool {
 
 /// Whether `url` points at this machine.
 pub fn is_local_url(url: &str) -> bool {
+    let host = url_host(url);
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "0.0.0.0" | "::1") || host.ends_with(".localhost")
+}
+
+/// Whether `url` points at this machine or its local network: a loopback,
+/// private or link-local address (Tailscale's 100.64.0.0/10 too), a name with
+/// no dot, or one under a suffix only a local network resolves. A model server
+/// there is the user's own: it bills nothing for a long prompt and keeps its
+/// own cache.
+pub fn is_local_network_url(url: &str) -> bool {
+    if is_local_url(url) {
+        return true;
+    }
+    let host = url_host(url);
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let tailscale = matches!(ip, std::net::IpAddr::V4(v4) if v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64);
+        return tailscale || crate::web::is_private_ip(ip);
+    }
+    !host.contains('.')
+        || [".local", ".lan", ".home.arpa", ".internal", ".ts.net"].iter().any(|suffix| host.ends_with(suffix))
+}
+
+/// The host a URL names, lower-cased, without its port or brackets.
+fn url_host(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
     // An IPv6 host is bracketed, and its colons are not a port.
-    let host = match authority.strip_prefix('[') {
+    match authority.strip_prefix('[') {
         Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
         None => authority.split(':').next().unwrap_or_default(),
     }
-    .to_ascii_lowercase();
-    matches!(host.as_str(), "localhost" | "127.0.0.1" | "0.0.0.0" | "::1") || host.ends_with(".localhost")
+    .to_ascii_lowercase()
 }
 
 /// Provider ids appear in every model reference (`{id}/{model}`), so they are
@@ -925,6 +948,31 @@ mod tests {
         }
         for url in ["https://openrouter.ai/api/v1", "https://localhost.example.com/v1"] {
             assert!(!is_local_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_server_on_the_local_network_counts_as_local() {
+        for url in [
+            "http://localhost:11434/v1",
+            "http://192.168.1.20:8080/v1",
+            "http://10.0.0.5/v1",
+            "http://172.20.1.1:1234/v1",
+            "http://100.101.102.103:11434/v1",
+            "http://[fd12::1]:8080/v1",
+            "http://nas:11434/v1",
+            "http://gpu-box.local:8080/v1",
+            "http://ollama.lan/v1",
+            "http://llm.home.arpa/v1",
+            "http://host.docker.internal:11434/v1",
+            "http://gpu.tail1234.ts.net:8080/v1",
+        ] {
+            assert!(is_local_network_url(url), "{url}");
+        }
+        for url in
+            ["https://api.kojo.sh/v1", "https://openrouter.ai/api/v1", "http://8.8.8.8/v1", "http://100.200.1.1/v1"]
+        {
+            assert!(!is_local_network_url(url), "{url}");
         }
     }
 

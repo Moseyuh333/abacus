@@ -77,12 +77,15 @@ run.
   turn, Abacus summarises it while the provider still has it cached, keeping
   the opening and the last exchange. The next message then does not send the
   whole history again at full price. The transcript says "Compacted while you
-  were away" and how many tokens it saved. Typing in the terminal holds it off,
-  and sending a message stops one in progress. It is off for local servers and
-  can be turned off with `idle_compaction` under `[agent]`, in `/config`, or in
-  the desktop's settings. In the app server it is the `idleCompaction`
-  capability, the `thread/compacted` notification and the `idle_compaction`
-  config key.
+  were away" and how many tokens it saved. Typing holds it off, in the
+  terminal and in the desktop, and sending a message stops one in progress. It
+  is off for model servers on this machine or the local network (private and
+  Tailscale addresses, names without a dot, `.local` and `.lan` names and the
+  like) and can be turned off with `idle_compaction` under `[agent]`, in
+  `/config`, or in the desktop's settings. In the app server it is the
+  `idleCompaction` capability, the `thread/compacted` notification, the
+  `thread/typing` request a client sends while the person writes, and the
+  `idle_compaction` config key.
 
 - **Sessions can find and message each other.** A fork remembers the session
   it came from. Every open session (in a terminal, the desktop or a headless

@@ -764,7 +764,7 @@ fn is_private_host(host: &str) -> bool {
     candidate.parse::<std::net::IpAddr>().is_ok_and(is_private_ip)
 }
 
-fn is_private_ip(ip: std::net::IpAddr) -> bool {
+pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     match ip {
         IpAddr::V4(v4) => {

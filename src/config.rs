@@ -551,10 +551,11 @@ impl Config {
     }
 
     /// Whether a long session that goes quiet is compacted before the person
-    /// comes back. Not on a local server: it bills nothing for resending the
-    /// history and keeps its own cache, so a summary would only lose detail.
+    /// comes back. Not on a server on this machine or its local network: it
+    /// bills nothing for resending the history and keeps its own cache, so a
+    /// summary would only lose detail.
     pub fn compacts_when_idle(&self) -> bool {
-        self.idle_compaction && !crate::providers::is_local_url(&self.connection.base_url)
+        self.idle_compaction && !crate::providers::is_local_network_url(&self.connection.base_url)
     }
 
     /// Point this configuration at another profile, the way `/profile` and
