@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.1 — unreleased
+## 0.7.1 — 2026-10-27
 
 This release reworks how Abacus is configured and how it asks permission. It
 goes with an Abacus Desktop release that needs it: the desktop's model picker
