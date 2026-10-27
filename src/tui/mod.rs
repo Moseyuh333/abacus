@@ -1606,6 +1606,9 @@ impl App {
                         format!("Training trace disabled — {error}")
                     });
                 }
+                AgentEvent::SubagentReport(_) => self.say(crate::agent::REPORT_NOTICE),
+                AgentEvent::AgentMessage { from, text } => self.say(crate::agent::message_notice(&from, &text)),
+                AgentEvent::MessageSent { .. } => {}
                 AgentEvent::Notice(notice) => {
                     self.say(notice);
                 }

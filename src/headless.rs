@@ -195,6 +195,11 @@ pub async fn run(
             // Headless output is the answer, not the deliberation.
             AgentEvent::Reasoning(_) => {}
             AgentEvent::Notice(notice) => eprintln!("note: {notice}"),
+            AgentEvent::SubagentReport(_) => eprintln!("note: {}", crate::agent::REPORT_NOTICE),
+            AgentEvent::AgentMessage { from, text } => {
+                eprintln!("note: {}", crate::agent::message_notice(&from, &text))
+            }
+            AgentEvent::MessageSent { .. } => {}
             AgentEvent::PeerMessage(message) => eprintln!("message {}: {}", message.origin(), message.text),
             AgentEvent::TraceFailed { error } => {
                 eprintln!("warning: training trace disabled — {error}");

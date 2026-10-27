@@ -375,6 +375,23 @@ impl WorkerLog {
                     item["output"] = json!(crate::text::clip(output, LOG_TOOL_OUTPUT, "\n…"));
                 }
             }
+            // A message from a sibling or `main` lands where the worker read
+            // it, like the main thread's.
+            AgentEvent::AgentMessage { from, text } => {
+                self.open_text = None;
+                self.open_reasoning = None;
+                self.push(crate::app_server::agent_item(from, text));
+            }
+            AgentEvent::MessageSent { text, .. } => {
+                if let Some(item) = self
+                    .items
+                    .iter_mut()
+                    .rev()
+                    .find(|item| item["name"] == "send_message" && item["status"] == "inProgress")
+                {
+                    item["message"] = json!(text);
+                }
+            }
             _ => {}
         }
     }
@@ -728,6 +745,32 @@ mod tests {
         assert_eq!(items[2]["status"], "completed");
         assert_eq!(items[2]["output"], "src/moe.rs:12");
         assert_eq!(items[3]["text"], "Found it in src/moe.rs.", "streamed text joins into one item");
+    }
+
+    /// What a worker hears from the others shows where it read it, and what
+    /// it sends stays on its send_message call.
+    #[test]
+    fn a_workers_transcript_keeps_its_messages() {
+        use crate::agent::AgentEvent;
+        let board = WorkerBoard::default();
+        let id = board.begin("perf", "general", Arc::default());
+        board.describe(id, "qwen3-coder", "make the report fast");
+        board.record(id, &AgentEvent::Delta("Reading first.".into()));
+        board.record(id, &AgentEvent::AgentMessage { from: "callers".into(), text: "keep the keys".into() });
+        board.record(id, &AgentEvent::ToolStarted { name: "send_message".into(), summary: "main".into() });
+        board.record(id, &AgentEvent::MessageSent { to: "main".into(), text: "one query now".into() });
+        board.record(
+            id,
+            &AgentEvent::ToolFinished { name: "send_message".into(), output: "Sent.".into(), refused: false },
+        );
+
+        let items = board.transcript(id).unwrap();
+        let kinds: Vec<&str> = items.iter().map(|item| item["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["userMessage", "agentMessage", "userMessage", "functionCall"]);
+        assert_eq!(items[2]["text"], "keep the keys");
+        assert_eq!(items[2]["from"], serde_json::json!({"title": "callers", "agent": true}));
+        assert_eq!(items[3]["message"], "one query now");
+        assert_eq!(items[3]["status"], "completed");
     }
 
     #[test]

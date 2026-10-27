@@ -112,6 +112,20 @@ pub enum AgentEvent {
     /// A message from another session reached the model, mid-turn or as the
     /// turn's opening prompt. The front end shows it with who sent it.
     PeerMessage(crate::inbox::Message),
+    /// Another agent's message reached the model: a subagent's, or on a
+    /// subagent's own turn a sibling's or `main`'s. The front end shows it
+    /// with who sent it, not as the prompt that carried it.
+    AgentMessage {
+        from: String,
+        text: String,
+    },
+    /// The report of background subagents that finished reached the model.
+    SubagentReport(String),
+    /// What a `send_message` call says, right after its `ToolStarted`.
+    MessageSent {
+        to: String,
+        text: String,
+    },
     Failed {
         error: String,
         messages: Vec<Value>,
@@ -672,6 +686,11 @@ async fn run_turn_inner(
             // A refused call is shown as an attempt that was stopped, so the
             // person sees what the agent tried and why it did not run.
             let _ = events.send(AgentEvent::ToolStarted { name: call.name.clone(), summary: call.summary() });
+            if call.name == "send_message"
+                && let (Some(to), Some(text)) = (argument(&call, "to"), argument(&call, "message"))
+            {
+                let _ = events.send(AgentEvent::MessageSent { to, text });
+            }
             let refused = refusal.is_some();
             let mut output = match refusal {
                 Some(refusal) => refusal,
@@ -1420,16 +1439,14 @@ fn deliver_injections(options: &TurnOptions, messages: &mut Vec<Value>, events: 
                 ))
             }
             Injection::SubagentReport(report) => {
-                let _ = events
-                    .send(AgentEvent::Notice("a background subagent finished; its report was delivered".to_owned()));
+                let _ = events.send(AgentEvent::SubagentReport(report.clone()));
                 Value::String(format!(
                     "[background subagent finished] {report}\n\nFold this into what you are \
                      doing; if it changes the plan, say so."
                 ))
             }
             Injection::AgentMessage { from, text } => {
-                let summary = crate::text::clip(&crate::text::squeeze(text), 160, "…");
-                let _ = events.send(AgentEvent::Notice(format!("message from {from} — {summary}")));
+                let _ = events.send(AgentEvent::AgentMessage { from: from.clone(), text: text.clone() });
                 Value::String(agent_message(from, text))
             }
             Injection::PeerMessage(message) => {
@@ -1455,6 +1472,44 @@ pub fn agent_message(from: &str, text: &str) -> String {
 /// the turn that delivers it.
 pub fn report_prompt(report: &str) -> String {
     format!("[background subagent finished] {report}\n\nFold this into the work; if it changes the plan, say so.")
+}
+
+/// What a terminal says when background subagents' report reaches the model.
+pub const REPORT_NOTICE: &str = "a background subagent finished; its report was delivered";
+
+/// What a terminal says when another agent's message reaches the model.
+pub fn message_notice(from: &str, text: &str) -> String {
+    let summary = crate::text::clip(&crate::text::squeeze(text), 160, "…");
+    format!("message from {from} — {summary}")
+}
+
+/// Another agent's words, as a saved conversation holds them.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Arrival {
+    /// Background subagents' report.
+    Report(String),
+    /// A message, and who sent it: a subagent's name, or `main`.
+    Message { from: String, text: String },
+}
+
+/// Recover another agent's words from the prompt that delivered them
+/// ([`report_prompt`], [`agent_message`] and the mid-turn report), so a
+/// reopened thread shows them as they arrived.
+pub fn arrival(prompt: &str) -> Option<Arrival> {
+    if let Some(rest) = prompt.strip_prefix("[background subagent finished] ") {
+        let report = rest.rsplit_once("\n\nFold this into ").map_or(rest, |(report, _)| report);
+        return Some(Arrival::Report(report.to_owned()));
+    }
+    let rest = prompt.strip_prefix("[message from ")?;
+    let (from, rest) = match rest.strip_prefix("the agent that started you] ") {
+        Some(rest) => (crate::workers::MAIN.to_owned(), rest),
+        None => {
+            let (name, rest) = rest.strip_prefix("subagent `")?.split_once("`] ")?;
+            (name.to_owned(), rest)
+        }
+    };
+    let text = rest.strip_suffix("\n\nReply with send_message if it needs an answer.").unwrap_or(rest);
+    Some(Arrival::Message { from, text: text.to_owned() })
 }
 
 /// Whether a saved tool result is a refusal: the call did not run because a
@@ -1598,15 +1653,62 @@ mod tests {
         let report = messages[2]["content"].as_str().unwrap();
         assert!(report.starts_with("[background subagent finished]"), "{report}");
         assert!(report.contains("worker alpha: done, 3 files"));
-        // Both are surfaced to the user as notices.
+        // Steering is surfaced as a notice, the report as what it is.
         let mut notices = Vec::new();
+        let mut reports = Vec::new();
         while let Ok(event) = receiver.try_recv() {
-            if let AgentEvent::Notice(text) = event {
-                notices.push(text);
+            match event {
+                AgentEvent::Notice(text) => notices.push(text),
+                AgentEvent::SubagentReport(report) => reports.push(report),
+                _ => {}
             }
         }
-        assert_eq!(notices.len(), 2);
+        assert_eq!(notices.len(), 1);
         assert!(notices[0].starts_with("steering —"), "{}", notices[0]);
+        assert_eq!(reports, ["worker alpha: done, 3 files"]);
+    }
+
+    /// A message from another agent reaches the model labelled with who sent
+    /// it, and the front end hears it whole.
+    #[test]
+    fn a_message_from_another_agent_arrives_whole() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let queue = InjectionQueue::default();
+        queue.push(Injection::AgentMessage { from: "callers".into(), text: "keep the keys".into() });
+        let mut messages = Vec::new();
+
+        deliver_injections(&test_turn_options(queue), &mut messages, &events);
+
+        assert_eq!(messages[0]["content"], agent_message("callers", "keep the keys"));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AgentEvent::AgentMessage { from, text }) if from == "callers" && text == "keep the keys"
+        ));
+    }
+
+    /// A saved subagent message or report is recovered from the prompt that
+    /// delivered it: mid-turn or as a turn's opening, from a sibling or `main`.
+    #[test]
+    fn arrivals_are_recovered_from_their_prompts() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let queue = InjectionQueue::default();
+        queue.push(Injection::SubagentReport("## a\nStatus: completed\ndone".into()));
+        let mut messages = Vec::new();
+        deliver_injections(&test_turn_options(queue), &mut messages, &events);
+        let mid_turn = messages[0]["content"].as_str().unwrap();
+
+        assert_eq!(arrival(mid_turn), Some(Arrival::Report("## a\nStatus: completed\ndone".into())));
+        assert_eq!(arrival(&report_prompt("found it")), Some(Arrival::Report("found it".into())));
+        assert_eq!(
+            arrival(&agent_message("perf", "one query\n\nsame keys")),
+            Some(Arrival::Message { from: "perf".into(), text: "one query\n\nsame keys".into() })
+        );
+        assert_eq!(
+            arrival(&agent_message(crate::workers::MAIN, "stop there")),
+            Some(Arrival::Message { from: "main".into(), text: "stop there".into() })
+        );
+        assert_eq!(arrival("[message from nowhere"), None);
+        assert_eq!(arrival("fix the importer"), None);
     }
 
     /// Another session's message reaches the model labelled as such, and the

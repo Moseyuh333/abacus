@@ -144,15 +144,21 @@ struct OpenItem {
     id: String,
     kind: &'static str,
     summary: String,
+    /// What a `send_message` call said.
+    message: Option<String>,
 }
 
 impl OpenItem {
     /// The item as a client sees a tool call at `status`.
     fn tool(&self, name: &str, status: &str) -> Value {
-        json!({
+        let mut item = json!({
             "id": self.id, "type": self.kind, "name": name,
             "command": self.summary, "status": status,
-        })
+        });
+        if let Some(message) = &self.message {
+            item["message"] = json!(message);
+        }
+        item
     }
 }
 
@@ -483,6 +489,10 @@ impl App {
                     // Sessions message each other: `live` on thread/list, and
                     // a `from` on the userMessage items they send.
                     "sessionMessages": true,
+                    // Subagents' messages and reports are userMessage items
+                    // `from` an agent (`from.agent`), `report` on a report;
+                    // a send_message call's item carries its `message`.
+                    "subagentMessages": true,
                 },
                 "idleCompaction": self.config.idle_compaction,
                 "thread": self.thread_snapshot(),
@@ -1474,7 +1484,7 @@ impl App {
         if !self.open_items.contains_key(kind) {
             let id = self.next("item");
             self.item("started", json!({"id": id, "type": kind, "text": ""}));
-            self.open_items.insert(kind.to_owned(), OpenItem { id, kind, summary: String::new() });
+            self.open_items.insert(kind.to_owned(), OpenItem { id, kind, summary: String::new(), message: None });
         }
         let open = self.open_items.get_mut(kind).expect("opened above");
         open.summary.push_str(&text);
@@ -1492,7 +1502,8 @@ impl App {
 
     /// Open the item for a tool call and announce it at `status`.
     fn open_tool(&mut self, name: &str, summary: &str, status: &str) -> String {
-        let open = OpenItem { id: self.next("item"), kind: item_type(name), summary: summary.to_owned() };
+        let open =
+            OpenItem { id: self.next("item"), kind: item_type(name), summary: summary.to_owned(), message: None };
         self.item("started", open.tool(name, status));
         let id = open.id.clone();
         self.open_items.insert(name.to_owned(), open);
@@ -1549,6 +1560,24 @@ impl App {
                 let mut item = peer_item(&message.from.title, message.from.session, &message.text);
                 item["id"] = json!(self.next("item"));
                 self.item("completed", item);
+            }
+            // So does a subagent's message, or their report.
+            AgentEvent::AgentMessage { from, text } => {
+                self.flush_streaming();
+                let mut item = agent_item(&from, &text);
+                item["id"] = json!(self.next("item"));
+                self.item("completed", item);
+            }
+            AgentEvent::SubagentReport(report) => {
+                self.flush_streaming();
+                let mut item = report_item(&report);
+                item["id"] = json!(self.next("item"));
+                self.item("completed", item);
+            }
+            AgentEvent::MessageSent { text, .. } => {
+                if let Some(open) = self.open_items.get_mut("send_message") {
+                    open.message = Some(text);
+                }
             }
             AgentEvent::TraceFailed { error } => {
                 notify("warning", json!({"message": format!("training trace off — {error}")}))
@@ -1677,9 +1706,17 @@ impl App {
         let (content, steer) = match self.thread.state.injections.take_starter() {
             Some(Injection::UserMessage(text)) => (Value::String(text.clone()), Some(text)),
             Some(Injection::UserContent { text, content }) => (content, Some(text)),
-            Some(Injection::SubagentReport(report)) => (Value::String(crate::agent::report_prompt(&report)), None),
+            // A subagent's report or message opens the turn, shown as what it
+            // is rather than as the prompt that carries it.
+            Some(Injection::SubagentReport(report)) => {
+                let content = Value::String(crate::agent::report_prompt(&report));
+                self.begin_turn(content, report_item(&report), events);
+                return;
+            }
             Some(Injection::AgentMessage { from, text }) => {
-                (Value::String(crate::agent::agent_message(&from, &text)), None)
+                let content = Value::String(crate::agent::agent_message(&from, &text));
+                self.begin_turn(content, agent_item(&from, &text), events);
+                return;
             }
             // Another session wrote while nothing was running: its message is
             // the next turn, shown with who sent it.
@@ -2158,6 +2195,19 @@ fn peer_item(title: &str, session: Option<uuid::Uuid>, text: &str) -> Value {
     })
 }
 
+/// Another agent's message as a client item: a `userMessage` `from` that
+/// agent, which a client that predates them shows like another session's.
+pub(crate) fn agent_item(from: &str, text: &str) -> Value {
+    json!({"type": "userMessage", "text": text, "from": {"title": from, "agent": true}})
+}
+
+/// Background subagents' report as a client item, from the workers it covers.
+fn report_item(report: &str) -> Value {
+    let workers = crate::subagent::report_workers(report);
+    let title = if workers.is_empty() { "background subagents".to_owned() } else { workers.join(", ") };
+    json!({"type": "userMessage", "text": report, "report": true, "from": {"title": title, "agent": true}})
+}
+
 /// The token ledger as a client sees it. `cacheRate` is omitted rather than
 /// zeroed when the endpoint reports no cache figures, so a client can tell "no
 /// hits" from "no information".
@@ -2190,6 +2240,17 @@ fn history_items(messages: &[Value]) -> Vec<Value> {
             Some((id, call.summary()))
         })
         .collect();
+    // And what each `send_message` said, as the live item carries it.
+    let sent: HashMap<&str, String> = messages
+        .iter()
+        .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+        .filter(|call| call["function"]["name"] == "send_message")
+        .filter_map(|call| {
+            let arguments = call["function"]["arguments"].as_str()?;
+            let arguments = serde_json::from_str::<Value>(arguments).ok()?;
+            Some((call["id"].as_str()?, arguments["message"].as_str()?.to_owned()))
+        })
+        .collect();
 
     let mut items = Vec::new();
     for (index, message) in messages.iter().enumerate() {
@@ -2212,10 +2273,15 @@ fn history_items(messages: &[Value]) -> Vec<Value> {
                 }
             }
             "user" => {
-                let shown = crate::inbox::shown(&crate::text::content_text(&message["content"]));
-                let mut item = match shown {
-                    Some((title, text)) => peer_item(&title, None, &text),
-                    None => user_item(&message["content"]),
+                let said = crate::text::content_text(&message["content"]);
+                let mut item = if let Some((title, text)) = crate::inbox::shown(&said) {
+                    peer_item(&title, None, &text)
+                } else {
+                    match crate::agent::arrival(&said) {
+                        Some(crate::agent::Arrival::Report(report)) => report_item(&report),
+                        Some(crate::agent::Arrival::Message { from, text }) => agent_item(&from, &text),
+                        None => user_item(&message["content"]),
+                    }
                 };
                 let empty = item["text"].as_str().is_none_or(|text| text.trim().is_empty())
                     && item.get("images").is_none()
@@ -2246,6 +2312,9 @@ fn history_items(messages: &[Value]) -> Vec<Value> {
                 });
                 if let Some(summary) = message["tool_call_id"].as_str().and_then(|call| summaries.get(call)) {
                     item["command"] = json!(summary);
+                }
+                if let Some(said) = message["tool_call_id"].as_str().and_then(|call| sent.get(call)) {
+                    item["message"] = json!(said);
                 }
                 items.push(item);
             }
@@ -2417,6 +2486,34 @@ mod tests {
         assert_eq!(items[0]["text"], "tests pass here");
         assert_eq!(items[0]["from"]["title"], "Fork A");
         assert!(items[1].get("from").is_none());
+    }
+
+    /// A subagent's message and a background report show as what they are,
+    /// not as the prompts that delivered them; a sent message keeps its text.
+    #[test]
+    fn history_shows_subagent_messages_and_reports() {
+        let report = "## callers\nStatus: completed\nThree callers.\n\n## perf\nStatus: completed\nOne query.\n";
+        let items = history_items(&[
+            json!({"role": "user", "content": crate::agent::agent_message("perf", "tests pass")}),
+            json!({"role": "user", "content": crate::agent::report_prompt(report)}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "send_message", "arguments": "{\"to\": \"perf\", \"message\": \"keep the keys\"}"},
+                }],
+            }),
+            json!({"role": "tool", "name": "send_message", "tool_call_id": "call_1", "content": "Sent."}),
+        ]);
+        assert_eq!(items[0]["text"], "tests pass");
+        assert_eq!(items[0]["from"], json!({"title": "perf", "agent": true}));
+        assert_eq!(items[1]["text"], report);
+        assert_eq!(items[1]["report"], true);
+        assert_eq!(items[1]["from"]["title"], "callers, perf");
+        assert_eq!(items[2]["command"], "perf");
+        assert_eq!(items[2]["message"], "keep the keys");
     }
 
     /// A reopened thread shows where compaction cut its history, and how

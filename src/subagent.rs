@@ -960,15 +960,33 @@ fn format_results_json(results: &[SubagentResult]) -> String {
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned())
 }
 
+/// The workers a background report covers, by name: each `## name` that
+/// opens a section of [`format_results`], or the one a resumed worker's
+/// report names.
+pub fn report_workers(report: &str) -> Vec<String> {
+    if let Some(rest) = report.strip_prefix("worker `")
+        && let Some((name, _)) = rest.split_once('`')
+    {
+        return vec![name.to_owned()];
+    }
+    let lines: Vec<&str> = report.lines().collect();
+    lines
+        .windows(2)
+        .filter(|pair| pair[1].starts_with("Status: "))
+        .filter_map(|pair| pair[0].strip_prefix("## "))
+        .map(str::to_owned)
+        .collect()
+}
+
 fn format_results(results: &[SubagentResult], applied: bool) -> String {
     let mut output = String::new();
     for result in results {
         output.push_str(&format!("## {}\n", result.name));
         if let Some(error) = &result.error {
-            output.push_str(&format!("Status: failed\n{error}\n\n"));
+            output.push_str(&format!("Status: failed\n\n{error}\n\n"));
             continue;
         }
-        output.push_str(if applied { "Status: patch applied\n" } else { "Status: completed\n" });
+        output.push_str(if applied { "Status: patch applied\n\n" } else { "Status: completed\n\n" });
         output.push_str(&result.response);
         output.push('\n');
         if let Some(value) = &result.structured {
@@ -1003,6 +1021,16 @@ mod tests {
             structured,
             error: error.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn a_report_names_the_workers_it_covers() {
+        let report = format_results(&[result("callers", None, None), result("perf", None, Some("timed out"))], false);
+        assert_eq!(report_workers(&report), ["callers", "perf"]);
+        // A heading in a worker's own answer is not another worker.
+        assert_eq!(report_workers("## a\nStatus: completed\n## Findings\nnone\n"), ["a"]);
+        assert_eq!(report_workers("worker `perf` (resumed): done"), ["perf"]);
+        assert!(report_workers("all good").is_empty());
     }
 
     #[test]
