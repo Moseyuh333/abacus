@@ -105,15 +105,36 @@ run.
 - **Fewer commands and tools.** The terminal's commands are now `/profile`,
   `/providers`, `/mode`, `/effort`, `/config`, `/goal`, `/loop`, `/btw`, `/new`,
   `/fork`, `/resume`, `/rename`, `/compact`, `/repair`, `/memory`, `/tools`,
-  `/usage`, `/theme`, `/remote`, `/feedback`, `/help` and `/quit`. `/memory`
-  covers memories, papercuts and the harness log; `/tools` also lists skills,
-  plugin commands and MCP tools. `/plan`, `/swarm` and `/thinking` are gone:
-  `F3` still shows or hides reasoning, and parallel work is a plain request.
-  The older names of the commands that remain still work as aliases. The agent
-  no longer has `append_file`, `create_directory`, `git_show`, `git_blame`,
-  `git_restore`, `git_checkout`, `mode_set`, `handle_list`, `skill_search`,
-  `skill_reload`, `memory_list` or `papercut_list`, each of which repeated
-  another tool or what the prompt already carries.
+  `/usage`, `/theme`, `/remote`, `/feedback`, `/help` and `/quit`. `/tools`
+  also lists skills, plugin commands and MCP tools. `/plan`, `/swarm` and
+  `/thinking` are gone: `F3` still shows or hides reasoning, and parallel work
+  is a plain request. The older names of the commands that remain still work
+  as aliases. The agent no longer has `append_file`, `create_directory`,
+  `git_show`, `git_blame`, `git_restore`, `git_checkout`, `mode_set`,
+  `handle_list`, `skill_search`, `skill_reload` or `memory_list`, each of which
+  repeated another tool or what the prompt already carries.
+
+- **No more self-improvement loops.** Abacus no longer grades and rewrites
+  itself as it works, which cost background model calls and none of which the
+  work needs. Gone are the delegation tiers, which told the model how boldly to
+  use subagents from a saved record of past swarms; the drift checks, which
+  snapshotted a session's intent and asked a model every 35 steps whether the
+  work still served it; the refine pass, which reviewed long turns and wrote
+  prompt addendums, delegation specs and an `abacus:notes` block in
+  `AGENTS.md`, with `/memory log`, `/memory revert` and `/memory refine`;
+  papercuts, fixes recalled into a tool result when an old error came back,
+  with `papercut_record`; and `abacus eval`, which measured them.
+  `spawn_subagents` loses its `spec` field with the specs; the scout, drone and
+  worker roles remain.
+
+- **Memories stay, and keep.** A memory the agent records is kept for later
+  sessions straight away, rather than for the session until it had been
+  recorded in three. The memories the versioned harness held are brought over
+  to `~/.abacus/memories.json` the first time 0.7.1 runs. After that, the
+  files the removed features kept in `~/.abacus` (`papercuts.json`,
+  `hive.json`, `harness/` and `evals/`) can be deleted. An `abacus:notes` block
+  in an `AGENTS.md` is no longer updated, but the model still reads it with the
+  rest of the file, so delete it if it is out of date.
 
 Also since 0.7.0:
 

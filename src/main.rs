@@ -93,10 +93,6 @@ async fn main() -> Result<()> {
 
     // Commands that talk to the provider but open no session.
     match cli.command {
-        Some(Command::Eval { tasks, repeat, state, model, json }) => {
-            let options = abacus_agent::eval::EvalOptions { filter: tasks, repeat, state, model, json };
-            return abacus_agent::eval::run(config, settings, options).await;
-        }
         Some(Command::Upstreams) => return list_upstreams(&config).await,
         Some(Command::Doctor) => return doctor(&config, &settings).await,
         // Everything else returned above; the app server wants the same

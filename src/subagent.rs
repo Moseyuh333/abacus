@@ -59,9 +59,6 @@ struct SubagentTask {
     /// prose report is coerced into the shape and validated, so the parent gets
     /// data instead of something it has to re-read.
     schema: Option<Value>,
-    /// A harness `subagent` entry id supplying this worker's role prompt and
-    /// privileges, instead of one of the built-in roles.
-    spec: Option<String>,
     /// Prior conversation for a resumed worker — never part of the tool call,
     /// set only by `message_subagent` so the worker continues instead of
     /// starting over.
@@ -93,11 +90,31 @@ impl SubagentRole {
         }
     }
 
-    /// The role as Abacus ships it: its prompt, and whether it may only read.
+    /// The role's instructions, and whether it may only read. A read-only
+    /// role is enforced mechanically, not just instructed: the worker runs
+    /// with every change refused.
     fn built_in(self) -> (&'static str, bool) {
-        let shipped = crate::harness::BUILT_IN_SUBAGENTS;
-        let role = shipped.iter().find(|(id, ..)| *id == self.label()).expect("a shipped role");
-        (role.3, role.2)
+        match self {
+            Self::Drone => (
+                "You are a DRONE: a builder. Execute exactly the delegated change, run the narrowest checks that \
+                 verify it, and report what you changed and what you ran. Do not investigate beyond what the \
+                 change requires. Do not spawn subagents, commit, push, or modify paths outside the workspace.",
+                false,
+            ),
+            Self::Scout => (
+                "You are a SCOUT: a researcher. Investigate the delegated question — read code, crawl the \
+                 repository, search the web where allowed — and report findings with exact file paths and \
+                 evidence. You must NOT modify anything; your value is the fidelity of what you bring back. Do \
+                 not spawn subagents.",
+                true,
+            ),
+            Self::Worker => (
+                "You are an isolated subagent. Complete only the delegated task. You may edit and test this \
+                 worktree. Do not spawn more subagents, commit, push, or modify paths outside the workspace. \
+                 Finish with a concise summary and exact checks run.",
+                false,
+            ),
+        }
     }
 }
 
@@ -120,8 +137,6 @@ pub struct SubagentRuntime {
     tool_output_limit: usize,
     web_search: crate::web::WebConfig,
     hive: crate::hive::HiveHandle,
-    /// Supplies authored delegation specs; inert stores fall back to built-ins.
-    harness: crate::harness::HarnessStore,
     /// Where a background swarm delivers its report when it finishes.
     injections: crate::agent::InjectionQueue,
     /// The session's mode, shared: workers are reviewed in AUTO just as the
@@ -129,34 +144,6 @@ pub struct SubagentRuntime {
     yolo: Arc<AtomicBool>,
     /// The reviewer AUTO puts a worker's actions to.
     review: Option<crate::config::Target>,
-}
-
-/// A worker's resolved role: what to call it, what to tell it, and whether it
-/// is allowed to change anything.
-struct ResolvedRole {
-    label: String,
-    system_prompt: String,
-    read_only: bool,
-}
-
-/// Resolve a task's role, preferring an authored spec over the built-in.
-///
-/// An unknown spec id falls back to the built-in role rather than failing the
-/// worker: the roster is advisory context in the prompt, and a stale id should
-/// cost fidelity, not the task.
-fn resolve_role(harness: &crate::harness::HarnessStore, task: &SubagentTask) -> ResolvedRole {
-    if let Some(id) = task.spec.as_deref().filter(|id| !id.trim().is_empty())
-        && let Some(entry) =
-            harness.snapshot_of(crate::harness::EntryKind::Subagent).into_iter().find(|entry| entry.id == id)
-    {
-        return ResolvedRole {
-            read_only: entry.metadata.get("read_only").and_then(Value::as_bool).unwrap_or(false),
-            label: entry.id,
-            system_prompt: entry.content,
-        };
-    }
-    let (system_prompt, read_only) = task.role.built_in();
-    ResolvedRole { label: task.role.label().to_owned(), system_prompt: system_prompt.to_owned(), read_only }
 }
 
 /// The workers of a request as one line: name, role, and model where one was chosen.
@@ -179,7 +166,6 @@ impl SubagentRuntime {
             tool_output_limit: options.tool_output_limit,
             web_search: options.web_search.clone(),
             hive: options.hive.clone(),
-            harness: options.harness.clone(),
             injections: options.injections.clone(),
             yolo: options.yolo.clone(),
             review: options.review.clone().or_else(|| options.aux.clone()),
@@ -205,7 +191,6 @@ impl SubagentRuntime {
                                     "name":{"type":"string","description":"Short unique worker name"},
                                     "prompt":{"type":"string","description":"Self-contained coding assignment with expected verification"},
                                     "role":{"type":"string","enum":["drone","scout","worker"],"description":"drone = builder executing a concrete change; scout = read-only research/repo-crawl/web (cannot modify anything); worker = generic (default)"},
-                                    "spec":{"type":"string","description":"Optional id of a delegation spec from the harness roster, used instead of `role`. The roster is listed in your context; an unknown id quietly falls back to `role`."},
                                     "model":{"type":"string","description":"Optional model slug for this worker on the same endpoint. Omit to use your own (the main) model — that is the default and the right choice unless the user explicitly asked for specific models per worker (e.g. fanning a swarm across several OpenRouter models)."},
                                     "schema":{"type":"object","description":"Optional JSON Schema for this worker's answer. Set it when you want data you can act on rather than a report you have to re-read — e.g. {\"type\":\"object\",\"required\":[\"verdict\"],\"properties\":{\"verdict\":{\"type\":\"string\",\"enum\":[\"pass\",\"fail\"]}}}. With wait=true and every task carrying a schema, the result is a JSON array instead of prose. A worker whose answer cannot be made to fit is reported as failed."}
                                 },
@@ -357,7 +342,7 @@ impl SubagentRuntime {
     }
 
     /// Run a swarm to completion and format its report. Shared by the blocking
-    /// and background paths so both record the same delegation stats.
+    /// and background paths so both report alike.
     async fn run_swarm(
         &self,
         context: Arc<WorktreeContext>,
@@ -390,13 +375,7 @@ impl SubagentRuntime {
             }
         }
 
-        // The delegation record grows with every swarm, and the model sees
-        // its own track record in the result — confidence is earned, in
-        // writing.
-        let failures = results.iter().filter(|result| result.error.is_some()).count();
-        let record = self.hive.record_run(results.len() as u32, failures as u32);
-        let body = if all_typed { format_results_json(&results) } else { format_results(&results, apply) };
-        format!("{body}\n\n{record}")
+        if all_typed { format_results_json(&results) } else { format_results(&results, apply) }
     }
 
     /// Run a resumed worker to completion in its own worktree, replaying its
@@ -420,7 +399,6 @@ impl SubagentRuntime {
             // A follow-up is conversational; the parent asks for a shape by
             // spawning, not by messaging.
             schema: None,
-            spec: None,
             resume_from: Some(transcript.clone()),
         };
         let outcome = self.run_one_inner(&context, &task, board_id, worker_provider, injections).await;
@@ -447,8 +425,7 @@ impl SubagentRuntime {
         if let Some(model) = task.model.as_deref().filter(|model| !model.trim().is_empty()) {
             worker_provider = worker_provider.with_model(model);
         }
-        let role_label = resolve_role(&self.harness, &task).label;
-        let board_id = self.hive.board.begin(&name, &role_label, worker_tokens.clone());
+        let board_id = self.hive.board.begin(&name, task.role.label(), worker_tokens.clone());
         self.hive.board.describe(board_id, worker_provider.model(), &task.prompt);
         // Register before starting so a message addressed to this worker mid-run
         // reaches the turn that is about to begin.
@@ -531,7 +508,7 @@ impl SubagentRuntime {
         provider: Provider,
         injections: crate::agent::InjectionQueue,
     ) -> Result<(String, String, Vec<Value>)> {
-        let role = resolve_role(&self.harness, task);
+        let (role_prompt, read_only) = task.role.built_in();
         let worker_workspace = worker_root.join(&context.workspace_relative);
         // A resumed worker keeps its own conversation; a fresh one starts from
         // the standard preamble. Either way the new prompt is the last word.
@@ -543,7 +520,7 @@ impl SubagentRuntime {
                  applied; re-read what you need. Everything you learned above still stands."
                     .to_owned(),
             ),
-            _ => (initial_messages(&worker_workspace), role.system_prompt),
+            _ => (initial_messages(&worker_workspace), role_prompt.to_owned()),
         };
         messages.push(json!({"role":"system","content":briefing}));
         messages.push(json!({"role":"user","content":task.prompt}));
@@ -558,7 +535,7 @@ impl SubagentRuntime {
                 // Scouts are mechanically read-only, not just instructed so:
                 // a lock that nothing in the worker can flip. Everyone else
                 // works under the session's own mode.
-                read_only: role.read_only,
+                read_only,
                 yolo: self.yolo.clone(),
                 review: self.review.clone(),
                 web_search: self.web_search.clone(),
@@ -567,8 +544,8 @@ impl SubagentRuntime {
                 cancel: self.hive.board.cancel_flag(board_id),
                 // Everything else stays inert. No trace: subagent work is a
                 // different task shape and would blur the samples. No
-                // papercuts: a worker's snags belong to its delegated task,
-                // and its worktree paths would pollute workspace scoping.
+                // memories: what a worker records belongs to its delegated
+                // task, and its worktree paths would pollute workspace scoping.
                 ..TurnOptions::bare(worker_workspace, services)
             },
             events,
@@ -654,7 +631,7 @@ async fn coerce_to_schema(provider: &Provider, report: &str, schema: &Value) -> 
         if completion.cancelled {
             bail!("cancelled while coercing the result");
         }
-        match crate::refine::extract_json(&completion.content) {
+        match crate::schema::extract_json(&completion.content) {
             Err(error) => last_error = format!("{error:#}"),
             Ok(value) => match crate::schema::validate(&value, schema) {
                 Ok(()) => return Ok(value),
@@ -977,70 +954,13 @@ mod tests {
         }
     }
 
-    fn task_with_spec(spec: Option<&str>, role: SubagentRole) -> SubagentTask {
-        SubagentTask {
-            name: "w".to_owned(),
-            prompt: "do it".to_owned(),
-            role,
-            model: None,
-            schema: None,
-            spec: spec.map(str::to_owned),
-            resume_from: None,
-        }
-    }
-
     #[test]
-    fn an_authored_spec_overrides_the_built_in_role() {
-        let dir = tempdir().unwrap();
-        let harness = crate::harness::HarnessStore::load(dir.path().join("h"), dir.path());
-        harness.migrate(&dir.path().join("none.json"), dir.path()).unwrap();
-
-        // A seeded built-in resolves by id, and its read-only flag is honoured.
-        let scout = resolve_role(&harness, &task_with_spec(Some("scout"), SubagentRole::Drone));
-        assert_eq!(scout.label, "scout");
-        assert!(scout.read_only, "a scout spec must lock mutations off");
-        assert!(scout.system_prompt.contains("SCOUT"));
-
-        // An authored spec supplies its own brief.
-        harness.apply(
-            &crate::harness::RefinementProposal {
-                summary: "s".to_owned(),
-                rationale: "r".to_owned(),
-                expected_outcome: "e".to_owned(),
-                edits: vec![crate::harness::RefinementEdit {
-                    action: crate::harness::EditAction::Create,
-                    kind: crate::harness::EntryKind::Subagent,
-                    id: Some("release_auditor".to_owned()),
-                    title: Some("Release auditor".to_owned()),
-                    content: Some("You audit a release branch and report blockers.".to_owned()),
-                    path: None,
-                    metadata: None,
-                    reason: None,
-                }],
-            },
-            crate::harness::Lifetime::Durable,
-            None,
-            None,
-        );
-        let authored = resolve_role(&harness, &task_with_spec(Some("release_auditor"), SubagentRole::Worker));
-        assert_eq!(authored.label, "release_auditor");
-        assert!(authored.system_prompt.contains("audit a release branch"));
-        // No read_only metadata means it may build, like a worker.
-        assert!(!authored.read_only);
-    }
-
-    #[test]
-    fn an_unknown_spec_falls_back_to_the_role_instead_of_failing() {
-        let dir = tempdir().unwrap();
-        let harness = crate::harness::HarnessStore::load(dir.path().join("h"), dir.path());
-        // The roster is advisory context, so a stale id should cost fidelity,
-        // not the task.
-        let resolved = resolve_role(&harness, &task_with_spec(Some("deleted_spec"), SubagentRole::Scout));
-        assert_eq!(resolved.label, "scout");
-        assert!(resolved.read_only);
-
-        let blank = resolve_role(&harness, &task_with_spec(Some("   "), SubagentRole::Drone));
-        assert_eq!(blank.label, "drone");
+    fn a_scout_may_only_read_and_the_builders_may_change_things() {
+        let (prompt, read_only) = SubagentRole::Scout.built_in();
+        assert!(read_only, "a scout must have mutations locked off");
+        assert!(prompt.contains("SCOUT"));
+        assert!(!SubagentRole::Drone.built_in().1);
+        assert!(!SubagentRole::Worker.built_in().1);
     }
 
     #[test]

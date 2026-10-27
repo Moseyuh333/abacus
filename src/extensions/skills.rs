@@ -125,7 +125,7 @@ impl SkillRegistry {
         vec![
             tool(
                 "skill_create",
-                "Write a new Agent Skill so a procedure you have worked out becomes reusable. Use this once you have done something non-obvious that will recur — the skill is loadable by name in this and every later session. Not for one-off work, and not a place for failure lessons (use papercut_record).",
+                "Write a new Agent Skill so a procedure you have worked out becomes reusable. Use this once you have done something non-obvious that will recur — the skill is loadable by name in this and every later session. Not for one-off work.",
                 [
                     req("name", string("1-64 lowercase letters, digits, or hyphens; becomes the directory name")),
                     req(

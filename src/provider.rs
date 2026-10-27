@@ -283,7 +283,7 @@ impl Provider {
 
     /// A sibling provider that differs only in the model — same endpoint,
     /// auth, protocol, and provider settings. For the auxiliary model used by
-    /// secondary calls (refine, drafts, tether, compaction). The billing
+    /// secondary calls (page extraction, drafts, compaction). The billing
     /// counter is shared so aux calls count toward the session total; the
     /// context-size gauge is fresh so an aux call over the whole history does
     /// not overwrite the main conversation's "window full" figure.
@@ -1391,7 +1391,7 @@ impl CacheLog {
 
     /// Identify a conversation the way OpenRouter's sticky routing does: by the
     /// first system message and the first message that is not one. The main
-    /// loop, and the compaction and refine calls made inside it, share a key;
+    /// loop, and the compaction calls made inside it, share a key;
     /// a detached side call gets its own.
     fn conversation(messages: &[Value]) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();

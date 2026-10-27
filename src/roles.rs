@@ -41,7 +41,7 @@ pub const ROLES: &[Role] = &[
     Role {
         id: "aux",
         label: "Auxiliary model",
-        help: "Background calls — prompt refinement, drift checks, page extraction, drafts.",
+        help: "Background calls — reading fetched pages and large outputs, drafts.",
         fallback: Some("default"),
     },
     Role {

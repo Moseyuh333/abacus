@@ -125,15 +125,6 @@ impl CompactionState {
     }
 }
 
-/// Whether the next `compact` call is likely to run rolling-summary
-/// compaction — the tier that erases verbatim history. Exposed so the agent
-/// can run its reflection pass first, while the evidence still exists.
-/// Microcompaction inside `compact` may still relieve the pressure, in which
-/// case the reflection simply ran a little early.
-pub fn needs_summary(messages: &[Value], state: &CompactionState, budget: &CompactionBudget) -> bool {
-    under_pressure(messages, state, budget) && messages.len() > KEEP_FIRST + 1
-}
-
 /// Who summarises, and whether it can do so from inside the live context.
 ///
 /// An out-of-context summarisation builds a fresh prompt — its own system

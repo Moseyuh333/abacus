@@ -26,9 +26,7 @@ pub struct SessionState {
     pub goal: crate::goal::GoalState,
     pub tasks: crate::task::TaskList,
     pub compaction: CompactionState,
-    /// What the session is trying to achieve, and drift-check bookkeeping.
-    pub tether: crate::tether::TetherState,
-    pub harness: crate::harness::HarnessStore,
+    pub memories: crate::memories::MemoryStore,
     /// Large tool outputs bound as inspectable variables.
     pub handles: crate::handles::HandleStore,
     /// Mid-turn arrivals: user steering and finished background subagents.
@@ -37,20 +35,12 @@ pub struct SessionState {
 
 impl SessionState {
     /// The state `session` left off with, or a fresh one.
-    ///
-    /// `key` names the session to the harness, which counts *distinct
-    /// sessions* when promoting a lesson to durable — so a run with no saved
-    /// session yet still needs a stable key, or it contributes no evidence.
-    pub fn open(config: &crate::config::Config, session: Option<&Session>, key: String) -> Self {
-        let harness = crate::harness::HarnessStore::load_migrated(
-            config.paths.harness_dir.clone(),
+    pub fn open(config: &crate::config::Config, session: Option<&Session>) -> Self {
+        let memories = crate::memories::MemoryStore::load(
+            config.paths.memories_file.clone(),
+            &config.paths.harness_dir,
             &config.workspace,
-            &config.paths.memories_file,
-        )
-        .with_session(key);
-        if let Some(state) = session.and_then(|session| session.harness.clone()) {
-            harness.restore_session(state);
-        }
+        );
         Self {
             goal: crate::goal::GoalState::new(session.and_then(|session| session.goal.clone())),
             tasks: crate::task::TaskList::new(session.map(|session| session.tasks.clone()).unwrap_or_default()),
@@ -58,8 +48,7 @@ impl SessionState {
                 .and_then(|session| session.compaction.as_ref())
                 .map(CompactionState::detached)
                 .unwrap_or_default(),
-            tether: crate::tether::TetherState::new(session.and_then(|session| session.intent.clone())),
-            harness,
+            memories,
             handles: Default::default(),
             injections: Default::default(),
         }
@@ -67,8 +56,6 @@ impl SessionState {
 
     /// Write this state into `session`, ready to be saved.
     pub fn save(&self, session: &mut Session) {
-        session.intent = self.tether.intent();
-        session.harness = Some(self.harness.session_snapshot());
         session.goal = self.goal.snapshot();
         session.tasks = self.tasks.snapshot();
         session.compaction = Some(self.compaction.detached());
@@ -84,8 +71,7 @@ impl SessionState {
             goal: self.goal.clone(),
             tasks: self.tasks.clone(),
             compaction: self.compaction.clone(),
-            tether: self.tether.clone(),
-            harness: self.harness.clone(),
+            memories: self.memories.clone(),
             handles: self.handles.clone(),
             injections: self.injections.clone(),
             ..crate::agent::TurnOptions::for_config(config, services)
@@ -109,13 +95,6 @@ pub struct Session {
     #[serde(default)]
     pub tasks: Vec<Task>,
     pub compaction: Option<CompactionState>,
-    /// Tether snapshot: what this session is trying to achieve. Captured after
-    /// the first answered prompt, refreshed before compaction.
-    pub intent: Option<String>,
-    /// Session-lifetime harness entries. Durable ones live in `~/.abacus`;
-    /// these are the ones that have not yet earned a place there, so they ride
-    /// the session and are gone when it is.
-    pub harness: Option<crate::harness::HarnessState>,
     /// Approximate provider-reported token total accumulated across resumes.
     #[serde(default)]
     pub tokens_used: u64,
@@ -145,8 +124,6 @@ impl Session {
             ralph_loop: None,
             tasks: Vec::new(),
             compaction: None,
-            intent: None,
-            harness: None,
             tokens_used: 0,
             active_secs: 0,
             forked_from: None,
@@ -232,9 +209,9 @@ impl SessionStore {
 
     /// Save a fork of `original` holding `messages`, and return it. A fork is
     /// a branch of the work, so what shapes the work — goal, loop, tasks, the
-    /// rolling summary, the intent — carries over; time and token accounting
-    /// start fresh. It remembers where it came from, so it can be found from
-    /// there and shown under it.
+    /// rolling summary — carries over; time and token accounting start fresh.
+    /// It remembers where it came from, so it can be found from there and
+    /// shown under it.
     pub fn fork(&self, original: &Session, profile: String, model: String, messages: Vec<Value>) -> Result<Session> {
         let mut fork = Session::new(self.workspace.clone(), profile, model, messages);
         fork.title = format!("(fork) {}", original.title).chars().take(100).collect();
@@ -242,7 +219,6 @@ impl SessionStore {
         fork.ralph_loop = original.ralph_loop.clone();
         fork.tasks = original.tasks.clone();
         fork.compaction = original.compaction.clone();
-        fork.intent = original.intent.clone();
         fork.forked_from = Some(original.id);
         self.save(&fork)?;
         Ok(fork)
@@ -603,12 +579,12 @@ mod tests {
         let store = SessionStore::new(&paths, dir.path().join("project"));
         let mut original = store.create("p".into(), "m".into(), vec![json!({"role":"system","content":"x"})]).unwrap();
         original.title = "Fix the parser".into();
-        original.intent = Some("parser keeps its API".into());
+        original.tasks = vec![crate::task::Task { text: "keep the parser's API".into(), done: false }];
         store.save(&original).unwrap();
 
         let fork = store.fork(&original, "p".into(), "m".into(), original.messages.clone()).unwrap();
         assert_eq!(fork.title, "(fork) Fix the parser");
-        assert_eq!(fork.intent.as_deref(), Some("parser keeps its API"));
+        assert_eq!(fork.tasks.len(), 1, "the work carries over");
         let listed = store.list().unwrap();
         let forked = listed.iter().find(|summary| summary.id == fork.id).unwrap();
         assert_eq!(forked.forked_from, Some(original.id));

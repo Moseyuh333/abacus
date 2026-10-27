@@ -63,7 +63,7 @@ pub async fn run(
     let yolo = Arc::new(AtomicBool::new(config.permission == crate::config::Permission::Yolo));
     // Keyed by the session id so promotion counts distinct sessions rather
     // than distinct processes.
-    let state = SessionState::open(&config, session.as_ref(), activity_session.clone());
+    let state = SessionState::open(&config, session.as_ref());
 
     let mut ralph = loop_config;
     let mut text = String::new();
@@ -357,13 +357,7 @@ fn turn_options(
         (false, Some(id)) => crate::peers::Peers::new(config.paths.clone(), config.workspace.clone(), Some(id)),
         _ => Default::default(),
     };
-    TurnOptions {
-        trace,
-        yolo: yolo.clone(),
-        session_id,
-        peers,
-        ..state.turn(config, services.clone()).with_workspace_stores(config)
-    }
+    TurnOptions { trace, yolo: yolo.clone(), session_id, peers, ..state.turn(config, services.clone()) }
 }
 
 /// A bracketed aside on stderr, in the plain format only.

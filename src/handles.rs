@@ -467,7 +467,7 @@ pub async fn recurse(provider: &Provider, store: &HandleStore, arguments: &str, 
             Ok(completion) => completion.content.trim().to_owned(),
         };
         if let Some(schema) = schema {
-            match crate::refine::extract_json(&text)
+            match crate::schema::extract_json(&text)
                 .and_then(|value| crate::schema::validate(&value, &schema).map(|()| value))
             {
                 Ok(value) => {

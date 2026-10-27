@@ -76,7 +76,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/rename", "Rename this session"),
     ("/compact", "Compact the conversation's context"),
     ("/repair", "Fix session history a provider keeps rejecting"),
-    ("/memory", "What Abacus learned here: list, forget, log, revert, refine"),
+    ("/memory", "What Abacus remembers here: list, forget"),
     ("/tools", "Tools, skills, plugin commands and MCP tools"),
     ("/usage", "Local usage and activity"),
     ("/theme", "Switch theme, or export one to edit"),
@@ -397,8 +397,6 @@ enum Background {
         result: Result<Vec<crate::model_info::ModelCard>, String>,
     },
     Feedback(Result<crate::feedback::FeedbackReceipt, String>),
-    /// The outcome of a manual `/refine`.
-    Refined(String),
     Services(Result<Box<AgentServices>, String>),
     /// The remote link reported something. `generation` names the bridge it
     /// came from, so a stopped bridge's late events are ignored.
@@ -454,7 +452,7 @@ struct App {
     credentials: Credentials,
     provider: Provider,
     /// The auxiliary-model provider for secondary calls (drafts here; the
-    /// agent loop builds its own for refine/tether/classification).
+    /// agent loop builds its own for page extraction).
     aux_provider: Provider,
     messages: Vec<Value>,
     session: Option<Session>,
@@ -462,7 +460,6 @@ struct App {
     services: Arc<AgentServices>,
     /// What the conversation carries between turns.
     state: SessionState,
-    papercuts: crate::papercuts::PapercutStore,
     hive: crate::hive::HiveHandle,
     /// Whether Abacus is holding the mouse. Holding it enables wheel scrolling
     /// and clickable rows but takes click-drag away from the terminal on
@@ -532,8 +529,6 @@ struct App {
     last_board_version: u64,
     reload_services: bool,
     services_reloading: bool,
-    /// A manual refinement is in flight; a second would race it for the store.
-    refining: bool,
     /// Safety verdicts, kept for the session rather than the turn.
     safety: crate::safety::SafetyCache,
     /// YOLO when set, AUTO otherwise — for this session, starting from the
@@ -1163,12 +1158,6 @@ fn entries_from_messages(messages: &[Value]) -> Vec<Entry> {
     entries
 }
 
-/// The name a session goes by in the harness: its id, or a fresh one for a
-/// conversation that has not been saved yet.
-fn session_key(session: Option<&Session>) -> String {
-    session.map_or_else(|| uuid::Uuid::new_v4().to_string(), |session| session.id.to_string())
-}
-
 fn toggle(flag: &mut bool) {
     *flag = !*flag;
 }
@@ -1195,7 +1184,7 @@ impl App {
         let tokens = Arc::new(crate::provider::TokenLedger::new(initial_tokens));
         let provider = Provider::with_tokens(&config, tokens.clone())?;
         let aux_provider = provider.for_role(config.roles.aux.as_ref());
-        let hive = crate::hive::HiveHandle::load(config.paths.hive_file.clone());
+        let hive = crate::hive::HiveHandle::default();
         let ralph_loop = session.as_ref().and_then(|session| session.ralph_loop.clone());
         let messages =
             session.as_ref().map(|value| value.messages.clone()).unwrap_or_else(|| initial_messages(&config.workspace));
@@ -1228,8 +1217,7 @@ impl App {
         }
         let yolo = config.permission == Permission::Yolo;
         let branch = git_branch(&config.workspace);
-        let papercuts = crate::papercuts::PapercutStore::load(config.paths.papercuts_file.clone(), &config.workspace);
-        let state = SessionState::open(&config, session.as_ref(), session_key(session.as_ref()));
+        let state = SessionState::open(&config, session.as_ref());
         // The model lists on disk, so pickers open on something at once.
         let catalogs = settings
             .providers
@@ -1283,7 +1271,6 @@ impl App {
             session_store: session_store.clone(),
             services,
             state,
-            papercuts,
             hive,
             mouse_captured: true,
             hive_overlay: false,
@@ -1326,7 +1313,6 @@ impl App {
             last_board_version: 0,
             reload_services: false,
             services_reloading: false,
-            refining: false,
             safety: crate::safety::SafetyCache::default(),
             yolo: Arc::new(AtomicBool::new(yolo)),
             follows_profile,
@@ -2069,7 +2055,6 @@ impl App {
             cancel: self.cancel.clone(),
             yolo: self.yolo.clone(),
             session_id: self.session.as_ref().map(|session| session.id.to_string()),
-            papercuts: self.papercuts.clone(),
             hive: self.hive.clone(),
             peers: self.peers(),
             ..self.state.turn(&self.config, self.services.clone())
@@ -2303,7 +2288,7 @@ impl App {
         // instead of appending this session's calls to the previous trace.
         self.trace = None;
         let injections = self.state.injections.clone();
-        let state = SessionState::open(&self.config, session.as_ref(), session_key(session.as_ref()));
+        let state = SessionState::open(&self.config, session.as_ref());
         self.state = SessionState { injections, ..state };
         self.messages =
             session.as_ref().map_or_else(|| initial_messages(&self.config.workspace), |s| s.messages.clone());
@@ -2558,10 +2543,6 @@ impl App {
                 }
                 // A notice, not a prompt: nothing is downloaded or blocked.
                 Background::Update(available) => self.say(available.message()),
-                Background::Refined(message) => {
-                    self.refining = false;
-                    self.say(message);
-                }
                 Background::Feedback(Ok(receipt)) => {
                     self.feedback_form = None;
                     let reference = receipt.id.map(|id| format!(" Reference: {id}.")).unwrap_or_default();

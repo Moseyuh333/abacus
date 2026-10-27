@@ -1,7 +1,7 @@
 mod support;
 
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -319,14 +319,12 @@ async fn a_read_only_task_refuses_a_change() {
     assert!(!project.workspace.join("marker.txt").exists());
 }
 
-/// What kind of background request the agent is making. A summariser or
-/// reflector that is the conversation's own model asks from inside the live
-/// context; one on another model builds a detached prompt. Both are recognised.
+/// What kind of request the agent is making. A summariser that is the
+/// conversation's own model asks from inside the live context; one on another
+/// model builds a detached prompt. Both are recognised.
 #[derive(PartialEq)]
 enum Asked {
     Summary,
-    ReviewGate,
-    RefinePlan,
     Turn,
 }
 
@@ -334,15 +332,7 @@ const IN_CONTEXT_SUMMARY: &str = "Your context is full";
 
 fn asked(request: &str) -> Asked {
     let any = |phrases: &[&str]| phrases.iter().any(|phrase| request.contains(phrase));
-    if any(&[IN_CONTEXT_SUMMARY, "context-aware state summary"]) {
-        Asked::Summary
-    } else if any(&["refinement review gate", "Looking back at the turn you have just finished"]) {
-        Asked::ReviewGate
-    } else if any(&["continual-harness refiner", "to your own reusable state"]) {
-        Asked::RefinePlan
-    } else {
-        Asked::Turn
-    }
+    if any(&[IN_CONTEXT_SUMMARY, "context-aware state summary"]) { Asked::Summary } else { Asked::Turn }
 }
 
 /// A conversation over the compaction threshold (400k chars), carried by a
@@ -363,10 +353,7 @@ async fn rolling_summary_compaction_fires_on_large_context() {
             "1. Primary Request and Intent: do the thing. \
              9. Required Files:\n- src/main.rs\n10. Next Step: continue.",
         )),
-        // The review gate runs before summary compaction; refuse it so no
-        // planning call fires and the flow continues.
-        Asked::ReviewGate => Reply::Send(says(r#"{"should_refine": false, "rationale": "nothing to keep"}"#)),
-        _ => Reply::Last(says("all done")),
+        Asked::Turn => Reply::Last(says("all done")),
     })
     .await;
 
@@ -405,7 +392,6 @@ async fn a_summary_written_mid_turn_carries_into_the_next_turn() {
     let project = project(&[]);
     let mock = Mock::answering(|request| match asked(request) {
         Asked::Summary => Reply::Send(says("SUMMARY-OF-THE-THING")),
-        Asked::ReviewGate => Reply::Send(says(r#"{"should_refine": false, "rationale": "nothing to keep"}"#)),
         _ => Reply::Send(says("all done")),
     })
     .await;
@@ -488,98 +474,6 @@ async fn idle_compaction_stops_when_the_person_comes_back() {
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), compaction).await;
     mock.abort();
     assert!(result.expect("it stops promptly").unwrap().is_none());
-}
-
-/// The tether's intent snapshot used to run *after* the answer, so every first
-/// turn ended with a two-second stall. It now runs beside the turn: this proves
-/// the intent request reaches the server while the main stream is still open,
-/// and that the snapshot still lands on the tether by the time the turn is done.
-#[tokio::test]
-async fn intent_snapshot_runs_beside_the_turn_not_after_it() {
-    let project = project(&[]);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    // Milliseconds since the server started at which the intent request
-    // arrived, and at which the main answer finished streaming.
-    let intent_arrived: Arc<Mutex<Option<u128>>> = Arc::default();
-    let answer_finished: Arc<Mutex<Option<u128>>> = Arc::default();
-    let (intent_probe, answer_probe) = (intent_arrived.clone(), answer_finished.clone());
-    let server = tokio::spawn(async move {
-        let start = std::time::Instant::now();
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let (intent_probe, answer_probe) = (intent_probe.clone(), answer_probe.clone());
-            tokio::spawn(async move {
-                if support::read_request(&mut stream).await.contains("INTENT") {
-                    *intent_probe.lock().unwrap() = Some(start.elapsed().as_millis());
-                    return support::respond(&mut stream, &says("Ship the importer fix.")).await;
-                }
-                // The main answer is served slowly, so an intent call that only
-                // started afterwards could not possibly arrive before it ends.
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                support::respond(&mut stream, &says("all done")).await;
-                *answer_probe.lock().unwrap() = Some(start.elapsed().as_millis());
-            });
-        }
-    });
-
-    let tether = abacus_agent::tether::TetherState::default();
-    let mut tethered = false;
-    turn(
-        Provider::new(&project.config(address)).unwrap(),
-        project.asks("fix the importer"),
-        TurnOptions {
-            // A session id is what makes the tether run at all.
-            session_id: Some("session-under-test".into()),
-            tether: tether.clone(),
-            ..project.options()
-        },
-        |event| tethered |= matches!(event, AgentEvent::Notice(text) if text.starts_with("tethered")),
-    )
-    .await;
-    server.await.unwrap();
-
-    let intent_at = intent_arrived.lock().unwrap().expect("an intent call");
-    let answer_at = answer_finished.lock().unwrap().expect("an answered turn");
-    assert!(
-        intent_at < answer_at,
-        "the intent call must overlap the answer, not follow it \
-         (intent at {intent_at}ms, answer finished at {answer_at}ms)"
-    );
-    assert_eq!(tether.intent().as_deref(), Some("Ship the importer fix."));
-    assert!(tethered, "the user is told what the session is tethered to");
-}
-
-/// Refinement is two calls, not one: a cheap gate decides whether the turn
-/// taught anything before the planning call runs. A "no" must cost exactly one
-/// call — the old rethink pass planned unconditionally, and most long turns
-/// have nothing worth keeping.
-#[tokio::test]
-async fn a_refusing_review_gate_skips_the_planning_call() {
-    let project = project(&[]);
-    let mock = Mock::answering(|request| match asked(request) {
-        Asked::ReviewGate => Reply::Send(says(r#"{"should_refine": false, "rationale": "routine work"}"#)),
-        Asked::RefinePlan => Reply::Send(says(r#"{"summary":"s","rationale":"r","expected_outcome":"e","edits":[]}"#)),
-        Asked::Summary => Reply::Send(says("1. Primary Request and Intent: do the thing. 10. Next Step: continue.")),
-        Asked::Turn => Reply::Last(says("all done")),
-    })
-    .await;
-
-    let harness = abacus_agent::harness::HarnessStore::default();
-    turn(
-        project.provider(&mock),
-        // Over the rolling-summary threshold, which is what runs the reflection.
-        oversized(&project),
-        TurnOptions { harness: harness.clone(), ..project.options() },
-        |_| {},
-    )
-    .await;
-    let requests = mock.finish().await;
-
-    let count = |kind| requests.iter().filter(|request| asked(request) == kind).count();
-    assert_eq!(count(Asked::ReviewGate), 1, "the gate is consulted once");
-    assert_eq!(count(Asked::RefinePlan), 0, "a refused gate must not pay for the planning call");
-    assert!(harness.snapshot().is_empty(), "nothing is written when the gate refuses");
 }
 
 /// The Grok example is a copy-paste starting point, so it is worth proving it

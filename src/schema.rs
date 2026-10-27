@@ -155,6 +155,66 @@ fn type_name(value: &Value) -> &'static str {
     }
 }
 
+/// Pull a JSON value out of a model's reply that may be fenced or wrapped in
+/// prose, ready to validate.
+///
+/// A reply cut off by an exhausted output budget and a merely malformed one
+/// both fail to parse, and the parser error describes the fragment rather than
+/// the cause — so truncation is named explicitly.
+pub fn extract_json(reply: &str) -> Result<Value> {
+    let trimmed = reply.trim();
+    let candidate = if let Some(fenced) =
+        trimmed.split_once("```").and_then(|(_, rest)| rest.split_once("```")).map(|(inside, _)| inside)
+    {
+        fenced.strip_prefix("json").unwrap_or(fenced).trim()
+    } else {
+        trimmed
+    };
+    if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+        return Ok(value);
+    }
+    if let (Some(start), Some(end)) = (candidate.find('{'), candidate.rfind('}'))
+        && end > start
+        && let Ok(value) = serde_json::from_str::<Value>(&candidate[start..=end])
+    {
+        return Ok(value);
+    }
+    if is_incomplete(candidate) {
+        bail!("the reply was cut off before its JSON closed");
+    }
+    bail!("the reply held no JSON object")
+}
+
+/// Whether a candidate ends mid-value: an unterminated string or unclosed
+/// braces. A complete-but-malformed reply is balanced, so this distinguishes
+/// "ran out of budget" from "wrote nonsense".
+fn is_incomplete(candidate: &str) -> bool {
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in candidate.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            match character {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    in_string || depth > 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +279,25 @@ mod tests {
         let value = json!({"verdict": "maybe", "findings": []});
         let error = validate(&value, &findings_schema()).unwrap_err().to_string();
         assert!(error.contains("not one of"), "{error}");
+    }
+
+    #[test]
+    fn a_reply_is_read_bare_fenced_or_wrapped_in_prose() {
+        assert_eq!(extract_json(r#"{"verdict":"pass"}"#).unwrap(), json!({"verdict": "pass"}));
+        let fenced = "Here you go:\n```json\n{\"verdict\":\"pass\"}\n```\nhope that helps";
+        assert_eq!(extract_json(fenced).unwrap(), json!({"verdict": "pass"}));
+        let prose = "I think: {\"verdict\":\"fail\"} — done";
+        assert_eq!(extract_json(prose).unwrap(), json!({"verdict": "fail"}));
+    }
+
+    #[test]
+    fn a_truncated_reply_is_named_as_truncation_not_malformed_json() {
+        // The failure mode when the output budget runs out mid-answer, which
+        // is a different problem from the model writing nonsense.
+        let error = extract_json(r#"{"verdict":"pass","findings":[{"file":"a."#).unwrap_err().to_string();
+        assert!(error.contains("cut off"), "{error}");
+        let error = extract_json("I would rather not.").unwrap_err().to_string();
+        assert!(error.contains("no JSON object"), "{error}");
     }
 
     #[test]

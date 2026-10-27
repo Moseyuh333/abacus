@@ -49,7 +49,7 @@ pub(super) const SETTINGS: &[(&str, &[Setting])] = &[
             toggled(
                 ConfigKey::AuxModel,
                 "Auxiliary model",
-                "Background calls — refinement, drift checks, page extraction, drafts. Any provider. Enter picks, Del inherits the profile's model.",
+                "Background calls — reading fetched pages and large outputs, drafts. Any provider. Enter picks, Del inherits the profile's model.",
             ),
             toggled(
                 ConfigKey::ReviewModel,
@@ -97,7 +97,7 @@ pub(super) const SETTINGS: &[(&str, &[Setting])] = &[
             toggled(
                 ConfigKey::TokenCompression,
                 "Token compression",
-                "Balanced high-savings mode: tighter context, fewer background checks, and no draft or routine refine calls.",
+                "Saves tokens: compacts sooner, keeps less recent history verbatim, and makes no draft calls.",
             ),
             toggled(
                 ConfigKey::IdleCompaction,

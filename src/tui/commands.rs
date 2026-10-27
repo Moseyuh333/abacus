@@ -52,8 +52,7 @@ impl App {
             "/remote" => self.remote_command(argument),
             "/compact" => self.compact_command(),
             "/repair" => self.repair_command(),
-            "/memory" | "/memories" | "/papercuts" | "/harness" => self.memory_command(argument),
-            "/refine" => self.memory_command(&format!("refine {argument}")),
+            "/memory" | "/memories" => self.memory_command(argument),
             // A `/name` that is a skill or a plugin command is not a slash
             // command; the caller resolves it into a prompt.
             _ if command.starts_with('/') && !self.has_extension(&command[1..]) => {
@@ -394,139 +393,37 @@ impl App {
         self.say(format!("Repaired the session history: {}.", fixes.join("; ")));
     }
 
-    /// `/memory`: what Abacus has learned in this workspace — memories,
-    /// papercuts, standing guidance — and the tools to curate it: `forget`
-    /// removes one, `log` and `revert` inspect and undo refinements, `refine`
-    /// runs a refinement now.
+    /// `/memory`: what Abacus remembers in this workspace, numbered, and
+    /// `forget` to remove one.
     pub(super) fn memory_command(&mut self, argument: &str) {
-        use crate::harness::EntryKind;
         let argument = argument.trim();
         let (verb, rest) =
             argument.split_once(char::is_whitespace).map_or((argument, ""), |(verb, rest)| (verb, rest.trim()));
         // One ordering for display and forgetting alike, or the numbers shown
         // would target different entries.
-        let memories = self.state.harness.snapshot_of(EntryKind::Memory);
-        let papercuts = self.papercuts.snapshot();
+        let memories = self.state.memories.snapshot();
         match verb {
             "" => {}
             "forget" | "delete" => {
                 let reference = rest.to_ascii_lowercase();
-                let pick =
-                    |prefix: char| reference.strip_prefix(prefix).and_then(|number| number.parse::<usize>().ok());
-                if let Some(number) = pick('m')
-                    && let Some(memory) = numbered(&memories, &number.to_string())
-                    && self.state.harness.remove(EntryKind::Memory, &memory.id)
+                if let Some(memory) = numbered(&memories, reference.strip_prefix('m').unwrap_or(&reference))
+                    && self.state.memories.remove(memory.id)
                 {
                     return self.say(format!("Memory \"{}\" forgotten.", memory.title));
                 }
-                if let Some(number) = pick('p')
-                    && let Some(cut) = numbered(&papercuts, &number.to_string())
-                    && self.papercuts.remove(cut.id)
-                {
-                    return self.say(format!("Papercut \"{}\" forgotten.", cut.title));
-                }
-                return self.fail("Usage: /memory forget m<number> | p<number> — numbers from /memory");
+                return self.fail("Usage: /memory forget m<number> — numbers from /memory");
             }
-            "log" => return self.memory_log(),
-            "revert" => return self.memory_revert(rest),
-            "refine" => return self.start_refine(rest),
-            _ => return self.fail("Usage: /memory [forget m1|p1] [log] [revert <id>] [refine [--durable]]"),
+            _ => return self.fail("Usage: /memory [forget m1]"),
         }
-        let mut lines: Vec<String> = Vec::new();
-        if !memories.is_empty() {
-            lines.push(format!("Memories ({}), newest first:", memories.len()));
-            lines.extend(memories.iter().enumerate().map(|(index, memory)| {
-                format!(
-                    "  m{}. [{}] {} — {}",
-                    index + 1,
-                    memory.lifetime_label(),
-                    memory.title,
-                    ui::truncate(&memory.content, 120)
-                )
-            }));
+        if memories.is_empty() {
+            return self.say("No memories here yet. Abacus records facts and decisions worth keeping as it works.");
         }
-        if !papercuts.is_empty() {
-            let now = chrono::Utc::now();
-            lines.push(format!("Papercuts ({}) — fixes recalled when their error comes back:", papercuts.len()));
-            lines.extend(papercuts.iter().enumerate().map(|(index, cut)| {
-                format!(
-                    "  p{}. {} — tripped {}x, strength {:.1}\n      fix: {}\n      tripwires: {}",
-                    index + 1,
-                    cut.title,
-                    cut.trip_count,
-                    cut.decayed_strength(now),
-                    cut.fix,
-                    cut.tripwires.join(" · "),
-                )
-            }));
-        }
-        for kind in [EntryKind::Prompt, EntryKind::Subagent] {
-            let entries = self.state.harness.snapshot_of(kind);
-            if entries.is_empty() {
-                continue;
-            }
-            lines.push(format!("{} ({}):", kind.label(), entries.len()));
-            lines.extend(entries.iter().map(|entry| {
-                format!(
-                    "  [{}] {} — {} (v{}, {})",
-                    entry.id,
-                    entry.title,
-                    ui::truncate(&entry.content, 100),
-                    entry.version,
-                    entry.lifetime_label(),
-                )
-            }));
-        }
-        if lines.is_empty() {
-            return self.say(
-                "Nothing learned here yet. Abacus records memories, papercuts and standing guidance as it \
-                 works — on its own after long turns, or with /memory refine.",
-            );
-        }
-        lines.push(
-            "/memory forget m1 removes a memory (p1 a papercut) · /memory log lists refinements · /memory revert <id> undoes one."
-                .to_owned(),
-        );
+        let mut lines = vec![format!("Memories ({}), newest first:", memories.len())];
+        lines.extend(memories.iter().enumerate().map(|(index, memory)| {
+            format!("  m{}. {} — {}", index + 1, memory.title, ui::truncate(&memory.body, 120))
+        }));
+        lines.push("/memory forget m1 removes one.".to_owned());
         self.say(lines.join("\n"));
-    }
-
-    /// `/memory log`: the refinements, newest first.
-    fn memory_log(&mut self) {
-        let history = self.state.harness.history();
-        if history.is_empty() {
-            return self.say("No refinements recorded yet. Abacus refines after a long turn, or with /memory refine.");
-        }
-        let applied =
-            |changes: Vec<String>| if changes.is_empty() { "no applied edits".to_owned() } else { changes.join(", ") };
-        let mut lines = vec![format!("{} refinement(s), newest first:", history.len())];
-        lines.extend(
-            history
-                .iter()
-                .rev()
-                .take(15)
-                .map(|result| format!("- {} — {} [{}]", result.id, result.summary, applied(result.changes()))),
-        );
-        lines.push("Undo one with /memory revert <id>.".to_owned());
-        self.say(lines.join("\n"));
-    }
-
-    /// `/memory revert <id>`: undo a refinement, which is itself undoable.
-    fn memory_revert(&mut self, id: &str) {
-        if id.is_empty() {
-            return self.fail("Usage: /memory revert <refinement-id> — ids come from /memory log");
-        }
-        match self.state.harness.rollback(id) {
-            Ok(result) => {
-                let changes = result.changes();
-                self.say(format!(
-                    "Reverted {id} ({} edit(s) undone): {}\nThis rollback is itself {} — revert it to redo.",
-                    result.applied_count(),
-                    if changes.is_empty() { "nothing applied".to_owned() } else { changes.join(", ") },
-                    result.id
-                ))
-            }
-            Err(error) => self.fail(format!("{error:#}")),
-        }
     }
 
     /// Shift+Tab: AUTO and YOLO, back and forth, for this session.
@@ -794,64 +691,5 @@ impl App {
             [] => self.fail(format!("No profile matches `{argument}`. /profile lists them.")),
             several => self.fail(format!("`{argument}` matches {} — say which.", several.join(", "))),
         }
-    }
-
-    /// Run the refinement pass on demand. `--durable` writes straight to the
-    /// cross-session store instead of waiting for a lesson to recur, which is
-    /// how a user adopts something deliberately.
-    pub(super) fn start_refine(&mut self, argument: &str) {
-        if self.refining {
-            return self.fail("A refinement is already running.");
-        }
-        let (durable, instructions) = match argument.trim().strip_prefix("--durable") {
-            Some(rest) => (true, rest.trim()),
-            None => (false, argument.trim()),
-        };
-        let (lifetime, scope) = if durable {
-            (crate::harness::Lifetime::Durable, "durable")
-        } else {
-            (crate::harness::Lifetime::Session, "this session")
-        };
-        self.refining = true;
-        self.status = "refining the harness".to_owned();
-        let provider = self.aux_provider.clone();
-        let messages = self.messages.clone();
-        let (harness, papercuts) = (self.state.harness.clone(), self.papercuts.clone());
-        let workspace = self.config.workspace.clone();
-        let instructions = (!instructions.is_empty()).then(|| instructions.to_owned());
-        let events = self.background_tx.clone();
-        tokio::spawn(async move {
-            // A user asking for this has already made the judgement the review
-            // gate exists to make, so the planning call runs directly.
-            let outcome = crate::refine::run(
-                &crate::refine::Reflector::detached(&provider),
-                &messages,
-                &harness,
-                &papercuts,
-                lifetime,
-                instructions.as_deref(),
-                &AtomicBool::new(false),
-            )
-            .await;
-            let message = match outcome {
-                None => "refine — nothing worth recording from this conversation.".to_owned(),
-                Some(outcome) => {
-                    if durable {
-                        // Durable prompt entries are what AGENTS.md renders.
-                        let _ = harness.render_notes(&workspace);
-                    }
-                    let papercuts = match outcome.papercuts {
-                        0 => String::new(),
-                        count => format!(", {count} papercut(s)"),
-                    };
-                    format!(
-                        "refine — {} ({} harness edit(s){papercuts}, {scope}). Undo with \
-                         /memory revert {}.",
-                        outcome.summary, outcome.applied, outcome.result.id
-                    )
-                }
-            };
-            let _ = events.send(Background::Refined(message));
-        });
     }
 }

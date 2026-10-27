@@ -1,44 +1,22 @@
-//! Hive: the delegation ladder and the live subagent board.
+//! Hive: the live subagent board.
 //!
-//! Two halves. The **board** is shared mutable state the subagent runtime
-//! writes and the TUI reads: every worker's name, state, and latest activity,
-//! pinned above the composer while a swarm runs and expandable into a detail
-//! overlay. The **stats** are the persistent delegation record — how many
-//! swarms have run here and how they went — from which a maturity tier is
-//! derived: an inexperienced abacus is told to *probe* subagents on low-risk
-//! separable work, a proven one to *swarm* freely, and a veteran to act as a
-//! *hive* — clusters of parallel swarms per surface, its own effort spent on
-//! validation and coordination. The tier guidance is injected as a context
-//! layer, so confidence is earned from recorded outcomes, not assumed.
+//! Shared mutable state the subagent runtime writes and the front ends read:
+//! every worker's name, state, and latest activity, pinned above the composer
+//! while a swarm runs and expandable into a detail overlay. The workers still
+//! running are also named to the model, so it does not start the same work
+//! twice.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Individual worker lines shown when a swarm is at most this large;
 /// bigger swarms cluster into a single summary line.
 pub const CLUSTER_THRESHOLD: usize = 3;
-
-/// Clean swarm runs required to leave the probing tier.
-const SWARM_AT: u32 = 3;
-/// Clean swarm runs required for hive tier…
-const HIVE_AT: u32 = 12;
-/// …provided the worker failure rate stays under this.
-const HIVE_MAX_FAILURE_RATE: f64 = 0.3;
-/// Every promotion is gated on this, not just the top one. Counting clean runs
-/// alone let a workspace where most workers *fail* still read as "delegation
-/// works here" and ask for more of it: 3 clean runs out of 12, with 16 of 30
-/// workers failing, promoted to swarm and kept pushing.
-const SWARM_MAX_FAILURE_RATE: f64 = 0.4;
-/// Below this many workers the rate is too noisy to demote on — one early
-/// failure out of two should not pin a workspace to probing forever.
-const RATE_MEANINGFUL_AFTER: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerState {
@@ -64,9 +42,8 @@ impl WorkerState {
 pub struct WorkerStatus {
     pub id: u64,
     pub name: String,
-    /// The worker's role: a built-in name, or the id of an authored delegation
-    /// spec. Owned rather than `&'static str` because an authored spec's id is
-    /// only known at runtime.
+    /// The worker's role: `scout`, `drone` or `worker`, or `resumed` for one
+    /// continued by message.
     pub role: String,
     pub state: WorkerState,
     /// The worker's most recent visible activity — a tool call or the tail of
@@ -503,170 +480,45 @@ impl WorkerRegistry {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HiveTier {
-    Probing,
-    Swarm,
-    Hive,
-}
-
-impl HiveTier {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Probing => "probing",
-            Self::Swarm => "swarm",
-            Self::Hive => "hive",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct HiveStats {
-    #[serde(default)]
-    pub runs: u32,
-    #[serde(default)]
-    pub clean_runs: u32,
-    #[serde(default)]
-    pub workers: u32,
-    #[serde(default)]
-    pub worker_failures: u32,
-}
-
-impl HiveStats {
-    pub fn tier(&self) -> HiveTier {
-        let failure_rate =
-            if self.workers == 0 { 0.0 } else { f64::from(self.worker_failures) / f64::from(self.workers) };
-        // A rate computed from a handful of workers says little, so it only
-        // starts counting once there is enough of a record to mean something.
-        let rate_is_meaningful = self.workers >= RATE_MEANINGFUL_AFTER;
-        if self.clean_runs >= HIVE_AT && failure_rate < HIVE_MAX_FAILURE_RATE {
-            HiveTier::Hive
-        } else if self.clean_runs >= SWARM_AT && !(rate_is_meaningful && failure_rate >= SWARM_MAX_FAILURE_RATE) {
-            HiveTier::Swarm
-        } else {
-            HiveTier::Probing
-        }
-    }
-}
-
-/// Shared handle: persistent stats plus the live board, riding `TurnOptions`.
-/// `Default` yields an inert handle (no persistence) for nested contexts.
+/// Shared handle on the live board and the worker registry, riding
+/// `TurnOptions`. A front end keeps one for the process, so background workers
+/// stay visible across turns.
 #[derive(Clone, Default)]
 pub struct HiveHandle {
-    stats: Arc<RwLock<HiveStats>>,
-    file: Option<PathBuf>,
     pub board: SubagentBoard,
     /// Named workers the orchestrator can message after spawning them.
     pub workers: WorkerRegistry,
 }
 
 impl HiveHandle {
-    pub fn load(file: PathBuf) -> Self {
-        let stats: HiveStats = crate::config::read_json(&file);
-        Self {
-            stats: Arc::new(RwLock::new(stats)),
-            file: Some(file),
-            board: SubagentBoard::default(),
-            workers: WorkerRegistry::default(),
-        }
-    }
-
-    pub fn stats(&self) -> HiveStats {
-        self.stats.read().expect("hive lock").clone()
-    }
-
-    /// Record a finished swarm and return the updated record line the model
-    /// sees appended to the tool result — its own track record, kept honest.
-    pub fn record_run(&self, workers: u32, failures: u32) -> String {
-        let mut stats = self.stats.write().expect("hive lock");
-        stats.runs += 1;
-        stats.workers += workers;
-        stats.worker_failures += failures;
-        if failures == 0 {
-            stats.clean_runs += 1;
-        }
-        if let Some(file) = &self.file {
-            crate::config::write_json(file, &*stats);
-        }
-        format!(
-            "Hive record: {} swarm(s) run in total, {} clean; {} worker(s), {} failed. Tier: {}.",
-            stats.runs,
-            stats.clean_runs,
-            stats.workers,
-            stats.worker_failures,
-            stats.tier().label()
-        )
-    }
-
-    /// The tier guidance injected as a context layer. Confidence is earned:
-    /// the wording changes only as recorded outcomes accumulate.
-    pub fn guidance(&self) -> String {
-        let stats = self.stats();
-        // Workers already in flight come first, and they come every time.
-        //
-        // Spawning does not block: the call returns "started in background" and
-        // results arrive after a later tool call. So a model that only sees the
-        // encouragement below, and nothing about what it already launched, will
-        // launch the same work again — three spawns of three became nine
-        // workers for one task. Naming them is what closes that loop.
+    /// The workers still running, as a context layer: empty when none are.
+    ///
+    /// Spawning does not block: the call returns "started in background" and
+    /// results arrive after a later tool call. So a model that is not told
+    /// what it already launched will launch the same work again — three
+    /// spawns of three became nine workers for one task. Naming them is what
+    /// closes that loop.
+    pub fn in_flight(&self) -> String {
         let running: Vec<String> = self
             .board
             .snapshot()
             .into_iter()
             .filter(|worker| worker.state == WorkerState::Running)
             // Name and role only. The live activity line changes on every tool
-            // call a worker makes, and this guidance is conversation context:
-            // a text that changes that often is re-sent on every step.
+            // call a worker makes, and this is conversation context: a text
+            // that changes that often is re-sent on every step.
             .map(|worker| format!("{} ({})", worker.name, worker.role))
             .collect();
-        let in_flight = if running.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "ALREADY RUNNING — {} worker(s) you have already started, still \
-                 working: {}. Their results reach you after your next tool call. Do \
-                 NOT spawn more workers for this same work, and do not redo it \
-                 yourself; carry on with something else or wait for them.\n\n",
-                running.len(),
-                running.join("; ")
-            )
-        };
-        let guidance = self.tier_guidance(&stats);
-        format!("{in_flight}{guidance}")
-    }
-
-    fn tier_guidance(&self, stats: &HiveStats) -> String {
-        match stats.tier() {
-            HiveTier::Probing => format!(
-                "Delegation experience here: {} swarm run(s), {} clean. You are still \
-                 learning how subagents fit your workflow — PROBE them: when a task \
-                 contains low-risk, separable sub-work (independent research, isolated \
-                 test runs, self-contained fixes), delegate it with spawn_subagents and \
-                 record what you learn about delegating well as memories. Keep the \
-                 stakes small until the record grows.",
-                stats.runs, stats.clean_runs
-            ),
-            HiveTier::Swarm => format!(
-                "Delegation experience here: {} swarm run(s), {} clean, {} worker(s) with \
-                 {} failure(s). Delegation works in this workspace — SWARM: prefer \
-                 spawn_subagents for any genuinely separable work — scouts to gather, \
-                 drones to build, workers for the general case — keep your own focus \
-                 on the parts that need shared context, and keep recording what \
-                 delegates well.",
-                stats.runs, stats.clean_runs, stats.workers, stats.worker_failures
-            ),
-            HiveTier::Hive => format!(
-                "Delegation experience here: {} swarm run(s), {} clean, {} worker(s) with \
-                 {} failure(s). You are a proven swarm operator — act as a HIVE: split \
-                 multi-surface work into clusters of parallel swarms (one spawn_subagents \
-                 call per surface, sequenced as their dependencies require; scouts ahead \
-                 of drones, so building starts informed), validate \
-                 every worker outcome yourself before building on it, and spend your own \
-                 effort on inter-swarm coordination and integration rather than on work a \
-                 swarm can carry.",
-                stats.runs, stats.clean_runs, stats.workers, stats.worker_failures
-            ),
+        if running.is_empty() {
+            return String::new();
         }
+        format!(
+            "ALREADY RUNNING — {} worker(s) you have already started, still working: {}. Their results reach \
+             you after your next tool call. Do NOT spawn more workers for this same work, and do not redo it \
+             yourself; carry on with something else or wait for them.",
+            running.len(),
+            running.join("; ")
+        )
     }
 }
 
@@ -674,98 +526,24 @@ impl HiveHandle {
 mod tests {
     use super::*;
 
-    /// The record that caused this: 12 runs, 3 clean, 30 workers, 16 failed.
-    /// Counting clean runs alone promoted it to swarm, so the system prompt
-    /// told the model "delegation works in this workspace" while more than
-    /// half of every worker it started was failing — and asked for more.
-    #[test]
-    fn a_workspace_where_most_workers_fail_is_not_promoted() {
-        let losing = HiveStats { runs: 12, clean_runs: 3, workers: 30, worker_failures: 16 };
-        assert_eq!(losing.tier(), HiveTier::Probing, "53% of workers failed");
-
-        // The same clean-run count with workers that mostly succeed does earn it.
-        let winning = HiveStats { runs: 12, clean_runs: 3, workers: 30, worker_failures: 4 };
-        assert_eq!(winning.tier(), HiveTier::Swarm);
-    }
-
-    /// A rate from two or three workers is noise, and one early failure should
-    /// not pin a workspace to probing forever.
-    #[test]
-    fn a_thin_record_is_not_judged_on_its_failure_rate() {
-        let thin = HiveStats { runs: 3, clean_runs: 3, workers: 4, worker_failures: 2 };
-        assert_eq!(thin.tier(), HiveTier::Swarm, "too few workers to demote on");
-    }
-
     /// Spawning does not block, so without this the model cannot tell that it
     /// already started the work it is about to start again.
     #[test]
-    fn guidance_names_the_workers_already_in_flight() {
+    fn the_workers_already_in_flight_are_named() {
         let hive = HiveHandle::default();
-        assert!(!hive.guidance().contains("ALREADY RUNNING"), "nothing running, nothing to say");
+        assert_eq!(hive.in_flight(), "", "nothing running, nothing to say");
 
         let tokens = Arc::new(crate::provider::TokenLedger::default());
         let id = hive.board.begin("recon", "scout", tokens.clone());
         hive.board.activity(id, "reading src/agent.rs");
         hive.board.begin("builder", "drone", tokens);
 
-        let guidance = hive.guidance();
-        assert!(guidance.contains("ALREADY RUNNING"), "{guidance}");
-        assert!(guidance.contains("recon"), "names them: {guidance}");
-        assert!(guidance.contains("builder"), "{guidance}");
-        assert!(guidance.contains("scout"), "with their roles");
-        assert!(guidance.contains("Do NOT spawn more workers"), "and says what to do about it: {guidance}");
-        // The warning leads, ahead of the encouragement to delegate.
-        let warn = guidance.find("ALREADY RUNNING").unwrap();
-        let tier = guidance.find("Delegation experience").unwrap();
-        assert!(warn < tier, "the live state comes first");
-    }
-
-    #[test]
-    fn tiers_are_earned_from_clean_runs_and_failure_rate() {
-        let mut stats = HiveStats::default();
-        assert_eq!(stats.tier(), HiveTier::Probing);
-        stats.clean_runs = 3;
-        stats.runs = 3;
-        stats.workers = 9;
-        assert_eq!(stats.tier(), HiveTier::Swarm);
-        stats.clean_runs = 12;
-        stats.runs = 14;
-        stats.workers = 40;
-        stats.worker_failures = 2;
-        assert_eq!(stats.tier(), HiveTier::Hive);
-        // A high failure rate holds a veteran at swarm tier, and one where
-        // workers mostly fail sends it back to probing.
-        stats.worker_failures = 14;
-        assert_eq!(stats.tier(), HiveTier::Swarm);
-        stats.worker_failures = 20;
-        assert_eq!(stats.tier(), HiveTier::Probing);
-    }
-
-    #[test]
-    fn record_run_persists_and_reports() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("hive.json");
-        let hive = HiveHandle::load(file.clone());
-        let line = hive.record_run(4, 0);
-        assert!(line.contains("1 swarm(s)"), "{line}");
-        assert!(line.contains("probing"), "{line}");
-        let reloaded = HiveHandle::load(file);
-        assert_eq!(reloaded.stats().runs, 1);
-        assert_eq!(reloaded.stats().workers, 4);
-    }
-
-    #[test]
-    fn guidance_matures_with_the_record() {
-        let hive = HiveHandle::default();
-        assert!(hive.guidance().contains("PROBE"));
-        for _ in 0..3 {
-            hive.record_run(2, 0);
-        }
-        assert!(hive.guidance().contains("SWARM"));
-        for _ in 0..9 {
-            hive.record_run(2, 0);
-        }
-        assert!(hive.guidance().contains("HIVE"));
+        let layer = hive.in_flight();
+        assert!(layer.contains("ALREADY RUNNING"), "{layer}");
+        assert!(layer.contains("recon"), "names them: {layer}");
+        assert!(layer.contains("builder"), "{layer}");
+        assert!(layer.contains("scout"), "with their roles");
+        assert!(layer.contains("Do NOT spawn more workers"), "and says what to do about it: {layer}");
     }
 
     #[test]

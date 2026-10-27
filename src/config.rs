@@ -236,38 +236,6 @@ pub enum Command {
         #[arg(long, conflicts_with = "desktop")]
         check: bool,
     },
-    /// Run the eval suite in `examples/evals` and score it
-    Eval {
-        /// Only run tasks whose directory name contains this substring
-        #[arg(long, value_name = "SUBSTRING")]
-        tasks: Option<String>,
-        /// Repetitions per task per state. Models are stochastic; one run
-        /// proves nothing.
-        #[arg(long, default_value_t = 1)]
-        repeat: usize,
-        /// Whether accumulated state in `~/.abacus` is visible to the run.
-        /// `both` runs each task twice and reports the delta.
-        #[arg(long, value_enum, default_value_t = EvalState::On)]
-        state: EvalState,
-        /// Pin a model for the run instead of the configured one
-        #[arg(long)]
-        model: Option<String>,
-        /// Emit one JSON object per run instead of a table
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-/// Whether an eval run can see the papercuts, memories and hive tier this
-/// machine has accumulated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum EvalState {
-    /// Use the real `~/.abacus`
-    On,
-    /// Use an empty state directory — the control arm
-    Off,
-    /// Run both and report the difference
-    Both,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1529,12 +1497,10 @@ pub struct AbacusPaths {
     pub sessions_dir: PathBuf,
     pub traces_dir: PathBuf,
     pub attachments_dir: PathBuf,
-    pub papercuts_file: PathBuf,
-    /// Legacy store, read once by the harness migration and then left alone.
     pub memories_file: PathBuf,
-    /// Versioned continual-harness state and its refinement history.
+    /// Where memories were kept, versioned, before they had a file of their
+    /// own again; read once, when `memories_file` is imported.
     pub harness_dir: PathBuf,
-    pub hive_file: PathBuf,
     /// Where scripted endpoint files used to live; read once, when settings
     /// from before providers are migrated.
     pub endpoints_dir: PathBuf,
@@ -1568,10 +1534,8 @@ impl AbacusPaths {
             themes_dir: root.join("themes"),
             traces_dir: root.join("traces"),
             attachments_dir: root.join("attachments"),
-            papercuts_file: root.join("papercuts.json"),
             memories_file: root.join("memories.json"),
             harness_dir: root.join("harness"),
-            hive_file: root.join("hive.json"),
             endpoints_dir: root.join("endpoints"),
             models_dir: root.join("models"),
             update_file: root.join("update.json"),

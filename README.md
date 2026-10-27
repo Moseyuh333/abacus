@@ -134,7 +134,7 @@ selected block, `Y` copies the last reply, `i` returns to typing. Press `F1` or
 | `/resume [id]`, `/rename <title>` | Resume a saved session (a list without an id), rename this one |
 | `/compact` | Shrink the conversation context now |
 | `/repair` | Fix session history that a provider keeps rejecting |
-| `/memory` | What Abacus has learned here: list, forget, log, revert, refine |
+| `/memory` | What Abacus remembers here: list, or forget one |
 | `/tools` | Tools, skills, plugin commands and MCP tools |
 | `/usage` | Local token usage and activity |
 | `/theme` | Switch theme, or export one to edit |
@@ -143,7 +143,7 @@ selected block, `Y` copies the last reply, `i` returns to typing. Press `F1` or
 | `/quit` | Exit |
 
 The names older versions used (`/model`, `/models`, `/sessions`, `/skills`,
-`/memories`, `/papercuts` and the like) still work, as aliases.
+`/memories` and the like) still work, as aliases.
 
 ### Sessions
 
@@ -236,10 +236,11 @@ host without a path (for example `https://api.anthropic.com`); Abacus appends
 `/v1/messages`.
 
 A profile can hand jobs to other models, on any provider, as **roles**:
-`aux` for background calls such as prompt refinement and drift checks,
-`review` for AUTO's safety reviewer (it follows `aux` when unset), `subagent`
-for delegated agents, and `compaction` for the rolling summary. A role left
-unset uses the profile's own model. Set them in `/config` → Profile.
+`aux` for background calls such as reading fetched pages and drafting your
+next message, `review` for AUTO's safety reviewer (it follows `aux` when
+unset), `subagent` for delegated agents, and `compaction` for the rolling
+summary. A role left unset uses the profile's own model. Set them in
+`/config` → Profile.
 
 A configuration from an older version is converted the first time it is
 loaded: each profile's endpoint becomes a provider (profiles that shared one
@@ -371,21 +372,11 @@ a summary and a patch, and a patch is applied only if `git apply --check` passes
 
 ## What Abacus remembers
 
-Abacus remembers lessons between sessions in the same workspace.
-
-- **Memories** are facts, decisions and conventions the agent records about your
-  project. They are added to every new session.
-- **Papercuts** are fixes for errors the agent has hit before. When the same
-  error text shows up again, the fix is shown to the model next to the error.
-
-`/memory` lists both, numbered, and `/memory forget m2` or `/memory forget p1`
-removes one. After long turns, Abacus reviews what happened and may record new
-memories, papercuts or short instructions for itself; `/memory refine` runs that
-review now. `/memory log` lists every change and `/memory revert <id>` undoes
-one. Durable instructions are also written into a marked `abacus:notes` block
-in the workspace's `AGENTS.md`; the rest of that file is left alone.
-
-All of this is stored locally under `~/.abacus/`.
+The agent records facts, decisions and conventions about your project as
+**memories**, and they are added to every later session in the same workspace
+(or every workspace, for a global one). `/memory` lists them, numbered, and
+`/memory forget m2` removes one. They are stored locally, in
+`~/.abacus/memories.json`.
 
 ## Scheduled jobs
 

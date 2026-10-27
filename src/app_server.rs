@@ -21,9 +21,9 @@
 //! GUI stay simple.
 //!
 //! One process serves one workspace and one active thread. A second window is
-//! a second process — the state a turn needs (harness, tether, handles,
-//! injections) is per-session anyway, so multiplexing it inside one process
-//! would buy nothing but a lifetime puzzle.
+//! a second process — the state a turn needs (memories, handles, injections)
+//! is per-session anyway, so multiplexing it inside one process would buy
+//! nothing but a lifetime puzzle.
 //!
 //! **stdout is the protocol.** Every diagnostic goes to stderr, or the frame
 //! stream is corrupt and the front end desynchronises.
@@ -125,7 +125,7 @@ impl ThreadState {
                 initial_messages(&config.workspace),
             )
         });
-        let state = SessionState::open(config, Some(&session), session.id.to_string());
+        let state = SessionState::open(config, Some(&session));
         let trace = config
             .trace_enabled
             .then(|| crate::sft::TraceWriter::open(&config.paths.traces_dir, &session.id.to_string()).ok())
@@ -234,7 +234,7 @@ pub async fn run(
     let yolo = Arc::new(AtomicBool::new(config.permission == Permission::Yolo));
     let credentials = Credentials::load(&config.paths).unwrap_or_default();
     let usage = UsageReporter::new(&config.paths, &credentials, "app-server");
-    let hive = crate::hive::HiveHandle::load(config.paths.hive_file.clone());
+    let hive = crate::hive::HiveHandle::default();
     let (idle_done, mut idle_rx) = mpsc::unbounded_channel::<IdleDone>();
     let mailbox = crate::inbox::Mailbox::new(config.paths.clone(), crate::presence::FrontEnd::Desktop);
     let mut app = App {
@@ -1378,7 +1378,7 @@ impl App {
                 ),
                 None => Default::default(),
             },
-            ..self.thread.state.turn(&self.config, self.services.clone()).with_workspace_stores(&self.config)
+            ..self.thread.state.turn(&self.config, self.services.clone())
         }
     }
 

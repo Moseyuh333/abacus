@@ -368,7 +368,7 @@ fn worker_mark(worker: &crate::hive::WorkerStatus, animated: bool) -> (&'static 
 }
 
 /// The Ctrl+P overlay: every worker in the current swarm with role, state,
-/// elapsed time, and latest activity, plus the workspace's delegation record.
+/// elapsed time, and latest activity.
 pub(super) fn draw_hive(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let popup = ui::centered(area.width.saturating_sub(6).min(100), area.height.saturating_sub(4).max(8), area);
     let hints: &[(&str, &str)] = &[("j/k", "scroll"), ("esc", "close")];
@@ -400,18 +400,6 @@ pub(super) fn draw_hive(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(Line::from(fg(format!("    {}", ui::truncate(&worker.activity, 90)), muted())));
         lines.push(Line::from(""));
     }
-    let stats = app.hive.stats();
-    lines.push(Line::from(fg(
-        format!(
-            "delegation record: {} swarm(s), {} clean · {} worker(s), {} failed · tier {}",
-            stats.runs,
-            stats.clean_runs,
-            stats.workers,
-            stats.worker_failures,
-            stats.tier().label()
-        ),
-        rail(),
-    )));
     frame.render_widget(Paragraph::new(Text::from(lines)).scroll((app.hive_scroll, 0)), inner);
 }
 
