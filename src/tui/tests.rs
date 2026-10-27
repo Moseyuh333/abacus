@@ -346,6 +346,52 @@ async fn a_message_from_another_session_starts_a_turn_when_idle() {
     }));
 }
 
+/// A session reopened after compaction shows where its history was cut. The
+/// history keeps only what the model sees, so the transcript used to run from
+/// the opening straight to the last exchange.
+#[tokio::test]
+async fn a_reopened_session_shows_where_compaction_cut_its_history() {
+    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
+    let store = SessionStore::new(&app.config.paths, app.config.workspace.clone());
+    let mut session = store.create("test".into(), "test/test-model".into(), Vec::new()).unwrap();
+    session.update_messages(vec![
+        json!({"role": "system", "content": "rules"}),
+        json!({"role": "user", "content": "fix the importer"}),
+        json!({"role": "system", "content": "", "compacted": {"messages": 48, "tokens": 92_000, "summarised": true}}),
+        json!({"role": "user", "content": "and the tests?"}),
+        json!({"role": "assistant", "content": "They pass."}),
+    ]);
+    store.save(&session).unwrap();
+    app.adopt(Some(store.load(&session.id.to_string()).unwrap()));
+
+    let shown: Vec<(EntryKind, &str)> = app.entries.iter().map(|entry| (entry.kind, entry.text.as_str())).collect();
+    assert_eq!(
+        shown,
+        [
+            (EntryKind::User, "fix the importer"),
+            (EntryKind::Rule, "Earlier conversation summarised · 48 messages, about 92.0k tokens"),
+            (EntryKind::User, "and the tests?"),
+            (EntryKind::Assistant, "They pass."),
+        ]
+    );
+}
+
+/// When the summary could not be written, the middle was dropped with only a
+/// trace for the model, and the divider says so.
+#[test]
+fn a_rebuilt_transcript_says_when_the_middle_was_dropped() {
+    let entries = entries_from_messages(&[
+        json!({"role": "user", "content": "fix the importer"}),
+        json!({"role": "system", "content": "", "compacted": {"messages": 1, "tokens": 640, "summarised": false}}),
+        json!({"role": "system", "content": "1 older conversation messages were omitted to fit the model context."}),
+        json!({"role": "user", "content": "and the tests?"}),
+    ]);
+    let rules: Vec<&str> =
+        entries.iter().filter(|entry| entry.kind == EntryKind::Rule).map(|entry| entry.text.as_str()).collect();
+    assert_eq!(rules, ["Earlier conversation dropped to fit the context · 1 message, about 640 tokens"]);
+    assert_eq!(entries.len(), 3, "the note is the model's, not the transcript's");
+}
+
 /// Messages that were waiting when a session is opened do not start a turn
 /// on their own: the person opening it is in charge, and they ride along
 /// with what the person sends.

@@ -363,11 +363,14 @@ impl Provider {
         deltas: mpsc::UnboundedSender<Chunk>,
         cancel: &AtomicBool,
     ) -> Result<Completion> {
+        // The markers compaction leaves in a history are the transcript's: no
+        // request carries one, whatever protocol it is built for.
+        let messages = crate::compaction::without_markers(messages);
         let _permit = match &self.stream_gate {
             Some(gate) => Some(gate.acquire().await.context("stream gate closed")?),
             None => None,
         };
-        match self.complete_once(messages, tools, deltas.clone(), cancel).await {
+        match self.complete_once(&messages, tools, deltas.clone(), cancel).await {
             // A strict chat template raises this from inside the template, and
             // some servers (LocalAI among them) report it as an error chunk on
             // a 200 stream rather than as a failed request — so it lands here
@@ -379,7 +382,7 @@ impl Provider {
                 if is_leading_system_rejection(&error)
                     && !self.prefers_leading_system.swap(true, Ordering::Relaxed) =>
             {
-                self.complete_once(messages, tools, deltas, cancel).await
+                self.complete_once(&messages, tools, deltas, cancel).await
             }
             result => result,
         }

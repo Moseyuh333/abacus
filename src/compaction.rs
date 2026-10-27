@@ -23,6 +23,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use std::borrow::Cow;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -44,6 +45,10 @@ const OVERFLOW_STRIP_PERCENTS: &[u32] = &[0, 10, 20, 50, 100];
 /// however much identifying detail the placeholder carries.
 const SENTINEL_PREFIX: &str = "[compacted:";
 const TOOL_BODY_OMITTED: &str = "[tool output omitted for summarization]";
+
+/// The field that makes a system message a marker of where compaction cut
+/// the history (see [`Folded`]).
+const MARKER_FIELD: &str = "compacted";
 
 /// Tools whose results are large and re-derivable from disk, so their old
 /// output is safe to placeholder.
@@ -125,6 +130,82 @@ impl CompactionState {
     }
 }
 
+/// What compaction folded away at one place in the history.
+///
+/// A session file holds only what the model sees, so a transcript rebuilt
+/// from a compacted one ran from the opening straight to the last exchange.
+/// Where compaction cuts into the conversation it leaves a marker — a system
+/// message with no text that carries this — and the front ends show it as a
+/// divider. The model never reads it: requests are built without it (see
+/// [`without_markers`]), so it costs no tokens, moves no cached prefix, and
+/// never reaches `merge_system_messages`.
+///
+/// Every compaction cuts at the end of the verbatim head, where the last one
+/// left its marker, so that marker is folded with the rest and what it
+/// counted carries into the new one: one divider for the whole gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Folded {
+    /// The person's messages, the agent's, and tool results.
+    pub messages: usize,
+    /// About how many tokens of context they took up.
+    pub tokens: usize,
+    /// Whether the rolling summary stands in for them. False when the last
+    /// compaction could not write one and dropped them, leaving the model
+    /// only a trace of what was done.
+    pub summarised: bool,
+}
+
+impl Folded {
+    /// What `message` marks, if it is a marker.
+    pub fn marked_by(message: &Value) -> Option<Self> {
+        if !is_marker(message) {
+            return None;
+        }
+        serde_json::from_value(message[MARKER_FIELD].clone()).ok()
+    }
+
+    /// What folding `range` away folds, with what the markers in it already
+    /// counted. Other system messages — context layers, a fallback note —
+    /// are scaffolding, not conversation.
+    fn of(range: &[Value], summarised: bool) -> Self {
+        let mut folded = Self { messages: 0, tokens: 0, summarised };
+        let mut chars = 0;
+        for message in range {
+            if let Some(earlier) = Self::marked_by(message) {
+                folded.messages += earlier.messages;
+                folded.tokens += earlier.tokens;
+            } else if message["role"] != "system" {
+                folded.messages += 1;
+                chars += message_chars_one(message);
+            }
+        }
+        folded.tokens += chars / crate::model_info::CHARS_PER_TOKEN;
+        folded
+    }
+
+    /// The marker that stands where the history was cut, if any of the
+    /// conversation was: a fold of context layers alone leaves nothing for a
+    /// divider to stand for.
+    fn marker(self) -> Option<Value> {
+        (self.messages > 0).then(|| json!({"role": "system", "content": "", MARKER_FIELD: self}))
+    }
+}
+
+/// Whether `message` is a marker compaction left rather than part of the
+/// conversation.
+pub fn is_marker(message: &Value) -> bool {
+    message["role"] == "system" && message.get(MARKER_FIELD).is_some()
+}
+
+/// The history as the model reads it: without the markers compaction leaves
+/// for the transcript.
+pub fn without_markers(messages: &[Value]) -> Cow<'_, [Value]> {
+    if !messages.iter().any(is_marker) {
+        return Cow::Borrowed(messages);
+    }
+    Cow::Owned(messages.iter().filter(|message| !is_marker(message)).cloned().collect())
+}
+
 /// Who summarises, and whether it can do so from inside the live context.
 ///
 /// An out-of-context summarisation builds a fresh prompt — its own system
@@ -198,7 +279,8 @@ pub async fn compact(
     // budget is tiny — that tail is what the next model call has to see.
     let cut = find_tail_cut(messages, budget.recent_budget_chars, head_end)
         .min(last_user_index(messages).unwrap_or(messages.len()));
-    if cut <= head_end {
+    // The marker the last compaction left is nothing to summarise.
+    if cut <= head_end || messages[head_end..cut].iter().all(is_marker) {
         return;
     }
 
@@ -224,13 +306,14 @@ pub async fn compact(
             Some(json!({"role":"system","content":format!(
                 "{} older conversation messages were omitted to fit the model context.{actions} \
                  Reinspect files when prior details matter.",
-                to_summarize.len()
+                to_summarize.iter().filter(|message| !is_marker(message)).count()
             )}))
         }
     };
-    // The middle gives way to the note, when there is one. What is left may
-    // still carry stale output.
-    messages.splice(head_end..cut, note);
+    // The middle gives way to the marker the transcript shows, and to the
+    // note, when there is one. What is left may still carry stale output.
+    let marker = Folded::of(&to_summarize, note.is_none()).marker();
+    messages.splice(head_end..cut, marker.into_iter().chain(note));
     microcompact(messages, budget);
 }
 
@@ -268,7 +351,8 @@ fn idle_cut(messages: &[Value], budget: &CompactionBudget) -> Option<(usize, usi
     let head_end = first_legal_cut_at_or_after(messages, KEEP_FIRST);
     let last = messages.iter().rposition(|message| message["role"] != "tool")?;
     let cut = find_tail_cut(messages, budget.recent_budget_chars / 3, head_end).min(last);
-    (cut > head_end).then_some((head_end, cut))
+    // A range holding only the last compaction's marker has nothing to fold.
+    (cut > head_end && !messages[head_end..cut].iter().all(is_marker)).then_some((head_end, cut))
 }
 
 /// The rolling summary, written ahead of time because the session went quiet.
@@ -293,7 +377,7 @@ pub async fn compact_idle(
     let summary =
         summarize(summariser, prior.as_deref(), messages, &messages[head_end..cut], budget, cancel).await.ok()?;
     let mut compacted = messages.to_vec();
-    compacted.drain(head_end..cut);
+    compacted.splice(head_end..cut, Folded::of(&messages[head_end..cut], true).marker());
     microcompact(&mut compacted, budget);
     Some((compacted, bound_summary(summary, budget.summary_budget_chars)))
 }
@@ -1109,5 +1193,103 @@ mod tests {
             vec![json!({"role":"system","content":"rules"}), json!({"role":"user","content":"x".repeat(80_000)})];
         assert_eq!(idle_cut(&messages, &budget), None);
         assert!(!idle_worthwhile(&messages, &CompactionState::default(), &budget));
+    }
+
+    /// One divider for the whole gap: a marker already in the range carries
+    /// what it counted into the new one. Context layers and notes are
+    /// scaffolding, not conversation, so they are not counted.
+    #[test]
+    fn a_marker_counts_what_it_folds_and_what_the_last_one_did() {
+        let mut range = vec![
+            Folded { messages: 40, tokens: 90_000, summarised: false }.marker().unwrap(),
+            json!({"role":"system","content":"<session_context layer=\"memory\">\nnotes\n</session_context>"}),
+            json!({"role":"user","content":"and the tests?"}),
+        ];
+        tool_calls(&mut range, 2, "read_file", |_| "x".repeat(4_000));
+        let folded = Folded::of(&range, true);
+        assert_eq!(folded.messages, 40 + 5);
+        let chars: usize = range[2..].iter().map(message_chars_one).sum();
+        assert_eq!(folded.tokens, 90_000 + chars / crate::model_info::CHARS_PER_TOKEN);
+        assert!(folded.summarised, "the new summary stands in for what the last compaction dropped");
+        assert_eq!(Folded::marked_by(&folded.marker().unwrap()), Some(folded));
+        assert_eq!(Folded::marked_by(&range[1]), None);
+    }
+
+    /// A compaction can fold nothing but context layers, which the next
+    /// request sends again anyway. No conversation went, so no divider says
+    /// "0 messages" were summarised.
+    #[test]
+    fn folding_only_context_layers_leaves_no_marker() {
+        let layer =
+            json!({"role":"system","content":"<session_context layer=\"permissions\">\nAUTO\n</session_context>"});
+        assert_eq!(Folded::of(&[layer], true).marker(), None);
+    }
+
+    /// The marker is the transcript's: the model reads the history without
+    /// it, and the context measured for compaction leaves it out.
+    #[test]
+    fn the_model_reads_the_history_without_its_markers() {
+        let plain = vec![
+            json!({"role":"system","content":"rules"}),
+            json!({"role":"user","content":"fix the importer"}),
+            json!({"role":"assistant","content":"done"}),
+        ];
+        assert!(matches!(without_markers(&plain), Cow::Borrowed(_)));
+        let mut marked = plain.clone();
+        marked.insert(2, Folded { messages: 3, tokens: 1_000, summarised: true }.marker().unwrap());
+        assert_eq!(without_markers(&marked).as_ref(), plain.as_slice());
+        assert_eq!(message_chars(&marked), message_chars(&plain));
+        // Only a system message carrying the field is one.
+        assert!(!is_marker(&json!({"role":"user","content":"hi","compacted":{"messages":1}})));
+        assert!(!is_marker(&json!({"role":"system","content":"rules"})));
+    }
+
+    /// Once idle compaction has folded all but the last reply away, its
+    /// marker is all there is to fold: another quiet spell has nothing to
+    /// summarise.
+    #[test]
+    fn a_lone_marker_is_not_folded_again_when_idle() {
+        let budget =
+            CompactionBudget { compact_at_chars: 100_000, recent_budget_chars: 30_000, summary_budget_chars: 15_000 };
+        let messages = vec![
+            json!({"role":"system","content":"rules"}),
+            json!({"role":"user","content":"fix the importer"}),
+            Folded { messages: 22, tokens: 30_000, summarised: true }.marker().unwrap(),
+            json!({"role":"assistant","content":"r".repeat(60_000)}),
+        ];
+        assert_eq!(idle_cut(&messages, &budget), None);
+        assert!(!idle_worthwhile(&messages, &CompactionState::default(), &budget));
+    }
+
+    /// Under pressure likewise: a turn that began right after the marker
+    /// leaves the summariser nothing to read, so nothing is asked of it and
+    /// the history stays as it is.
+    #[tokio::test]
+    async fn a_lone_marker_is_not_summarised_again_under_pressure() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            no_session: true,
+            ..crate::config::Config::for_endpoint(
+                directory.path().to_path_buf(),
+                "http://127.0.0.1:9/v1".into(),
+                "test-model".into(),
+                crate::config::AbacusPaths::under(directory.path().join("home")),
+            )
+        };
+        let provider = Provider::new(&config).unwrap();
+        let mut messages = vec![
+            json!({"role":"system","content":"rules"}),
+            json!({"role":"user","content":"fix the importer"}),
+            Folded { messages: 12, tokens: 40_000, summarised: true }.marker().unwrap(),
+            json!({"role":"user","content":"now the exporter"}),
+        ];
+        tool_calls(&mut messages, 3, "edit_file", |_| "y".repeat(6_000));
+        let before = messages.clone();
+        let state = CompactionState::new(Some("did the importer".to_owned()));
+        let budget =
+            CompactionBudget { compact_at_chars: 10_000, recent_budget_chars: 3_000, summary_budget_chars: 1_000 };
+        compact(&Summariser::detached(&provider), &mut messages, &state, &budget, &AtomicBool::new(false)).await;
+        assert_eq!(messages, before);
+        assert_eq!(state.snapshot().as_deref(), Some("did the importer"));
     }
 }

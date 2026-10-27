@@ -517,7 +517,8 @@ async fn run_turn_inner(
         const EMPTY_COMPLETION_RETRY_LIMIT: usize = 2;
         let mut empty_retries: usize = 0;
         sync_session_context(&mut messages, &options);
-        let mut provider_messages = messages.clone();
+        // The history as the model reads it, which is what the trace records.
+        let mut provider_messages = crate::compaction::without_markers(&messages).into_owned();
         let completion = loop {
             let completion =
                 match provider.complete(&provider_messages, &specs, delta_tx.clone(), &options.cancel).await {
@@ -552,7 +553,7 @@ async fn run_turn_inner(
                 // message list in case compaction or context state changed.
                 tokio::time::sleep(std::time::Duration::from_millis(500 * empty_retries as u64)).await;
                 sync_session_context(&mut messages, &options);
-                provider_messages = messages.clone();
+                provider_messages = crate::compaction::without_markers(&messages).into_owned();
                 continue;
             }
             break completion;
@@ -1001,6 +1002,10 @@ pub fn message_chars(messages: &[Value]) -> usize {
 }
 
 pub fn message_chars_one(message: &Value) -> usize {
+    // A compaction marker is left out of every request.
+    if crate::compaction::is_marker(message) {
+        return 0;
+    }
     // Image parts carry base64 payloads that are huge on the wire but cost a
     // roughly fixed number of vision tokens, so counting their raw length
     // would make the context estimate useless after one screenshot.

@@ -264,7 +264,7 @@ pub fn records_from_session(session: &Value) -> Vec<Value> {
             "source": "session",
             "step": step,
             "mode": "UNKNOWN",
-            "messages": &messages[..index],
+            "messages": crate::compaction::without_markers(&messages[..index]),
             "tools": [],
             "completion": completion,
         }));
@@ -489,6 +489,27 @@ mod tests {
             ]
         });
         assert_eq!(records_from_session(&session).len(), 1);
+    }
+
+    /// A rebuilt prompt is the history as the model saw it, which never held
+    /// the marker compaction leaves for the transcript.
+    #[test]
+    fn a_rebuilt_prompt_leaves_out_the_compaction_marker() {
+        let session = json!({
+            "id": "abc",
+            "model": "m",
+            "messages": [
+                {"role":"system","content":"be careful"},
+                {"role":"user","content":"read it"},
+                {"role":"system","content":"","compacted":{"messages":12,"tokens":9000,"summarised":true}},
+                {"role":"user","content":"and now?"},
+                {"role":"assistant","content":"Done."}
+            ]
+        });
+        let records = records_from_session(&session);
+        let prompt = records[0]["messages"].as_array().unwrap();
+        assert_eq!(prompt.len(), 3);
+        assert!(prompt.iter().all(|message| message.get("compacted").is_none()));
     }
 
     /// A live capture carries reasoning and the tool list; a reconstruction

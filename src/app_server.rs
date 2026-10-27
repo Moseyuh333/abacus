@@ -2197,8 +2197,20 @@ fn history_items(messages: &[Value]) -> Vec<Value> {
         let role = message["role"].as_str().unwrap_or_default();
         let content = message["content"].as_str().unwrap_or_default();
         match role {
-            // The system prompt is scaffolding, not conversation.
-            "system" => continue,
+            // Where compaction folded the middle away, which the history no
+            // longer holds. Every other system message is scaffolding, not
+            // conversation.
+            "system" => {
+                if let Some(folded) = crate::compaction::Folded::marked_by(message) {
+                    items.push(json!({
+                        "id": id,
+                        "type": "contextCompaction",
+                        "messages": folded.messages,
+                        "tokens": folded.tokens,
+                        "summarised": folded.summarised,
+                    }));
+                }
+            }
             "user" => {
                 let shown = crate::inbox::shown(&crate::text::content_text(&message["content"]));
                 let mut item = match shown {
@@ -2405,6 +2417,27 @@ mod tests {
         assert_eq!(items[0]["text"], "tests pass here");
         assert_eq!(items[0]["from"]["title"], "Fork A");
         assert!(items[1].get("from").is_none());
+    }
+
+    /// A reopened thread shows where compaction cut its history, and how
+    /// much it folded away, between the opening and what was kept. Every
+    /// other system message stays out of the transcript.
+    #[test]
+    fn history_shows_where_compaction_cut_it() {
+        let items = history_items(&[
+            json!({"role": "system", "content": "scaffolding"}),
+            json!({"role": "user", "content": "fix the importer"}),
+            json!({"role": "system", "content": "", "compacted": {"messages": 48, "tokens": 92_000, "summarised": true}}),
+            json!({"role": "system", "content": "<session_context layer=\"summary\">\nfixed it\n</session_context>"}),
+            json!({"role": "user", "content": "and the tests?"}),
+            json!({"role": "assistant", "content": "They pass."}),
+        ]);
+        let types: Vec<&str> = items.iter().map(|item| item["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["userMessage", "contextCompaction", "userMessage", "agentMessage"]);
+        assert_eq!(
+            items[1],
+            json!({"id": "history_2", "type": "contextCompaction", "messages": 48, "tokens": 92_000, "summarised": true})
+        );
     }
 
     #[test]

@@ -1123,9 +1123,27 @@ fn number_entries(entries: &mut [Entry], mut last: u64) -> u64 {
     last
 }
 
+/// The divider where compaction cut a session's history, as a transcript
+/// rebuilt from that history shows it.
+fn folded_rule(folded: &crate::compaction::Folded) -> String {
+    let what = if folded.summarised {
+        "Earlier conversation summarised"
+    } else {
+        "Earlier conversation dropped to fit the context"
+    };
+    let plural = if folded.messages == 1 { "" } else { "s" };
+    format!("{what} · {} message{plural}, about {} tokens", folded.messages, ui::format_count(folded.tokens as u64))
+}
+
 fn entries_from_messages(messages: &[Value]) -> Vec<Entry> {
     let mut entries = Vec::new();
     for message in messages {
+        // The history keeps only what the model sees, so this is all that
+        // stands where compaction folded the middle away.
+        if let Some(folded) = crate::compaction::Folded::marked_by(message) {
+            entries.push(Entry::new(EntryKind::Rule, folded_rule(&folded)));
+            continue;
+        }
         let role = message["role"].as_str().unwrap_or_default();
         // An image prompt is an array of parts; its text (with the
         // `[image #N]` markers) is what the transcript shows.

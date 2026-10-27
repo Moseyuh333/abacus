@@ -164,7 +164,8 @@ session reads its messages when it is next opened.
 
 When a conversation outgrows the model's context, Abacus folds its older part
 into a rolling summary and keeps the opening and the recent work; `/compact`
-shrinks it now. A long session (about 100k tokens or more) that sits idle for
+shrinks it now. Reopened, such a session shows a divider where the summary took
+over. A long session (about 100k tokens or more) that sits idle for
 4½ minutes after a turn is summarised early, while the provider still has the
 conversation cached, so the next message does not send the whole history again
 at full price. The transcript says "Compacted while you were away", and typing

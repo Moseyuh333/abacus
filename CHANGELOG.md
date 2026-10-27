@@ -168,6 +168,12 @@ Also since 0.7.0:
 - The rolling summary written when a turn compacts the context now carries
   into the next turn. It used to be lost when the turn ended, and the next turn
   told the model the summary no longer applied.
+- A session reopened after compaction shows a divider where its history was
+  summarised, with about how much was folded away. It used to run from the
+  opening straight to the last exchange. The session file keeps a marker there,
+  which no request carries, and the app server's `thread/resume` and
+  `thread/read` return it as a `contextCompaction` item (`messages`, `tokens`,
+  `summarised`).
 - `read_page` refuses a page whose host resolves to a private address.
 - The `git_diff` and `git_log` path filters cannot reach `.env` files.
 - `Ctrl+T` cycles the reasoning effort.

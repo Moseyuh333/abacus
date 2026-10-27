@@ -7,7 +7,7 @@ use std::sync::{
 
 use abacus_agent::{
     agent::{AgentEvent, ApprovalDecision, DoneReason, TurnOptions, compact_idle},
-    compaction::CompactionState,
+    compaction::{CompactionState, Folded, without_markers},
     config::ProviderProtocol,
     provider::Provider,
     tools::tool_specs,
@@ -449,6 +449,90 @@ async fn a_summary_written_mid_turn_carries_into_the_next_turn() {
     assert_eq!(state.snapshot().as_deref(), Some("SUMMARY-OF-THE-THING"));
 }
 
+/// Compaction leaves a marker where it cut, for a reopened transcript to show,
+/// and the next compaction folds it with the rest: one marker for the whole
+/// gap, counting what both folded away. No request carries it.
+#[tokio::test]
+async fn compaction_marks_where_it_cut_the_history() {
+    let project = project(&[]);
+    let mut turns = 0;
+    let mock = Mock::answering(move |request| match asked(request) {
+        Asked::Summary => Reply::Send(says("SUMMARY-OF-THE-THING")),
+        Asked::Turn => {
+            turns += 1;
+            if turns == 2 { Reply::Last(says("all done")) } else { Reply::Send(says("all done")) }
+        }
+    })
+    .await;
+    let state = CompactionState::default();
+    let options = || TurnOptions { compaction: state.clone(), ..project.options() };
+
+    let (mut messages, _) = turn(project.provider(&mock), oversized(&project), options(), |_| {}).await;
+    let first = Folded::marked_by(&messages[2]).expect("a marker where the middle was cut");
+    assert_eq!((first.messages, first.summarised), (1, true), "the big reply was folded into the summary");
+    assert!(first.tokens > 100_000, "folded {}", first.tokens);
+
+    messages.push(json!({"role":"assistant","content":format!("BIGBLOB{}", "z".repeat(420_000))}));
+    messages.push(json!({"role":"user","content":"and again"}));
+    let (messages, _) = turn(project.provider(&mock), messages, options(), |_| {}).await;
+    let requests = mock.finish().await;
+
+    let markers: Vec<Folded> = messages.iter().filter_map(Folded::marked_by).collect();
+    assert_eq!(markers.len(), 1, "one divider for the whole gap");
+    let gap = markers[0];
+    assert_eq!(Folded::marked_by(&messages[2]), Some(gap), "where the opening ends");
+    // The first marker's count, then "continue", its reply and the next big one.
+    assert_eq!((gap.messages, gap.summarised), (first.messages + 3, true));
+    assert!(gap.tokens > first.tokens + 100_000, "folded {}", gap.tokens);
+    assert!(requests.iter().all(|request| !request.contains("\"compacted\":")), "a request carried the marker");
+}
+
+/// When no summary can be written under pressure, the middle is dropped with
+/// a trace for the model, and the marker says it was dropped, not summarised.
+#[tokio::test]
+async fn compaction_that_cannot_summarise_marks_the_middle_dropped() {
+    let project = project(&[]);
+    let mock = Mock::answering(|request| match asked(request) {
+        Asked::Summary => Reply::Send(says("")),
+        Asked::Turn => Reply::Last(says("all done")),
+    })
+    .await;
+    let (messages, _) = turn(project.provider(&mock), oversized(&project), project.options(), |_| {}).await;
+    let requests = mock.finish().await;
+
+    let folded = Folded::marked_by(&messages[2]).expect("a marker where the middle was cut");
+    assert_eq!((folded.messages, folded.summarised), (1, false));
+    let note = "1 older conversation messages were omitted";
+    assert!(messages[3]["content"].as_str().is_some_and(|content| content.starts_with(note)), "the model's note");
+    let last = requests.last().unwrap();
+    assert!(last.contains(note) && !last.contains("\"compacted\":"), "the note is sent, the marker is not");
+}
+
+/// The marker is the transcript's alone: a turn over a history holding one
+/// sends exactly the request a turn over the same history without it sends,
+/// so it costs nothing and moves no cached prefix. A session file keeps it as
+/// a system message with no text.
+#[tokio::test]
+async fn the_compaction_marker_never_reaches_the_model() {
+    let project = project(&[]);
+    let mock = Mock::script([says("noted"), says("noted")]).await;
+    let mut plain = project.asks("please do the thing");
+    plain.push(json!({"role":"assistant","content":"done"}));
+    plain.push(json!({"role":"user","content":"and the tests?"}));
+    let mut marked = plain.clone();
+    let marker = json!({"role":"system","content":"","compacted":{"messages":40,"tokens":90_000,"summarised":true}});
+    marked.insert(2, marker.clone());
+
+    let (kept, _) = turn(project.provider(&mock), marked, project.options(), |_| {}).await;
+    turn(project.provider(&mock), plain, project.options(), |_| {}).await;
+    let requests = mock.finish().await;
+
+    assert_eq!(kept[2], marker, "the history keeps it");
+    let body = |request: &str| request.split_once("\r\n\r\n").unwrap().1.to_owned();
+    assert!(!requests[0].contains("\"compacted\":"), "the marker was sent");
+    assert_eq!(body(&requests[0]), body(&requests[1]));
+}
+
 /// A long session that went quiet after its last turn.
 fn finished(project: &support::Project) -> Vec<serde_json::Value> {
     let mut messages = oversized(project);
@@ -477,7 +561,11 @@ async fn idle_compaction_summarises_in_context_down_to_the_last_exchange() {
     assert!(requests[0].contains(IN_CONTEXT_SUMMARY) && requests[0].contains("BIGBLOB"), "asked in-context");
     assert!(requests[0].contains("\"tools\""), "with the turns' tools, or the cached prefix moves");
     assert_eq!(compacted.summary, "SUMMARY-OF-THE-THING");
-    let contents = contents(&compacted.messages);
+    let folded = Folded::marked_by(&compacted.messages[2]).expect("a marker where the middle was cut");
+    assert_eq!((folded.messages, folded.summarised), (1, true));
+    assert!(folded.tokens > 100_000, "folded {}", folded.tokens);
+    let read = without_markers(&compacted.messages);
+    let contents = contents(&read);
     assert!(!contents.iter().any(|content| content.contains("BIGBLOB")), "the middle was not dropped");
     assert_eq!(
         &contents[1..],
