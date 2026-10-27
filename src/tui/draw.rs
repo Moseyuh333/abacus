@@ -1377,10 +1377,12 @@ pub(super) fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ),
         ]));
     } else {
-        header.push(Line::from(fg(
-            "The safety review could not decide on this one. Read it before allowing it to run.",
-            muted(),
-        )));
+        let reason = if approval.reason.is_empty() {
+            "The safety review could not decide on this one. Read it before allowing it to run."
+        } else {
+            approval.reason.as_str()
+        };
+        header.push(Line::from(fg(reason, muted())));
     }
     frame.render_widget(Paragraph::new(Text::from(header)), sections[0]);
 

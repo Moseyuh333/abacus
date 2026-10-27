@@ -259,7 +259,9 @@ async fn an_undecided_review_asks_the_person() {
         |event| {
             if let AgentEvent::Approval(request) = event {
                 assert_eq!(request.tool, "run_command");
-                assert!(request.details.contains("could not decide"), "{}", request.details);
+                assert!(request.reason.contains("could not decide"), "{}", request.reason);
+                // The operation travels apart from the reason, as it would be run.
+                assert_eq!(request.details.trim(), "$ touch marker.txt");
                 request.respond.send(ApprovalDecision::Once).unwrap();
                 asked = true;
             }

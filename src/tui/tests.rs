@@ -952,6 +952,7 @@ fn ctrl_o_steps_a_question_aside_and_a_new_dialog_returns_visible() {
     app.set_approval(crate::agent::ApprovalRequest {
         tool: "write_file".into(),
         summary: "x".into(),
+        reason: String::new(),
         details: "x".into(),
         respond,
     });
@@ -1106,11 +1107,14 @@ fn approval_modal_spells_out_the_choices() {
     app.set_approval(crate::agent::ApprovalRequest {
         tool: "run_command".into(),
         summary: "rm -rf build/".into(),
+        reason: "The safety review could not decide (the reviewer gave no verdict), so this one is yours.".into(),
         details: "$ rm -rf build/".into(),
         respond,
     });
     let rendered = render(&mut app, 110, 34);
-    assert!(rendered.contains("could not decide"), "say why a person is being asked: {rendered}");
+    // The reason is said once, apart from the operation.
+    assert_eq!(rendered.matches("could not decide").count(), 1, "say why a person is being asked: {rendered}");
+    assert!(rendered.contains("gave no verdict"), "{rendered}");
     assert!(rendered.contains("Yes, run it"), "{rendered}");
     assert!(rendered.contains("tell Abacus in chat what to do instead"), "{rendered}");
     // AUTO's reviewer decides each action, so an approval never sticks.
@@ -1400,6 +1404,7 @@ fn semantic_diff_approval_renders_at_standard_and_compact_sizes() {
         app.set_approval(ApprovalRequest {
             tool: "apply_patch".into(),
             summary: "workspace patch".into(),
+            reason: String::new(),
             details: patch.into(),
             respond,
         });
@@ -2196,6 +2201,7 @@ async fn browser_approvals_take_the_terminal_decision_path() {
     app.set_approval(crate::agent::ApprovalRequest {
         tool: "write_file".into(),
         summary: "notes.txt".into(),
+        reason: String::new(),
         details: "Write notes.txt".into(),
         respond,
     });
@@ -2244,6 +2250,7 @@ async fn browser_approvals_take_the_terminal_decision_path() {
     app.set_approval(crate::agent::ApprovalRequest {
         tool: "run_command".into(),
         summary: "ls".into(),
+        reason: String::new(),
         details: "$ ls".into(),
         respond,
     });
@@ -2500,6 +2507,7 @@ async fn a_resync_shows_how_dialogs_ended_where_they_happened_and_only_once() {
     app.set_approval(crate::agent::ApprovalRequest {
         tool: "write_file".into(),
         summary: "notes.txt".into(),
+        reason: String::new(),
         details: "--- a/notes.txt\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+hello\n".into(),
         respond,
     });
@@ -2573,6 +2581,7 @@ async fn rewinding_resyncs_the_browsers_without_what_was_rewound() {
     app.set_approval(crate::agent::ApprovalRequest {
         tool: "write_file".into(),
         summary: "x".into(),
+        reason: String::new(),
         details: "d".into(),
         respond,
     });
@@ -2604,6 +2613,7 @@ async fn a_turn_that_ends_with_an_approval_open_does_not_claim_a_denial() {
         app.set_approval(crate::agent::ApprovalRequest {
             tool: "run_command".into(),
             summary: "rm -rf target".into(),
+            reason: String::new(),
             details: "$ rm -rf target".into(),
             respond,
         });

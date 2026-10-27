@@ -37,6 +37,9 @@ pub enum ApprovalDecision {
 pub struct ApprovalRequest {
     pub tool: String,
     pub summary: String,
+    /// Why the person is asked, in one sentence.
+    pub reason: String,
+    /// The operation itself: the command, or a diff for a file change.
     pub details: String,
     pub respond: oneshot::Sender<ApprovalDecision>,
 }
@@ -1033,9 +1036,14 @@ pub fn message_chars_one(message: &Value) -> usize {
 
 /// Ask the person whether `call` may run. Only AUTO asks, and only when its
 /// reviewer could not decide; nobody answering is a no.
-async fn request_approval(call: &ToolCall, details: String, events: &mpsc::UnboundedSender<AgentEvent>) -> bool {
+async fn request_approval(
+    call: &ToolCall,
+    reason: String,
+    details: String,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) -> bool {
     let (respond, receive) = oneshot::channel();
-    let request = ApprovalRequest { tool: call.name.clone(), summary: call.summary(), details, respond };
+    let request = ApprovalRequest { tool: call.name.clone(), summary: call.summary(), reason, details, respond };
     if events.send(AgentEvent::Approval(request)).is_err() {
         return false;
     }
@@ -1077,8 +1085,10 @@ async fn review_call(
             } else {
                 options.services.approval_details(call).unwrap_or_else(|| tools.approval_details(call))
             };
-            let details = format!("The safety review could not decide ({why}), so this one is yours.\n\n{details}");
-            if request_approval(call, details, events).await {
+            // The reason travels apart from the operation, so a diff still
+            // reads as a diff.
+            let reason = format!("The safety review could not decide ({why}), so this one is yours.");
+            if request_approval(call, reason, details, events).await {
                 None
             } else {
                 Some("The user rejected this tool call. Do not retry it without changing the approach.".to_owned())

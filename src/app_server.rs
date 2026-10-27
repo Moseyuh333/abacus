@@ -1347,7 +1347,8 @@ impl App {
                         "tool": request.tool,
                         "command": request.summary,
                         "cwd": self.config.workspace,
-                        "reason": request.details,
+                        "reason": request.reason,
+                        "details": request.details,
                         "availableDecisions": ["accept", "decline", "cancel"],
                     }
                 }));

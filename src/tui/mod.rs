@@ -132,6 +132,7 @@ type TranscriptKey = (u64, u16, usize, Option<usize>, bool);
 struct PendingApproval {
     tool: String,
     summary: String,
+    reason: String,
     details: String,
     diff: Option<DiffDocument>,
     view: ApprovalView,
@@ -1785,6 +1786,7 @@ impl App {
         self.approval = Some(PendingApproval {
             tool: request.tool,
             summary: request.summary,
+            reason: request.reason,
             details: request.details,
             view: if diff.is_some() { ApprovalView::Unified } else { ApprovalView::Raw },
             diff,
