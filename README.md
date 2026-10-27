@@ -364,11 +364,14 @@ completion word you choose:
 
 Ask the agent to split work across subagents and it runs them in parallel with
 `spawn_subagents`. Up to eight workers run in separate git worktrees seeded with
-your current changes, so their edits do not land in your checkout. They run in
-the session's mode, and a worker cannot ask you anything: in AUTO, what the
-reviewer cannot clear is not run. Each worker returns
-a summary and a patch, and a patch is applied only if `git apply --check` passes.
-`Ctrl+P` shows each worker's progress.
+your current changes, so their edits do not land in your checkout. A worker is
+`general`, or `explore`, which can only read. They run in the session's mode,
+and a worker cannot ask you anything: in AUTO, what the reviewer cannot clear
+is not run. While they run, the workers can message each other, and the agent
+that started them as `main`, with `send_message`; the agent messages them the
+same way, and a message to a finished worker picks its conversation up again.
+Each worker returns a summary and a patch, and a patch is applied only if
+`git apply --check` passes. `Ctrl+P` shows each worker's progress.
 
 ## What Abacus remembers
 

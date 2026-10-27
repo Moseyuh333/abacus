@@ -3,7 +3,7 @@
 //! Two questions are asked here. AUTO mode asks "is this what the user wants
 //! done?" of every action that could do harm: [`review_action`] puts it to a
 //! reviewer model with the user's own words beside it, and blocks what goes
-//! beyond them. A read-only task (a scout subagent) asks "does this have side
+//! beyond them. A read-only task (an explore subagent) asks "does this have side
 //! effects?", in three tiers, most settled without a model at all:
 //!
 //! 1. `Allow` — recognisably pure inspection. Runs immediately.

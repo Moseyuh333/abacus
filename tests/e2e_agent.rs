@@ -294,7 +294,7 @@ async fn yolo_runs_everything_without_review() {
     assert_eq!(requests.len(), 2, "no review request in between");
 }
 
-/// A scout is read-only mechanically: a command that changes something is
+/// An explore subagent is read-only mechanically: a command that changes something is
 /// refused even in YOLO, after the classifier calls it a mutation.
 #[tokio::test]
 async fn a_read_only_task_refuses_a_change() {

@@ -79,10 +79,10 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) {
         // Ctrl+G jumps back to the live tail from anywhere, in any mode.
         KeyCode::Char('g') if ctrl(key, 'g') => return app.follow_tail(),
         // Ctrl+P: the subagent board. Approval and question dialogs keep
-        // priority — a swarm view must never shadow a pending decision.
+        // priority — the board must never shadow a pending decision.
         KeyCode::Char('p') if ctrl(key, 'p') && !dialog_open => {
-            toggle(&mut app.hive_overlay);
-            app.hive_scroll = 0;
+            toggle(&mut app.workers_overlay);
+            app.workers_scroll = 0;
             return;
         }
         // Ctrl+T steps the reasoning effort, so trying a harder or cheaper
@@ -91,11 +91,11 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) {
         _ => {}
     }
 
-    if app.hive_overlay && !dialog_open {
+    if app.workers_overlay && !dialog_open {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            app.hive_overlay = false;
+            app.workers_overlay = false;
         }
-        scroll_keys(&mut app.hive_scroll, key);
+        scroll_keys(&mut app.workers_scroll, key);
     } else if dialog_open && app.approval.is_some() {
         approval_key(app, key);
     } else if dialog_open {

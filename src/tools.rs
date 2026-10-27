@@ -151,7 +151,7 @@ impl ToolCall {
                     args["tasks"].as_array().into_iter().flatten().filter_map(|task| task["name"].as_str()).collect();
                 if names.is_empty() { "subagents".to_owned() } else { names.join(", ") }
             }
-            "message_subagent" => args["name"].as_str().unwrap_or("subagent").to_owned(),
+            "send_message" => args["to"].as_str().unwrap_or("subagent").to_owned(),
             // The desktop's browser tools: what was visited, clicked or typed.
             name if name.starts_with("browser_") => ["url", "element", "text", "key", "direction"]
                 .iter()
@@ -1498,7 +1498,7 @@ mod tests {
             ),
             "Readme survey, FizzBuzz audit"
         );
-        assert_eq!(call("message_subagent", r#"{"name":"Readme survey","message":"and the tests?"}"#), "Readme survey");
+        assert_eq!(call("send_message", r#"{"to":"Readme survey","message":"and the tests?"}"#), "Readme survey");
         assert_eq!(call("browser_navigate", r#"{"url":"https://example.com"}"#), "https://example.com");
         assert_eq!(call("browser_click", r#"{"ref":7,"element":"Sign in button"}"#), "Sign in button");
         assert_eq!(call("browser_click", r#"{"ref":7}"#), "element 7");

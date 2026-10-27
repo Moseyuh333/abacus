@@ -124,8 +124,19 @@ run.
   `AGENTS.md`, with `/memory log`, `/memory revert` and `/memory refine`;
   papercuts, fixes recalled into a tool result when an old error came back,
   with `papercut_record`; and `abacus eval`, which measured them.
-  `spawn_subagents` loses its `spec` field with the specs; the scout, drone and
-  worker roles remain.
+  `spawn_subagents` loses its `spec` field with the specs.
+
+- **Subagents talk to each other.** `send_message` replaces `message_subagent`
+  and goes both ways: the agent messages a worker by name, as before, and a
+  worker messages the others by name, or the agent that started it as `main`.
+  A running worker reads a message after its current step; the receiver sees
+  who sent it. A worker is told on starting who else is working alongside it,
+  and a message to one that is still waiting for a slot is there when it
+  starts. When a report or a message reaches an agent that has no turn
+  running, it starts one, now in the app server too, which `turn/completed`
+  announces with `continues`. The hive is gone with the delegation tiers: the
+  roles are `general` and `explore` (read-only), where `drone`, `scout` and
+  `worker` still parse, and the terminal's strip no longer says HIVE.
 
 - **Memories stay, and keep.** A memory the agent records is kept for later
   sessions straight away, rather than for the session until it had been

@@ -17,7 +17,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.composer_width = composer_text_width as u16;
     let task_height = u16::from(app.state.goal.snapshot().is_some() || app.ralph_loop.is_some()) * 2
         + u16::from(!app.state.tasks.is_empty())
-        + app.hive.board.strip_rows();
+        + app.workers.board.strip_rows();
     // The composer grows to its configured height, but never so far that the
     // transcript loses its last three rows.
     let most = (app.settings.ui.composer_rows.saturating_add(2))
@@ -68,8 +68,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         draw_approval(frame, area, app);
     } else if app.question.is_some() && !app.overlay_hidden {
         draw_user_question(frame, area, app);
-    } else if app.hive_overlay {
-        draw_hive(frame, area, app);
+    } else if app.workers_overlay {
+        draw_workers(frame, area, app);
     }
 }
 
@@ -308,12 +308,12 @@ pub(super) fn draw_task_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(Line::from(spans));
     }
     // The subagent board: each worker pinned with its live activity while a
-    // small swarm runs; a large swarm clusters into one summary line and the
-    // detail lives behind Ctrl+P.
-    let workers = app.hive.board.snapshot();
+    // few run; more cluster into one summary line, and the detail lives behind
+    // Ctrl+P.
+    let workers = app.workers.board.snapshot();
     if !workers.is_empty() {
         let set = ui::glyphs();
-        if workers.len() <= crate::hive::CLUSTER_THRESHOLD {
+        if workers.len() <= crate::workers::CLUSTER_THRESHOLD {
             for worker in &workers {
                 let (glyph, color, _) = worker_mark(worker, app.settings.ui.animations);
                 lines.push(Line::from(vec![
@@ -330,17 +330,17 @@ pub(super) fn draw_task_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ]));
             }
         } else {
-            let running = workers.iter().filter(|worker| worker.state == crate::hive::WorkerState::Running).count();
-            let failed = workers.iter().filter(|worker| worker.state == crate::hive::WorkerState::Failed).count();
+            let running = workers.iter().filter(|worker| worker.state == crate::workers::WorkerState::Running).count();
+            let failed = workers.iter().filter(|worker| worker.state == crate::workers::WorkerState::Failed).count();
             let done = workers.len() - running - failed;
-            let swarm_tokens: u64 = workers.iter().map(|worker| worker.tokens_used()).sum();
+            let tokens: u64 = workers.iter().map(|worker| worker.tokens_used()).sum();
             lines.push(Line::from(vec![
-                bold(format!(" {} HIVE  ", set.tasks), primary()),
+                bold(format!(" {} ", set.tasks), primary()),
                 fg(
                     format!(
                         "{} subagent(s) · {running} running · {done} done · {failed} failed · {}",
                         workers.len(),
-                        ui::format_count(swarm_tokens)
+                        ui::format_count(tokens)
                     ),
                     text(),
                 ),
@@ -355,26 +355,26 @@ pub(super) fn draw_task_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// How a worker's state is drawn: its glyph, its colour, and the word for it.
-fn worker_mark(worker: &crate::hive::WorkerStatus, animated: bool) -> (&'static str, Color, &'static str) {
+fn worker_mark(worker: &crate::workers::WorkerStatus, animated: bool) -> (&'static str, Color, &'static str) {
     let set = ui::glyphs();
     match worker.state {
-        crate::hive::WorkerState::Running => {
+        crate::workers::WorkerState::Running => {
             (ui::spinner_frame(worker.started.elapsed(), animated), primary(), "running")
         }
-        crate::hive::WorkerState::Done => (set.ok, success(), "done"),
-        crate::hive::WorkerState::Failed => (set.failed, danger(), "failed"),
-        crate::hive::WorkerState::Stopped => (set.failed, muted(), "stopped"),
+        crate::workers::WorkerState::Done => (set.ok, success(), "done"),
+        crate::workers::WorkerState::Failed => (set.failed, danger(), "failed"),
+        crate::workers::WorkerState::Stopped => (set.failed, muted(), "stopped"),
     }
 }
 
-/// The Ctrl+P overlay: every worker in the current swarm with role, state,
+/// The Ctrl+P overlay: every worker in the current batch with role, state,
 /// elapsed time, and latest activity.
-pub(super) fn draw_hive(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw_workers(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let popup = ui::centered(area.width.saturating_sub(6).min(100), area.height.saturating_sub(4).max(8), area);
     let hints: &[(&str, &str)] = &[("j/k", "scroll"), ("esc", "close")];
     let inner = open_overlay(frame, popup, "SUBAGENTS", primary(), hints);
 
-    let workers = app.hive.board.snapshot();
+    let workers = app.workers.board.snapshot();
     let mut lines: Vec<Line<'static>> = Vec::new();
     if workers.is_empty() {
         lines.push(Line::from(fg(
@@ -400,7 +400,7 @@ pub(super) fn draw_hive(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(Line::from(fg(format!("    {}", ui::truncate(&worker.activity, 90)), muted())));
         lines.push(Line::from(""));
     }
-    frame.render_widget(Paragraph::new(Text::from(lines)).scroll((app.hive_scroll, 0)), inner);
+    frame.render_widget(Paragraph::new(Text::from(lines)).scroll((app.workers_scroll, 0)), inner);
 }
 
 /// Slash-command and `@file` suggestions, floated above the composer with the

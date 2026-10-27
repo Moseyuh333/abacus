@@ -460,15 +460,15 @@ struct App {
     services: Arc<AgentServices>,
     /// What the conversation carries between turns.
     state: SessionState,
-    hive: crate::hive::HiveHandle,
+    workers: crate::workers::Workers,
     /// Whether Abacus is holding the mouse. Holding it enables wheel scrolling
     /// and clickable rows but takes click-drag away from the terminal on
     /// terminals without a Shift-drag bypass, which is how you select and copy
     /// text — so it is releasable with F2.
     mouse_captured: bool,
     /// Ctrl+P: the subagent detail overlay.
-    hive_overlay: bool,
-    hive_scroll: u16,
+    workers_overlay: bool,
+    workers_scroll: u16,
     ralph_loop: Option<RalphLoop>,
     entries: Vec<Entry>,
     /// The number the transcript gave its newest entry (`Entry::id`).
@@ -1184,7 +1184,7 @@ impl App {
         let tokens = Arc::new(crate::provider::TokenLedger::new(initial_tokens));
         let provider = Provider::with_tokens(&config, tokens.clone())?;
         let aux_provider = provider.for_role(config.roles.aux.as_ref());
-        let hive = crate::hive::HiveHandle::default();
+        let workers = crate::workers::Workers::default();
         let ralph_loop = session.as_ref().and_then(|session| session.ralph_loop.clone());
         let messages =
             session.as_ref().map(|value| value.messages.clone()).unwrap_or_else(|| initial_messages(&config.workspace));
@@ -1271,10 +1271,10 @@ impl App {
             session_store: session_store.clone(),
             services,
             state,
-            hive,
+            workers,
             mouse_captured: true,
-            hive_overlay: false,
-            hive_scroll: 0,
+            workers_overlay: false,
+            workers_scroll: 0,
             ralph_loop,
             entries,
             last_entry_id,
@@ -1788,9 +1788,9 @@ impl App {
 
     /// True when the worker board changed since the last draw. The strip must
     /// update while no turn is running — during that window nothing else marks
-    /// the frame dirty, so background swarms looked frozen between keystrokes.
+    /// the frame dirty, so background workers looked frozen between keystrokes.
     fn board_changed(&mut self) -> bool {
-        let version = self.hive.board.version();
+        let version = self.workers.board.version();
         std::mem::replace(&mut self.last_board_version, version) != version
     }
 
@@ -1992,7 +1992,7 @@ impl App {
         }
         self.turn_started = Some(Instant::now());
         self.turn_output_chars = 0;
-        self.hive.board.clear();
+        self.workers.board.clear();
         self.turn_reasoning.clear();
         self.turn_had_tools = false;
         self.receiving_thinking = false;
@@ -2055,7 +2055,7 @@ impl App {
             cancel: self.cancel.clone(),
             yolo: self.yolo.clone(),
             session_id: self.session.as_ref().map(|session| session.id.to_string()),
-            hive: self.hive.clone(),
+            workers: self.workers.clone(),
             peers: self.peers(),
             ..self.state.turn(&self.config, self.services.clone())
         }
@@ -2940,8 +2940,9 @@ impl App {
     }
 
     /// A background subagent that finished after its turn ended still has a
-    /// report to deliver. Start a turn to hand it over, the same way a running
-    /// turn would have picked it up between tool calls.
+    /// report to deliver, and one still running may have sent a message. Start
+    /// a turn to hand it over, the same way a running turn would have picked
+    /// it up between tool calls.
     fn deliver_pending_injections(&mut self) -> bool {
         use crate::agent::Injection;
         if self.running.is_some() {
@@ -2964,10 +2965,11 @@ impl App {
                 }
                 Injection::SubagentReport(report) => {
                     self.say("A background subagent finished.");
-                    self.submit_prompt(format!(
-                        "[background subagent finished] {report}\n\nFold this into the work; if \
-                         it changes the plan, say so."
-                    ));
+                    self.submit_prompt(crate::agent::report_prompt(&report));
+                }
+                Injection::AgentMessage { from, text } => {
+                    self.say(format!("Subagent {from} sent a message."));
+                    self.submit_prompt(crate::agent::agent_message(&from, &text));
                 }
                 // Another session wrote while nothing was running: its message
                 // is the turn, sent as written rather than as a typed prompt.

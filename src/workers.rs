@@ -1,22 +1,26 @@
-//! Hive: the live subagent board.
+//! Workers: the subagents a session has started, while they run and after.
 //!
-//! Shared mutable state the subagent runtime writes and the front ends read:
-//! every worker's name, state, and latest activity, pinned above the composer
-//! while a swarm runs and expandable into a detail overlay. The workers still
-//! running are also named to the model, so it does not start the same work
-//! twice.
+//! The **board** is shared state the subagent runtime writes and the front
+//! ends read: every worker's name, state, and latest activity, pinned above
+//! the composer while they run and expandable into a detail overlay. The
+//! **registry** reaches a worker by name, which is how messages travel: from
+//! the agent that started it, from the other workers, and back to `main`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
-/// Individual worker lines shown when a swarm is at most this large;
-/// bigger swarms cluster into a single summary line.
+/// Individual worker lines shown when at most this many run at once; more
+/// cluster into a single summary line.
 pub const CLUSTER_THRESHOLD: usize = 3;
+
+/// What a subagent calls the agent that started it.
+pub const MAIN: &str = "main";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerState {
@@ -42,7 +46,7 @@ impl WorkerState {
 pub struct WorkerStatus {
     pub id: u64,
     pub name: String,
-    /// The worker's role: `scout`, `drone` or `worker`, or `resumed` for one
+    /// The worker's role: `general` or `explore`, or `resumed` for one
     /// continued by message.
     pub role: String,
     pub state: WorkerState,
@@ -90,13 +94,13 @@ struct BoardInner {
 
 /// Live worker state, written by the subagent runtime and read by the UI.
 #[derive(Clone, Default)]
-pub struct SubagentBoard {
+pub struct WorkerBoard {
     inner: Arc<RwLock<BoardInner>>,
 }
 
-impl SubagentBoard {
+impl WorkerBoard {
     /// Register a worker; a new batch starting while only finished workers
-    /// remain replaces them, so the strip always shows the current swarm.
+    /// remain replaces them, so the strip always shows the current batch.
     pub fn begin(&self, name: &str, role: &str, tokens: Arc<crate::provider::TokenLedger>) -> u64 {
         let mut inner = self.inner.write().expect("board lock");
         if inner.workers.iter().all(|worker| worker.state != WorkerState::Running) {
@@ -395,10 +399,10 @@ impl WorkerLog {
 /// so the window is bounded; older workers fall out oldest-first.
 const RESUMABLE_WORKERS: usize = 8;
 
-/// What the orchestrator can reach when it addresses a worker by name.
+/// What a message to a worker reaches.
 pub enum WorkerChannel {
-    /// The worker is still running — a message steers it mid-flight, exactly
-    /// like the user steering the main turn.
+    /// The worker is running, or waiting for its turn to start: a message
+    /// reaches it after its current step.
     Live(crate::agent::InjectionQueue),
     /// The worker finished. Its conversation is kept so a follow-up can
     /// continue with context intact, in a fresh worktree.
@@ -413,9 +417,9 @@ struct WorkerEntry {
     seq: u64,
 }
 
-/// Named workers the orchestrator can address after spawning them. Lives on
-/// the hive handle so it survives across turns — a worker spawned in one turn
-/// is still reachable from the next.
+/// Workers by name, for the agent that started them and for each other. It
+/// lives on the [`Workers`] handle, so it survives across turns: a worker
+/// started in one turn is still reachable from the next.
 #[derive(Clone, Default)]
 pub struct WorkerRegistry {
     inner: Arc<RwLock<std::collections::BTreeMap<String, WorkerEntry>>>,
@@ -424,8 +428,8 @@ pub struct WorkerRegistry {
 
 impl WorkerRegistry {
     /// Register a starting worker and hand back the queue its turn drains.
-    /// A repeated name replaces the older entry: the live worker is the one
-    /// the orchestrator means.
+    /// A repeated name replaces the older entry: the live worker is the one a
+    /// sender means.
     pub fn open(&self, name: &str) -> crate::agent::InjectionQueue {
         let injections = crate::agent::InjectionQueue::default();
         let mut inner = self.inner.write().expect("worker registry lock");
@@ -478,19 +482,86 @@ impl WorkerRegistry {
         let inner = self.inner.read().expect("worker registry lock");
         inner.iter().map(|(name, entry)| (name.clone(), entry.running)).collect()
     }
+
+    /// Why a message to `name` reaches nobody, with the names it could have
+    /// meant.
+    pub fn unknown(&self, name: &str) -> String {
+        let roster = self.roster();
+        if roster.is_empty() {
+            return format!("no worker named `{name}` — none have been started yet");
+        }
+        let known = roster
+            .iter()
+            .map(|(worker, running)| format!("{worker} ({})", if *running { "running" } else { "finished" }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("no worker named `{name}`. Known workers: {known}")
+    }
+}
+
+/// The two halves of a `send_message` call: who it is for, and what it says.
+pub fn parse_message(arguments: &str) -> Result<(String, String)> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Arguments {
+        to: String,
+        message: String,
+    }
+    let arguments: Arguments = serde_json::from_str(arguments).context("invalid send_message arguments")?;
+    if arguments.message.trim().is_empty() {
+        bail!("message must not be empty");
+    }
+    Ok((arguments.to.trim().to_owned(), arguments.message))
+}
+
+/// How a subagent sends: as itself, to the other workers and to `main`.
+#[derive(Clone)]
+pub struct Mailbox {
+    /// The worker's own name, which its messages are signed with.
+    pub name: String,
+    pub registry: WorkerRegistry,
+    /// The queue of the agent that started it, which `main` reaches.
+    pub parent: crate::agent::InjectionQueue,
+}
+
+impl Mailbox {
+    /// Deliver a `send_message` call: to `main`, or to another worker that is
+    /// still running. Nothing waits for an answer; one arrives as a message.
+    pub fn send(&self, arguments: &str) -> Result<String> {
+        let (to, text) = parse_message(arguments)?;
+        let message = crate::agent::Injection::AgentMessage { from: self.name.clone(), text };
+        if to == MAIN {
+            self.parent.push(message);
+            return Ok(format!(
+                "Delivered to `{MAIN}`, the agent that started you; it reads it after its current step."
+            ));
+        }
+        if to == self.name {
+            bail!("`{to}` is you; message another worker, or `{MAIN}`");
+        }
+        match self.registry.channel(&to) {
+            Some(WorkerChannel::Live(queue)) => {
+                queue.push(message);
+                Ok(format!("Delivered to `{to}`; it reads it after its current step."))
+            }
+            Some(WorkerChannel::Finished(_)) => {
+                bail!("`{to}` has finished, and its report went to `{MAIN}`; message `{MAIN}` instead")
+            }
+            None => bail!("{}", self.registry.unknown(&to)),
+        }
+    }
 }
 
 /// Shared handle on the live board and the worker registry, riding
 /// `TurnOptions`. A front end keeps one for the process, so background workers
 /// stay visible across turns.
 #[derive(Clone, Default)]
-pub struct HiveHandle {
-    pub board: SubagentBoard,
-    /// Named workers the orchestrator can message after spawning them.
-    pub workers: WorkerRegistry,
+pub struct Workers {
+    pub board: WorkerBoard,
+    pub registry: WorkerRegistry,
 }
 
-impl HiveHandle {
+impl Workers {
     /// The workers still running, as a context layer: empty when none are.
     ///
     /// Spawning does not block: the call returns "started in background" and
@@ -530,20 +601,51 @@ mod tests {
     /// already started the work it is about to start again.
     #[test]
     fn the_workers_already_in_flight_are_named() {
-        let hive = HiveHandle::default();
-        assert_eq!(hive.in_flight(), "", "nothing running, nothing to say");
+        let workers = Workers::default();
+        assert_eq!(workers.in_flight(), "", "nothing running, nothing to say");
 
         let tokens = Arc::new(crate::provider::TokenLedger::default());
-        let id = hive.board.begin("recon", "scout", tokens.clone());
-        hive.board.activity(id, "reading src/agent.rs");
-        hive.board.begin("builder", "drone", tokens);
+        let id = workers.board.begin("recon", "explore", tokens.clone());
+        workers.board.activity(id, "reading src/agent.rs");
+        workers.board.begin("builder", "general", tokens);
 
-        let layer = hive.in_flight();
+        let layer = workers.in_flight();
         assert!(layer.contains("ALREADY RUNNING"), "{layer}");
         assert!(layer.contains("recon"), "names them: {layer}");
         assert!(layer.contains("builder"), "{layer}");
-        assert!(layer.contains("scout"), "with their roles");
+        assert!(layer.contains("explore"), "with their roles");
         assert!(layer.contains("Do NOT spawn more workers"), "and says what to do about it: {layer}");
+    }
+
+    #[test]
+    fn a_worker_messages_a_running_peer_and_main_but_not_one_that_finished() {
+        let registry = WorkerRegistry::default();
+        let parent = crate::agent::InjectionQueue::default();
+        let mailbox =
+            |name: &str| Mailbox { name: name.to_owned(), registry: registry.clone(), parent: parent.clone() };
+        let recon = registry.open("recon");
+        registry.open("builder");
+
+        let sent = mailbox("builder").send(r#"{"to":"recon","message":"the schema lives in db/"}"#).unwrap();
+        assert!(sent.starts_with("Delivered to `recon`"), "{sent}");
+        let delivered = recon.drain();
+        assert!(
+            matches!(delivered.as_slice(), [crate::agent::Injection::AgentMessage { from, text }]
+                if from == "builder" && text == "the schema lives in db/"),
+            "signed by its sender: {delivered:?}"
+        );
+
+        mailbox("builder").send(r#"{"to":"main","message":"done with db/"}"#).unwrap();
+        assert!(
+            matches!(parent.drain().as_slice(), [crate::agent::Injection::AgentMessage { from, .. }] if from == "builder")
+        );
+
+        registry.close("recon", Vec::new());
+        let finished = mailbox("builder").send(r#"{"to":"recon","message":"one more"}"#).unwrap_err().to_string();
+        assert!(finished.contains("has finished"), "{finished}");
+        let unknown = mailbox("builder").send(r#"{"to":"ghost","message":"hello"}"#).unwrap_err().to_string();
+        assert!(unknown.contains("recon (finished)") && unknown.contains("builder (running)"), "{unknown}");
+        assert!(mailbox("builder").send(r#"{"to":"builder","message":"hi"}"#).is_err(), "not to itself");
     }
 
     #[test]
@@ -604,8 +706,8 @@ mod tests {
     #[test]
     fn a_workers_transcript_and_counts_follow_its_events() {
         use crate::agent::AgentEvent;
-        let board = SubagentBoard::default();
-        let id = board.begin("recon", "scout", Arc::default());
+        let board = WorkerBoard::default();
+        let id = board.begin("recon", "explore", Arc::default());
         board.describe(id, "kimi-k3", "find the balancing loss");
         board.record(id, &AgentEvent::Reasoning("look at the router".into()));
         board.record(id, &AgentEvent::ToolStarted { name: "grep".into(), summary: "aux_loss in src".into() });
@@ -630,7 +732,7 @@ mod tests {
 
     #[test]
     fn stopped_workers_say_so_and_finished_ones_outlive_their_batch() {
-        let board = SubagentBoard::default();
+        let board = WorkerBoard::default();
         let first = board.begin("alpha", "worker", Arc::default());
         assert!(board.stop(first));
         assert!(board.cancel_flag(first).load(Ordering::Relaxed), "the worker's turn sees the stop");
@@ -660,11 +762,11 @@ mod tests {
 
     #[test]
     fn board_tracks_workers_and_clusters_at_scale() {
-        let board = SubagentBoard::default();
+        let board = WorkerBoard::default();
         assert_eq!(board.strip_rows(), 0);
-        let a = board.begin("alpha", "scout", Arc::new(crate::provider::TokenLedger::default()));
-        let b = board.begin("beta", "drone", Arc::new(crate::provider::TokenLedger::default()));
-        assert_eq!(board.strip_rows(), 2, "small swarms list individually");
+        let a = board.begin("alpha", "explore", Arc::new(crate::provider::TokenLedger::default()));
+        let b = board.begin("beta", "general", Arc::new(crate::provider::TokenLedger::default()));
+        assert_eq!(board.strip_rows(), 2, "a small batch lists individually");
         board.activity(a, "running tests\npass 3 of 9");
         assert_eq!(board.snapshot()[0].activity, "pass 3 of 9");
         board.finish(a, true);

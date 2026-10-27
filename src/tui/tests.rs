@@ -371,7 +371,10 @@ async fn messages_waiting_when_a_session_opens_wait_for_the_person() {
     assert!(app.running.is_some());
     app.mailbox.look_again();
     assert!(app.check_inbox(), "the person's turn takes it");
-    assert!(app.state.injections.take_peer().is_some_and(|message| message.text == "found the bug"));
+    assert!(matches!(
+        app.state.injections.take_starter(),
+        Some(crate::agent::Injection::PeerMessage(message)) if message.text == "found the bug"
+    ));
 }
 
 #[test]

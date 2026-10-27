@@ -37,7 +37,7 @@ struct SpawnArgs {
     apply: bool,
     /// Block the turn until every worker finishes. Off by default: workers run
     /// in the background and report back after a later tool call, so the
-    /// orchestrator keeps working instead of idling.
+    /// agent that started them keeps working instead of idling.
     #[serde(default)]
     wait: bool,
     #[serde(default = "default_concurrency")]
@@ -52,41 +52,44 @@ struct SubagentTask {
     #[serde(default)]
     role: SubagentRole,
     /// An optional model slug for this worker, run on the same endpoint as the
-    /// orchestrator — so one swarm can fan out across several models (e.g. five
-    /// different OpenRouter models). None uses the orchestrator's model.
+    /// agent that started it — so one call can fan out across several models
+    /// (e.g. five different OpenRouter models). None uses that agent's model.
     model: Option<String>,
     /// A JSON Schema this worker's answer must satisfy. When set, the worker's
     /// prose report is coerced into the shape and validated, so the parent gets
     /// data instead of something it has to re-read.
     schema: Option<Value>,
     /// Prior conversation for a resumed worker — never part of the tool call,
-    /// set only by `message_subagent` so the worker continues instead of
-    /// starting over.
+    /// set only by `send_message` so the worker continues instead of starting
+    /// over.
     #[serde(skip)]
     resume_from: Option<Vec<Value>>,
+    /// The other workers it can message: those started in the same call, or
+    /// for a resumed one, those running when it resumed.
+    #[serde(skip)]
+    peers: Vec<String>,
 }
 
 /// What kind of worker a task gets. The role shapes both the worker's system
-/// prompt and its privileges: scouts run read-only (PLAN mode, no mutations),
-/// drones and workers may build.
+/// prompt and its privileges: an explore worker runs read-only, a general one
+/// may change things in its worktree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum SubagentRole {
-    /// Builder: executes a concrete change and verifies it.
-    Drone,
-    /// Researcher: reads, crawls, searches — never modifies.
-    Scout,
-    /// Generic: the full standard toolset.
+    /// The full standard toolset. The names older versions used still parse.
     #[default]
-    Worker,
+    #[serde(alias = "worker", alias = "drone")]
+    General,
+    /// Research: reads, crawls, searches — never modifies.
+    #[serde(alias = "scout")]
+    Explore,
 }
 
 impl SubagentRole {
     fn label(self) -> &'static str {
         match self {
-            Self::Drone => "drone",
-            Self::Scout => "scout",
-            Self::Worker => "worker",
+            Self::General => "general",
+            Self::Explore => "explore",
         }
     }
 
@@ -95,24 +98,17 @@ impl SubagentRole {
     /// with every change refused.
     fn built_in(self) -> (&'static str, bool) {
         match self {
-            Self::Drone => (
-                "You are a DRONE: a builder. Execute exactly the delegated change, run the narrowest checks that \
-                 verify it, and report what you changed and what you ran. Do not investigate beyond what the \
-                 change requires. Do not spawn subagents, commit, push, or modify paths outside the workspace.",
+            Self::General => (
+                "You are a subagent. Complete only the delegated task. You may edit and test this worktree. Do \
+                 not commit, push, or modify paths outside the workspace. Finish with a concise summary and the \
+                 exact checks you ran.",
                 false,
             ),
-            Self::Scout => (
-                "You are a SCOUT: a researcher. Investigate the delegated question — read code, crawl the \
+            Self::Explore => (
+                "You are a read-only subagent. Investigate the delegated question — read code, crawl the \
                  repository, search the web where allowed — and report findings with exact file paths and \
-                 evidence. You must NOT modify anything; your value is the fidelity of what you bring back. Do \
-                 not spawn subagents.",
+                 evidence. You must NOT modify anything; your value is the fidelity of what you bring back.",
                 true,
-            ),
-            Self::Worker => (
-                "You are an isolated subagent. Complete only the delegated task. You may edit and test this \
-                 worktree. Do not spawn more subagents, commit, push, or modify paths outside the workspace. \
-                 Finish with a concise summary and exact checks run.",
-                false,
             ),
         }
     }
@@ -136,14 +132,32 @@ pub struct SubagentRuntime {
     max_steps: usize,
     tool_output_limit: usize,
     web_search: crate::web::WebConfig,
-    hive: crate::hive::HiveHandle,
-    /// Where a background swarm delivers its report when it finishes.
+    workers: crate::workers::Workers,
+    /// Where a background batch delivers its report when it finishes, and
+    /// where its workers' messages to `main` go.
     injections: crate::agent::InjectionQueue,
     /// The session's mode, shared: workers are reviewed in AUTO just as the
     /// session is, and a switch to YOLO reaches them too.
     yolo: Arc<AtomicBool>,
     /// The reviewer AUTO puts a worker's actions to.
     review: Option<crate::config::Target>,
+}
+
+/// What a worker is told about whom it can message.
+fn reach_briefing(name: &str, peers: &[String]) -> String {
+    let main = crate::workers::MAIN;
+    let alongside = match peers {
+        [] => String::new(),
+        peers => {
+            let names: Vec<String> = peers.iter().map(|peer| format!("`{peer}`")).collect();
+            format!(" Working alongside you: {}.", names.join(", "))
+        }
+    };
+    format!(
+        "You are subagent `{name}`.{alongside} send_message reaches the others while they run, and `{main}`, the \
+         agent that started you, at any time: share what another needs, or ask. Nothing waits for an answer; \
+         replies arrive as messages. Your final answer is your report to `{main}`."
+    )
 }
 
 /// The workers of a request as one line: name, role, and model where one was chosen.
@@ -165,7 +179,7 @@ impl SubagentRuntime {
             max_steps: options.max_steps,
             tool_output_limit: options.tool_output_limit,
             web_search: options.web_search.clone(),
-            hive: options.hive.clone(),
+            workers: options.workers.clone(),
             injections: options.injections.clone(),
             yolo: options.yolo.clone(),
             review: options.review.clone().or_else(|| options.aux.clone()),
@@ -177,7 +191,7 @@ impl SubagentRuntime {
             "type":"function",
             "function":{
                 "name":"spawn_subagents",
-                "description":"Delegate tasks to parallel agents in isolated git worktrees. Prefer this when the request splits into two or more genuinely separable units — independent files, modules, fixes, or research questions that need no shared intermediate state — and run them in one call; it is the efficient way to parallelize. Use scout roles to parallelize investigation (repo crawls, research, web searches); a quick single lookup is still faster done directly. Do NOT use it for a single indivisible task or for tightly-coupled sequential edits. Each worker starts from the current workspace state and cannot spawn its own subagents.\n\nWorkers run in the BACKGROUND by default: this returns immediately with the roster, and each swarm's report is delivered to you automatically after a later tool call. Keep working while they run — do not idle, and never invent or predict a pending worker's findings; wait for the delivered report. Pass wait=true only when you genuinely cannot proceed without the results. Set apply=true to apply non-conflicting patches to the parent workspace.",
+                "description":"Delegate tasks to subagents that run in parallel, each in its own git worktree. Prefer this when the request splits into two or more genuinely separable units — independent files, modules, fixes, or research questions that need no shared intermediate state — and start them in one call; it is the efficient way to parallelize. Use the explore role to parallelize investigation (repo crawls, research, web searches); a quick single lookup is still faster done directly. Do NOT use it for a single indivisible task or for tightly-coupled sequential edits. Each worker starts from the current workspace state and cannot start subagents of its own.\n\nWorkers run in the BACKGROUND by default: this returns immediately with the roster, and their report is delivered to you automatically after a later tool call. Keep working while they run — do not idle, and never invent or predict a pending worker's findings; wait for the delivered report. Workers can message each other, and you, with send_message while they run; what they send reaches you after a later tool call. Pass wait=true only when you genuinely cannot proceed without the results. Set apply=true to apply non-conflicting patches to the parent workspace.",
                 "parameters":{
                     "type":"object",
                     "properties":{
@@ -190,8 +204,8 @@ impl SubagentRuntime {
                                 "properties":{
                                     "name":{"type":"string","description":"Short unique worker name"},
                                     "prompt":{"type":"string","description":"Self-contained coding assignment with expected verification"},
-                                    "role":{"type":"string","enum":["drone","scout","worker"],"description":"drone = builder executing a concrete change; scout = read-only research/repo-crawl/web (cannot modify anything); worker = generic (default)"},
-                                    "model":{"type":"string","description":"Optional model slug for this worker on the same endpoint. Omit to use your own (the main) model — that is the default and the right choice unless the user explicitly asked for specific models per worker (e.g. fanning a swarm across several OpenRouter models)."},
+                                    "role":{"type":"string","enum":["general","explore"],"description":"general (default) = edits and runs checks in its worktree; explore = read-only research, repo crawls and web searches (cannot modify anything)"},
+                                    "model":{"type":"string","description":"Optional model slug for this worker on the same endpoint. Omit to use your own (the main) model — that is the default and the right choice unless the user explicitly asked for specific models per worker (e.g. fanning the work across several OpenRouter models)."},
                                     "schema":{"type":"object","description":"Optional JSON Schema for this worker's answer. Set it when you want data you can act on rather than a report you have to re-read — e.g. {\"type\":\"object\",\"required\":[\"verdict\"],\"properties\":{\"verdict\":{\"type\":\"string\",\"enum\":[\"pass\",\"fail\"]}}}. With wait=true and every task carrying a schema, the result is a JSON array instead of prose. A worker whose answer cannot be made to fit is reported as failed."}
                                 },
                                 "required":["name","prompt"],
@@ -209,68 +223,68 @@ impl SubagentRuntime {
         })
     }
 
-    /// The tool for addressing one worker by name after it was spawned.
-    pub fn message_tool_spec() -> Value {
+    /// `send_message`, as the agent that starts workers sees it, or as one of
+    /// those workers does.
+    pub fn message_tool_spec(from_worker: bool) -> Value {
+        let (description, to) = if from_worker {
+            (
+                "Send a message to another agent by name: one of the subagents working alongside you, or `main`, \
+                 the agent that started you. A running subagent reads it after its current step. Use it to share \
+                 something another needs, or to ask; nothing waits for an answer, and replies arrive as messages.",
+                "A subagent's name, or main",
+            )
+        } else {
+            (
+                "Send a message to a subagent you started, by name. If it is still running it reads the message \
+                 after its current step — use this to correct or extend it without stopping it. If it already \
+                 finished, it picks up where it left off with its conversation intact, in a fresh worktree seeded \
+                 from the current workspace; its reply is delivered to you after a later tool call, like any \
+                 background report. Prefer this to starting a new subagent for the same thread of work, because \
+                 it keeps everything it already learned.",
+                "The subagent's name, exactly as given to spawn_subagents",
+            )
+        };
         json!({
             "type":"function",
             "function":{
-                "name":"message_subagent",
-                "description":"Send a message to one worker you spawned, by name. If it is still running the message reaches it mid-task — use this to correct or extend a worker without killing it. If it already finished, it picks up where it left off with its conversation intact, in a fresh worktree seeded from the current workspace; its reply is delivered to you after a later tool call, like any background worker. Prefer this over re-spawning a worker for the same thread of work, because the worker keeps everything it already learned.",
+                "name":"send_message",
+                "description":description,
                 "parameters":{
                     "type":"object",
                     "properties":{
-                        "name":{"type":"string","description":"The worker's name, exactly as given to spawn_subagents"},
-                        "message":{"type":"string","description":"What to tell it — a correction, extra context, or a follow-up task"}
+                        "to":{"type":"string","description":to},
+                        "message":{"type":"string","description":"What to say: a correction, a finding, extra context, or a follow-up task"}
                     },
-                    "required":["name","message"],
+                    "required":["to","message"],
                     "additionalProperties":false
                 }
             }
         })
     }
 
+    /// `send_message` from the agent that started the workers.
     pub async fn message(&self, arguments: &str) -> Result<String> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct MessageArgs {
-            name: String,
-            message: String,
+        let (name, message) = crate::workers::parse_message(arguments)?;
+        if name == crate::workers::MAIN {
+            bail!("`main` is you; message one of your subagents by name");
         }
-        let args: MessageArgs = serde_json::from_str(arguments).context("invalid message_subagent arguments")?;
-        let name = args.name.trim();
-        if args.message.trim().is_empty() {
-            bail!("message must not be empty");
-        }
-        let Some(channel) = self.hive.workers.channel(name) else {
-            let roster = self.hive.workers.roster();
-            if roster.is_empty() {
-                bail!("no worker named `{name}` — none have been spawned yet");
-            }
-            let known = roster
-                .iter()
-                .map(|(worker, running)| format!("{worker} ({})", if *running { "running" } else { "finished" }))
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!("no worker named `{name}`. Known workers: {known}");
-        };
-
-        match channel {
-            // Running: steer it, exactly as the user steers the main turn.
-            crate::hive::WorkerChannel::Live(injections) => {
-                injections.push(crate::agent::Injection::UserMessage(args.message));
+        match self.workers.registry.channel(&name) {
+            Some(crate::workers::WorkerChannel::Live(injections)) => {
+                let from = crate::workers::MAIN.to_owned();
+                injections.push(crate::agent::Injection::AgentMessage { from, text: message });
                 Ok(format!(
-                    "Delivered to `{name}`, which is still running — it picks the message up \
-                     after its current step. Its report will reach you as usual."
+                    "Delivered to `{name}`, which is still running — it picks the message up after its current \
+                     step. Its report will reach you as usual."
                 ))
             }
             // Finished: continue the same thread of work with its context.
-            crate::hive::WorkerChannel::Finished(transcript) if !transcript.is_empty() => {
-                self.resume_worker(name.to_owned(), transcript, args.message).await
+            Some(crate::workers::WorkerChannel::Finished(transcript)) if !transcript.is_empty() => {
+                self.resume_worker(name, transcript, message).await
             }
-            crate::hive::WorkerChannel::Finished(_) => bail!(
-                "`{name}` finished without a usable conversation (it failed early); \
-                 spawn a fresh worker instead"
+            Some(crate::workers::WorkerChannel::Finished(_)) => bail!(
+                "`{name}` finished without a usable conversation (it failed early); start a fresh subagent instead"
             ),
+            None => bail!("{}", self.workers.registry.unknown(&name)),
         }
     }
 
@@ -319,18 +333,23 @@ impl SubagentRuntime {
         let roster = roster(&args.tasks);
         let count = args.tasks.len();
         let runtime = self.clone();
-        let tasks = args.tasks;
+        let mut tasks = args.tasks;
+        // Each worker is told whom else it can reach: the rest of this call.
+        let names: Vec<String> = tasks.iter().map(|task| task.name.clone()).collect();
+        for task in &mut tasks {
+            task.peers = names.iter().filter(|name| **name != task.name).cloned().collect();
+        }
 
         if args.wait {
-            return Ok(runtime.run_swarm(context, tasks, concurrency, apply).await);
+            return Ok(runtime.run_batch(context, tasks, concurrency, apply).await);
         }
-        // Background: hand the swarm to a detached task and return at once.
+        // Background: hand the batch to a detached task and return at once.
         // The report is pushed onto the injection queue, which the running
         // turn drains after its next tool call — the model keeps working in
         // the meantime instead of blocking on workers.
         let injections = self.injections.clone();
         tokio::spawn(async move {
-            let report = runtime.run_swarm(context, tasks, concurrency, apply).await;
+            let report = runtime.run_batch(context, tasks, concurrency, apply).await;
             injections.push(crate::agent::Injection::SubagentReport(report));
         });
         Ok(format!(
@@ -341,23 +360,32 @@ impl SubagentRuntime {
         ))
     }
 
-    /// Run a swarm to completion and format its report. Shared by the blocking
-    /// and background paths so both report alike.
-    async fn run_swarm(
+    /// Run a batch of workers to completion and format its report. Shared by
+    /// the blocking and background paths so both report alike.
+    async fn run_batch(
         &self,
         context: Arc<WorktreeContext>,
         tasks: Vec<SubagentTask>,
         concurrency: usize,
         apply: bool,
     ) -> String {
-        // Decided before the tasks are consumed: a swarm where every worker was
+        // Decided before the tasks are consumed: a batch where every worker was
         // asked for a shape reports as data.
         let all_typed = !tasks.is_empty() && tasks.iter().all(|task| task.schema.is_some());
+        // Every worker is reachable from the start, so a message to one still
+        // waiting for a slot is there when it begins.
+        let queued: Vec<_> = tasks
+            .into_iter()
+            .map(|task| {
+                let injections = self.workers.registry.open(&task.name);
+                (task, injections)
+            })
+            .collect();
         let runtime = self.clone();
-        let mut results = stream::iter(tasks.into_iter().map(|task| {
+        let mut results = stream::iter(queued.into_iter().map(|(task, injections)| {
             let runtime = runtime.clone();
             let context = context.clone();
-            async move { runtime.run_one(context, task).await }
+            async move { runtime.run_one(context, task, injections).await }
         }))
         .buffer_unordered(concurrency)
         .collect::<Vec<_>>()
@@ -388,49 +416,60 @@ impl SubagentRuntime {
         message: String,
     ) -> Result<String> {
         let (worker_provider, worker_tokens) = self.provider.with_detached_counter();
-        let board_id = self.hive.board.begin(name, "resumed", worker_tokens.clone());
-        self.hive.board.describe(board_id, worker_provider.model(), &message);
-        let injections = self.hive.workers.open(name);
+        let board_id = self.workers.board.begin(name, "resumed", worker_tokens.clone());
+        self.workers.board.describe(board_id, worker_provider.model(), &message);
+        let injections = self.workers.registry.open(name);
+        let peers = self
+            .workers
+            .registry
+            .roster()
+            .into_iter()
+            .filter(|(peer, running)| *running && peer != name)
+            .map(|(peer, _)| peer)
+            .collect();
         let task = SubagentTask {
             name: name.to_owned(),
             prompt: message,
-            role: SubagentRole::Worker,
+            role: SubagentRole::General,
             model: None,
             // A follow-up is conversational; the parent asks for a shape by
             // spawning, not by messaging.
             schema: None,
             resume_from: Some(transcript.clone()),
+            peers,
         };
         let outcome = self.run_one_inner(&context, &task, board_id, worker_provider, injections).await;
         self.provider.add_tokens(&worker_tokens);
         match outcome {
             Ok((response, _patch, new_transcript)) => {
-                self.hive.board.finish(board_id, true);
+                self.workers.board.finish(board_id, true);
                 // The continued conversation replaces the old one, so a second
                 // follow-up builds on this round too.
-                self.hive.workers.close(name, new_transcript);
+                self.workers.registry.close(name, new_transcript);
                 Ok(response)
             }
             Err(error) => {
-                self.hive.board.finish(board_id, false);
-                self.hive.workers.close(name, transcript);
+                self.workers.board.finish(board_id, false);
+                self.workers.registry.close(name, transcript);
                 Err(error)
             }
         }
     }
 
-    async fn run_one(&self, context: Arc<WorktreeContext>, task: SubagentTask) -> SubagentResult {
+    async fn run_one(
+        &self,
+        context: Arc<WorktreeContext>,
+        task: SubagentTask,
+        injections: crate::agent::InjectionQueue,
+    ) -> SubagentResult {
         let name = task.name.clone();
         let (mut worker_provider, worker_tokens) = self.provider.with_detached_counter();
         if let Some(model) = task.model.as_deref().filter(|model| !model.trim().is_empty()) {
             worker_provider = worker_provider.with_model(model);
         }
-        let board_id = self.hive.board.begin(&name, task.role.label(), worker_tokens.clone());
-        self.hive.board.describe(board_id, worker_provider.model(), &task.prompt);
-        // Register before starting so a message addressed to this worker mid-run
-        // reaches the turn that is about to begin.
-        let worker_injections = self.hive.workers.open(&name);
-        let outcome = self.run_one_inner(&context, &task, board_id, worker_provider, worker_injections).await;
+        let board_id = self.workers.board.begin(&name, task.role.label(), worker_tokens.clone());
+        self.workers.board.describe(board_id, worker_provider.model(), &task.prompt);
+        let outcome = self.run_one_inner(&context, &task, board_id, worker_provider, injections).await;
         // Fold the worker's usage into the session total — the per-worker
         // counter exists for the board, not to hide cost.
         self.provider.add_tokens(&worker_tokens);
@@ -444,13 +483,13 @@ impl SubagentRuntime {
                     Some(schema) => coerce_to_schema(&self.provider, &response, schema).await.map(Some),
                     None => Ok(None),
                 };
-                self.hive.board.finish(board_id, coerced.is_ok());
-                // Keep the conversation so the orchestrator can follow up with
-                // this worker and have it continue where it left off.
-                self.hive.workers.close(&name, transcript);
+                self.workers.board.finish(board_id, coerced.is_ok());
+                // Keep the conversation so the agent that started it can follow
+                // up with this worker and have it continue where it left off.
+                self.workers.registry.close(&name, transcript);
                 let (structured, error) = match coerced {
-                    // The orchestrator should not read a cut-short answer as a finished one.
-                    _ if self.hive.board.was_stopped(board_id) => {
+                    // A cut-short answer must not read as a finished one.
+                    _ if self.workers.board.was_stopped(board_id) => {
                         (None, Some("stopped by the user before it finished".to_owned()))
                     }
                     Ok(value) => (value, None),
@@ -459,8 +498,8 @@ impl SubagentRuntime {
                 SubagentResult { name, response, patch, structured, error }
             }
             Err(error) => {
-                self.hive.board.finish(board_id, false);
-                self.hive.workers.close(&name, Vec::new());
+                self.workers.board.finish(board_id, false);
+                self.workers.registry.close(&name, Vec::new());
                 SubagentResult { name, error: Some(format!("{error:#}")), ..Default::default() }
             }
         }
@@ -522,7 +561,10 @@ impl SubagentRuntime {
             ),
             _ => (initial_messages(&worker_workspace), role_prompt.to_owned()),
         };
-        messages.push(json!({"role":"system","content":briefing}));
+        // Whom it can reach is said every time it starts: a resumed worker's
+        // company has moved on since its first round.
+        let reach = reach_briefing(&task.name, &task.peers);
+        messages.push(json!({"role":"system","content":format!("{briefing}\n\n{reach}")}));
         messages.push(json!({"role":"user","content":task.prompt}));
         let (events, mut receiver) = mpsc::unbounded_channel();
         let services = Arc::new(self.services.for_workspace(worker_workspace.clone()));
@@ -532,16 +574,22 @@ impl SubagentRuntime {
             TurnOptions {
                 max_steps: self.max_steps,
                 tool_output_limit: self.tool_output_limit,
-                // Scouts are mechanically read-only, not just instructed so:
-                // a lock that nothing in the worker can flip. Everyone else
-                // works under the session's own mode.
+                // An explore worker is mechanically read-only, not just
+                // instructed so: a lock that nothing in the worker can flip.
+                // Everyone else works under the session's own mode.
                 read_only,
                 yolo: self.yolo.clone(),
                 review: self.review.clone(),
                 web_search: self.web_search.clone(),
                 injections,
+                // What it sends is signed with its name.
+                mailbox: Some(crate::workers::Mailbox {
+                    name: task.name.clone(),
+                    registry: self.workers.registry.clone(),
+                    parent: self.injections.clone(),
+                }),
                 // The board's stop button reaches the worker through this.
-                cancel: self.hive.board.cancel_flag(board_id),
+                cancel: self.workers.board.cancel_flag(board_id),
                 // Everything else stays inert. No trace: subagent work is a
                 // different task shape and would blur the samples. No
                 // memories: what a worker records belongs to its delegated
@@ -556,7 +604,7 @@ impl SubagentRuntime {
         // its turn would otherwise only notice after the running tool call,
         // and a long command can take minutes. Dropping the turn kills the
         // command (kill_on_drop) and the worktree is removed below.
-        let stop = self.hive.board.cancel_flag(board_id);
+        let stop = self.workers.board.cancel_flag(board_id);
         let mut check = tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
@@ -588,7 +636,7 @@ impl SubagentRuntime {
 
     /// Mirror a worker's visible activity and transcript onto the live board.
     fn note_activity(&self, board_id: u64, event: &AgentEvent) {
-        self.hive.board.record(board_id, event);
+        self.workers.board.record(board_id, event);
     }
 }
 
@@ -802,6 +850,9 @@ fn parse_args(arguments: &str) -> Result<SpawnArgs> {
         if !names.insert(task.name.to_ascii_lowercase()) {
             bail!("worker names must be unique");
         }
+        if task.name.trim().eq_ignore_ascii_case(crate::workers::MAIN) {
+            bail!("`{}` is what workers call you; give the worker another name", crate::workers::MAIN);
+        }
         if task.prompt.trim().is_empty() || task.prompt.len() > MAX_TASK_CHARS {
             bail!("each worker prompt must contain 1 to {MAX_TASK_CHARS} characters");
         }
@@ -890,7 +941,7 @@ fn final_assistant_text(messages: &[Value]) -> String {
 /// Render results as JSON when every worker was asked for a shape.
 ///
 /// This is the point of a schema: the parent consumes data instead of parsing
-/// prose back out of a markdown report. Mixed swarms fall back to markdown,
+/// prose back out of a markdown report. A mixed batch falls back to markdown,
 /// since half an array is worse than none.
 fn format_results_json(results: &[SubagentResult]) -> String {
     let payload: Vec<Value> = results
@@ -955,12 +1006,11 @@ mod tests {
     }
 
     #[test]
-    fn a_scout_may_only_read_and_the_builders_may_change_things() {
-        let (prompt, read_only) = SubagentRole::Scout.built_in();
-        assert!(read_only, "a scout must have mutations locked off");
-        assert!(prompt.contains("SCOUT"));
-        assert!(!SubagentRole::Drone.built_in().1);
-        assert!(!SubagentRole::Worker.built_in().1);
+    fn an_explore_worker_may_only_read_and_a_general_one_may_change_things() {
+        let (prompt, read_only) = SubagentRole::Explore.built_in();
+        assert!(read_only, "an explore worker must have mutations locked off");
+        assert!(prompt.contains("read-only"));
+        assert!(!SubagentRole::General.built_in().1);
     }
 
     #[test]
@@ -975,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fully_typed_swarm_renders_json_the_parent_can_consume() {
+    fn a_fully_typed_batch_renders_json_the_parent_can_consume() {
         let results = vec![
             result("auditor", Some(json!({"verdict": "pass"})), None),
             result("scanner", Some(json!({"verdict": "fail", "count": 2})), None),
@@ -1009,7 +1059,7 @@ mod tests {
 
     #[test]
     fn a_structured_result_is_still_shown_in_the_markdown_report() {
-        // Background swarms and mixed swarms deliver prose; the data must not
+        // Background and mixed batches deliver prose; the data must not
         // vanish just because the rendering is markdown.
         let rendered = format_results(&[result("auditor", Some(json!({"verdict": "pass"})), None)], false);
         assert!(rendered.contains("```json"), "{rendered}");
@@ -1036,16 +1086,19 @@ mod tests {
     fn per_task_role_and_model_parse_with_main_model_default() {
         let args = parse_args(
             r#"{"tasks":[
-                {"name":"a","prompt":"read","role":"scout"},
-                {"name":"b","prompt":"build","role":"drone","model":"anthropic/claude-sonnet-4.6"}
+                {"name":"a","prompt":"read","role":"explore"},
+                {"name":"b","prompt":"build","role":"general","model":"anthropic/claude-sonnet-4.6"},
+                {"name":"c","prompt":"look","role":"scout"}
             ]}"#,
         )
         .unwrap();
-        // Default: no model → the orchestrator's (main) model is used.
-        assert_eq!(args.tasks[0].role, SubagentRole::Scout);
+        // Default: no model → the main model is used.
+        assert_eq!(args.tasks[0].role, SubagentRole::Explore);
         assert_eq!(args.tasks[0].model, None);
         // Explicit slug is carried per worker.
-        assert_eq!(args.tasks[1].role, SubagentRole::Drone);
+        assert_eq!(args.tasks[1].role, SubagentRole::General);
+        // The names older versions used still parse.
+        assert_eq!(args.tasks[2].role, SubagentRole::Explore);
         assert_eq!(args.tasks[1].model.as_deref(), Some("anthropic/claude-sonnet-4.6"));
     }
 

@@ -188,10 +188,10 @@ struct App {
     usage: Option<UsageReporter>,
     /// Sync problems already told to the front end.
     sync_warned: Arc<std::sync::Mutex<HashSet<String>>>,
-    /// One hive for the process, as the TUI keeps one: background workers
+    /// One set of workers for the process, as the TUI keeps: background workers
     /// outlive the turn that spawned them, and the next turn (and the front
     /// end) must still see them.
-    hive: crate::hive::HiveHandle,
+    workers: crate::workers::Workers,
     /// When idle compaction is due: set by a turn that finished, cleared by
     /// anything that replaces the thread or starts a turn.
     idle_due: Option<tokio::time::Instant>,
@@ -234,7 +234,7 @@ pub async fn run(
     let yolo = Arc::new(AtomicBool::new(config.permission == Permission::Yolo));
     let credentials = Credentials::load(&config.paths).unwrap_or_default();
     let usage = UsageReporter::new(&config.paths, &credentials, "app-server");
-    let hive = crate::hive::HiveHandle::default();
+    let workers = crate::workers::Workers::default();
     let (idle_done, mut idle_rx) = mpsc::unbounded_channel::<IdleDone>();
     let mailbox = crate::inbox::Mailbox::new(config.paths.clone(), crate::presence::FrontEnd::Desktop);
     let mut app = App {
@@ -258,7 +258,7 @@ pub async fn run(
         counter: 0,
         usage,
         sync_warned: Arc::default(),
-        hive,
+        workers,
         idle_due: None,
         idle_compaction: None,
         idle_done,
@@ -266,7 +266,7 @@ pub async fn run(
     };
     app.thread_opened();
     let usage_task = app.usage.as_ref().map(UsageReporter::spawn_periodic);
-    let tasks_task = watch_tasks(app.hive.board.clone());
+    let tasks_task = watch_tasks(app.workers.board.clone());
     if crate::sync::is_configured(&credentials) {
         // Pull what changed on other devices and upload what an earlier exit
         // left behind, without holding up the first request. The open thread
@@ -352,7 +352,7 @@ pub async fn run(
             event = event_rx.recv() => {
                 let Some(event) = event else { continue };
                 app.handle_event(event);
-                app.send_leftover_steer(&events);
+                app.start_pending_turn(&events);
             }
             call = client_call_rx.recv() => {
                 let Some(call) = call else { continue };
@@ -363,9 +363,11 @@ pub async fn run(
                 let Some(done) = done else { continue };
                 app.idle_compacted(done);
             }
+            // Another session can write, and a background subagent can
+            // finish or message `main`, while no turn runs to pick it up.
             _ = inbox_checks.tick() => {
                 app.check_inbox();
-                app.send_leftover_steer(&events);
+                app.start_pending_turn(&events);
             }
         }
     }
@@ -647,22 +649,22 @@ impl App {
                 self.services = Arc::new(without_client.with_client_tools(Some(Arc::new(tools))));
                 Ok(json!({"registered": names}))
             }
-            "tasks/list" => Ok(json!({"tasks": task_summaries(&self.hive.board)})),
+            "tasks/list" => Ok(json!({"tasks": task_summaries(&self.workers.board)})),
             "task/read" => {
                 let id = params["id"].as_u64().ok_or_else(|| anyhow!("task id required"))?;
-                let task = self.hive.board.all().into_iter().find(|worker| worker.id == id);
-                let (Some(task), Some(items)) = (task, self.hive.board.transcript(id)) else {
+                let task = self.workers.board.all().into_iter().find(|worker| worker.id == id);
+                let (Some(task), Some(items)) = (task, self.workers.board.transcript(id)) else {
                     return Err(anyhow!("no task {id}"));
                 };
                 Ok(json!({"task": task_summary(&task), "items": items}))
             }
             "task/stop" => {
                 let id = params["id"].as_u64().ok_or_else(|| anyhow!("task id required"))?;
-                Ok(json!({"stopping": self.hive.board.stop(id)}))
+                Ok(json!({"stopping": self.workers.board.stop(id)}))
             }
             "tasks/clear" => {
-                self.hive.board.clear_finished();
-                Ok(json!({"tasks": task_summaries(&self.hive.board)}))
+                self.workers.board.clear_finished();
+                Ok(json!({"tasks": task_summaries(&self.workers.board)}))
             }
             "files/search" => {
                 let query = params["query"].as_str().unwrap_or_default();
@@ -1369,7 +1371,7 @@ impl App {
             session_id: Some(self.thread_id()),
             trace: self.thread.trace.clone(),
             cancel: self.cancel.clone(),
-            hive: self.hive.clone(),
+            workers: self.workers.clone(),
             peers: match &self.store {
                 Some(_) => crate::peers::Peers::new(
                     self.config.paths.clone(),
@@ -1639,39 +1641,47 @@ impl App {
                 "turnId": turn,
                 "status": status,
                 "name": self.thread.session.title,
-                // A steering message this turn did not reach starts the next
-                // one at once; a client holding messages for later waits.
-                "continues": self.thread.state.injections.has_message(),
+                // A steering message this turn did not reach, a background
+                // report or a message starts the next one at once; a client
+                // holding messages for later waits.
+                "continues": self.thread.state.injections.has_starter(),
             }),
         );
     }
 
-    /// A steering message the turn ended before reaching was meant for now,
-    /// not for whenever the person next types: it starts the next turn, as in
-    /// the terminal.
-    fn send_leftover_steer(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
+    /// What reached an idle thread was meant for now, not for whenever the
+    /// person next types, so it starts a turn, as in the terminal: a steering
+    /// message the last turn ended before reaching, a background subagent's
+    /// report, a message one sent to `main`, or one from another session.
+    fn start_pending_turn(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
+        use crate::agent::Injection;
         if self.turn_id.is_some() {
             return;
         }
-        let (text, content) = match self.thread.state.injections.take_message() {
-            Some(crate::agent::Injection::UserMessage(text)) => (text.clone(), Value::String(text)),
-            Some(crate::agent::Injection::UserContent { text, content }) => (text, content),
-            _ => {
-                // Another session wrote while nothing was running: its message
-                // is the next turn.
-                if let Some(message) = self.thread.state.injections.take_peer() {
-                    let item = peer_item(&message.from.title, message.from.session, &message.text);
-                    self.begin_turn(Value::String(message.prompt(&self.config.workspace)), item, events);
-                }
+        let (content, steer) = match self.thread.state.injections.take_starter() {
+            Some(Injection::UserMessage(text)) => (Value::String(text.clone()), Some(text)),
+            Some(Injection::UserContent { text, content }) => (content, Some(text)),
+            Some(Injection::SubagentReport(report)) => (Value::String(crate::agent::report_prompt(&report)), None),
+            Some(Injection::AgentMessage { from, text }) => {
+                (Value::String(crate::agent::agent_message(&from, &text)), None)
+            }
+            // Another session wrote while nothing was running: its message is
+            // the next turn, shown with who sent it.
+            Some(Injection::PeerMessage(message)) => {
+                let item = peer_item(&message.from.title, message.from.session, &message.text);
+                self.begin_turn(Value::String(message.prompt(&self.config.workspace)), item, events);
                 return;
             }
+            Some(Injection::SideNote(_)) | None => return,
         };
         let item = user_item(&content);
         self.begin_turn(content, item, events);
-        self.steer_delivered(&text);
+        if let Some(text) = steer {
+            self.steer_delivered(&text);
+        }
     }
 
-    /// Hand what other sessions sent to the agent, as `send_leftover_steer`
+    /// Hand what other sessions sent to the agent, as `start_pending_turn`
     /// and the running turn take it.
     fn check_inbox(&mut self) {
         match self.mailbox.collect(self.turn_id.is_none()) {
@@ -1963,7 +1973,7 @@ fn parse_numstat(line: &str) -> Option<Value> {
 }
 
 /// A background worker as a client lists it.
-fn task_summary(worker: &crate::hive::WorkerStatus) -> Value {
+fn task_summary(worker: &crate::workers::WorkerStatus) -> Value {
     json!({
         "id": worker.id,
         "name": worker.name,
@@ -1980,14 +1990,14 @@ fn task_summary(worker: &crate::hive::WorkerStatus) -> Value {
     })
 }
 
-fn task_summaries(board: &crate::hive::SubagentBoard) -> Vec<Value> {
+fn task_summaries(board: &crate::workers::WorkerBoard) -> Vec<Value> {
     board.all().iter().map(task_summary).collect()
 }
 
 /// Tell the front end when background workers change: state, activity, and
 /// (while any run) their token counts. Twice a second at most, and silent
 /// while nothing moves.
-fn watch_tasks(board: crate::hive::SubagentBoard) -> tokio::task::JoinHandle<()> {
+fn watch_tasks(board: crate::workers::WorkerBoard) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last = (board.version(), 0_u64);
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -1996,8 +2006,8 @@ fn watch_tasks(board: crate::hive::SubagentBoard) -> tokio::task::JoinHandle<()>
             let workers = board.all();
             let running_tokens = workers
                 .iter()
-                .filter(|worker| worker.state == crate::hive::WorkerState::Running)
-                .map(crate::hive::WorkerStatus::tokens_used)
+                .filter(|worker| worker.state == crate::workers::WorkerState::Running)
+                .map(crate::workers::WorkerStatus::tokens_used)
                 .sum::<u64>();
             let now = (board.version(), running_tokens);
             if now != last {

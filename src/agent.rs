@@ -141,6 +141,9 @@ pub enum Injection {
     UserContent { text: String, content: Value },
     /// A background subagent finished and its report is ready.
     SubagentReport(String),
+    /// A message from another agent: from a subagent, or, in a subagent's own
+    /// turn, from `main`, the agent that started it.
+    AgentMessage { from: String, text: String },
     /// A side note from the user — something they care about, delivered after
     /// the current tool call finishes. Explicitly *not* a new instruction: it
     /// tells the model what matters without derailing what it is doing.
@@ -153,6 +156,12 @@ impl Injection {
     /// Whether this is the person steering, as opposed to a note or a report.
     fn is_message(&self) -> bool {
         matches!(self, Self::UserMessage(_) | Self::UserContent { .. })
+    }
+
+    /// Whether, left over when a turn ends, this starts the next one. A side
+    /// note nudges a running turn and has nothing to nudge without one.
+    fn starts_turn(&self) -> bool {
+        !matches!(self, Self::SideNote(_))
     }
 
     /// The person's words, for a steering message.
@@ -189,19 +198,11 @@ impl InjectionQueue {
         self.0.lock().map(|mut queue| std::mem::take(&mut *queue)).unwrap_or_default()
     }
 
-    /// Take the oldest message from another session, leaving the rest queued.
-    pub fn take_peer(&self) -> Option<crate::inbox::Message> {
-        let mut queue = self.0.lock().ok()?;
-        let index = queue.iter().position(|injection| matches!(injection, Injection::PeerMessage(_)))?;
-        match queue.remove(index) {
-            Injection::PeerMessage(message) => Some(message),
-            _ => None,
-        }
-    }
-
-    /// Whether a steering message from the person is waiting.
-    pub fn has_message(&self) -> bool {
-        self.0.lock().is_ok_and(|queue| queue.iter().any(Injection::is_message))
+    /// Whether something waiting starts a turn of its own once the current
+    /// one ends: the person steering, a background report, or a message from
+    /// a subagent or another session.
+    pub fn has_starter(&self) -> bool {
+        self.0.lock().is_ok_and(|queue| queue.iter().any(Injection::starts_turn))
     }
 
     /// Take back a steering message the model has not read yet: the oldest
@@ -212,11 +213,13 @@ impl InjectionQueue {
         index.map(|index| queue.remove(index)).is_some()
     }
 
-    /// Take the oldest steering message from the person, leaving everything
-    /// else queued in order.
-    pub fn take_message(&self) -> Option<Injection> {
+    /// Take what the next turn starts with: the person's oldest steering
+    /// message, or else the oldest report or message. Side notes stay queued,
+    /// in order.
+    pub fn take_starter(&self) -> Option<Injection> {
         let mut queue = self.0.lock().ok()?;
-        let index = queue.iter().position(Injection::is_message)?;
+        let index =
+            queue.iter().position(Injection::is_message).or_else(|| queue.iter().position(Injection::starts_turn))?;
         Some(queue.remove(index))
     }
 
@@ -242,8 +245,9 @@ pub struct TurnOptions {
     /// YOLO when set, AUTO otherwise. Shared with the front end, so a switch
     /// made while a turn runs applies from its next tool call.
     pub yolo: Arc<AtomicBool>,
-    /// Refuse anything that changes something, whatever the mode — a scout
-    /// subagent, which is read-only mechanically rather than by instruction.
+    /// Refuse anything that changes something, whatever the mode — an
+    /// explore subagent, which is read-only mechanically rather than by
+    /// instruction.
     pub read_only: bool,
     pub services: Arc<AgentServices>,
     pub session_id: Option<String>,
@@ -259,7 +263,10 @@ pub struct TurnOptions {
     /// layer and kept with `memory_record` and `memory_forget`.
     pub memories: crate::memories::MemoryStore,
     /// The live subagent board, and the workers the model can message.
-    pub hive: crate::hive::HiveHandle,
+    pub workers: crate::workers::Workers,
+    /// Set on a subagent's own turn: who it is, and whom its `send_message`
+    /// reaches. The main agent messages through its subagent runtime instead.
+    pub mailbox: Option<crate::workers::Mailbox>,
     /// Model for secondary calls (page extraction, draft recommendations), on
     /// any provider. None reuses the main model. See
     /// [`crate::roles`] — this is the `aux` role.
@@ -313,7 +320,8 @@ impl TurnOptions {
             web_search: Default::default(),
             handles: Default::default(),
             memories: Default::default(),
-            hive: Default::default(),
+            workers: Default::default(),
+            mailbox: None,
             aux: None,
             review: None,
             subagent: None,
@@ -357,7 +365,9 @@ impl TurnOptions {
     }
 }
 
-/// The tools a turn over `options` offers the model.
+/// The tools a turn over `options` offers the model. The agent that starts
+/// subagents can message them; a subagent can message the others and `main`,
+/// but starts none of its own.
 fn turn_tool_specs(options: &TurnOptions) -> Vec<Value> {
     let mut specs = options.services.tool_specs();
     specs.extend(GoalState::tool_specs());
@@ -369,7 +379,9 @@ fn turn_tool_specs(options: &TurnOptions) -> Vec<Value> {
     }
     if options.allow_subagents {
         specs.push(SubagentRuntime::tool_spec());
-        specs.push(SubagentRuntime::message_tool_spec());
+        specs.push(SubagentRuntime::message_tool_spec(false));
+    } else if options.mailbox.is_some() {
+        specs.push(SubagentRuntime::message_tool_spec(true));
     }
     if options.peers.is_available() {
         specs.extend(crate::peers::Peers::tool_specs());
@@ -736,7 +748,11 @@ async fn run_tool(
     let reply = crate::tools::reply;
     let mut output = if name == "spawn_subagents" && options.allow_subagents {
         reply(subagents.execute(arguments).await)
-    } else if name == "message_subagent" && options.allow_subagents {
+    } else if name == "send_message"
+        && let Some(mailbox) = &options.mailbox
+    {
+        reply(mailbox.send(arguments))
+    } else if name == "send_message" && options.allow_subagents {
         reply(subagents.message(arguments).await)
     } else if name == "handle_recurse" {
         // Apart from the other handle tools because it makes model calls: the
@@ -1128,7 +1144,7 @@ async fn request_user_question(
 fn tool_requires_approval(call: &ToolCall, services: &AgentServices) -> bool {
     match call.name.as_str() {
         "goal_status" | "goal_update" | "task_list" | "task_create" | "task_update" | "memory_record"
-        | "memory_forget" | "message_subagent" | "ask_user" | "session_list" | "session_read" => false,
+        | "memory_forget" | "send_message" | "ask_user" | "session_list" | "session_read" => false,
         // Another session's agent acts on what it is sent, so a message is
         // judged like any action with effects beyond this conversation.
         "spawn_subagents" | "session_message" => true,
@@ -1270,7 +1286,7 @@ fn context_layers(options: &TurnOptions) -> Vec<(&'static str, String)> {
         ("extensions", options.services.prompt_context()),
         ("summary", options.compaction.prompt_context()),
         ("memory", options.memories.prompt_context()),
-        ("delegation", if options.allow_subagents { options.hive.in_flight() } else { String::new() }),
+        ("delegation", if options.allow_subagents { options.workers.in_flight() } else { String::new() }),
         ("goal", options.goal.prompt_context()),
         ("tasks", options.tasks.prompt_context()),
         ("permissions", permission_prompt(options).to_owned()),
@@ -1402,6 +1418,11 @@ fn deliver_injections(options: &TurnOptions, messages: &mut Vec<Value>, events: 
                      doing; if it changes the plan, say so."
                 ))
             }
+            Injection::AgentMessage { from, text } => {
+                let summary = crate::text::clip(&crate::text::squeeze(text), 160, "…");
+                let _ = events.send(AgentEvent::Notice(format!("message from {from} — {summary}")));
+                Value::String(agent_message(from, text))
+            }
             Injection::PeerMessage(message) => {
                 let _ = events.send(AgentEvent::PeerMessage(message.clone()));
                 Value::String(message.prompt(&options.workspace))
@@ -1409,6 +1430,22 @@ fn deliver_injections(options: &TurnOptions, messages: &mut Vec<Value>, events: 
         };
         messages.push(json!({"role": "user", "content": content}));
     }
+}
+
+/// How a message from another agent reads to the one receiving it.
+pub fn agent_message(from: &str, text: &str) -> String {
+    let sender = if from == crate::workers::MAIN {
+        "the agent that started you".to_owned()
+    } else {
+        format!("subagent `{from}`")
+    };
+    format!("[message from {sender}] {text}\n\nReply with send_message if it needs an answer.")
+}
+
+/// A background report that arrived after its turn ended, as the prompt of
+/// the turn that delivers it.
+pub fn report_prompt(report: &str) -> String {
+    format!("[background subagent finished] {report}\n\nFold this into the work; if it changes the plan, say so.")
 }
 
 /// Whether a saved tool result is a refusal: the call did not run because a
@@ -1459,19 +1496,21 @@ mod tests {
     }
 
     #[test]
-    fn the_oldest_steering_message_is_taken_and_the_rest_keep_their_order() {
+    fn the_next_turn_starts_with_the_person_then_the_oldest_report_and_never_a_note() {
         let queue = InjectionQueue::default();
         queue.push(Injection::SideNote("note".into()));
-        queue.push(Injection::UserMessage("first".into()));
         queue.push(Injection::SubagentReport("report".into()));
+        queue.push(Injection::UserMessage("first".into()));
+        queue.push(Injection::AgentMessage { from: "recon".into(), text: "found it".into() });
         queue.push(Injection::UserMessage("second".into()));
-        assert!(queue.has_message());
-        assert!(matches!(queue.take_message(), Some(Injection::UserMessage(text)) if text == "first"));
-        assert!(matches!(queue.take_message(), Some(Injection::UserMessage(text)) if text == "second"));
-        assert!(!queue.has_message());
-        assert!(queue.take_message().is_none());
-        let rest = queue.drain();
-        assert!(matches!(rest.as_slice(), [Injection::SideNote(_), Injection::SubagentReport(_)]), "{rest:?}");
+        assert!(queue.has_starter());
+        assert!(matches!(queue.take_starter(), Some(Injection::UserMessage(text)) if text == "first"));
+        assert!(matches!(queue.take_starter(), Some(Injection::UserMessage(text)) if text == "second"));
+        assert!(matches!(queue.take_starter(), Some(Injection::SubagentReport(_))));
+        assert!(matches!(queue.take_starter(), Some(Injection::AgentMessage { .. })));
+        assert!(!queue.has_starter(), "a side note starts nothing");
+        assert!(queue.take_starter().is_none());
+        assert!(matches!(queue.drain().as_slice(), [Injection::SideNote(_)]));
     }
 
     #[test]
@@ -1520,7 +1559,7 @@ mod tests {
         let queue = InjectionQueue::default();
         assert!(queue.is_empty());
         queue.push(Injection::UserMessage("actually, do X".into()));
-        queue.push(Injection::SubagentReport("scout found Y".into()));
+        queue.push(Injection::SubagentReport("recon found Y".into()));
         assert!(!queue.is_empty());
 
         let drained = queue.drain();
@@ -1810,6 +1849,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_subagent_can_message_the_others_but_start_none() {
+        let here = std::path::PathBuf::from(".");
+        let names = |options: &TurnOptions| -> Vec<String> {
+            turn_tool_specs(options)
+                .iter()
+                .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_owned))
+                .collect()
+        };
+        let main = TurnOptions {
+            allow_subagents: true,
+            ..TurnOptions::bare(here.clone(), Arc::new(AgentServices::empty(here.clone())))
+        };
+        let main = names(&main);
+        assert!(main.iter().any(|name| name == "spawn_subagents") && main.iter().any(|name| name == "send_message"));
+
+        let mailbox = crate::workers::Mailbox {
+            name: "recon".into(),
+            registry: Default::default(),
+            parent: InjectionQueue::default(),
+        };
+        let worker = TurnOptions {
+            mailbox: Some(mailbox),
+            ..TurnOptions::bare(here.clone(), Arc::new(AgentServices::empty(here)))
+        };
+        let worker = names(&worker);
+        assert!(worker.iter().any(|name| name == "send_message"), "{worker:?}");
+        assert!(!worker.iter().any(|name| name == "spawn_subagents"), "{worker:?}");
+    }
+
     /// Everything that changes something needs permission, so AUTO's review
     /// and a read-only worker's lock both see it.
     #[test]
@@ -1839,7 +1908,11 @@ mod tests {
         options.yolo.store(true, Ordering::Relaxed);
         assert_eq!(options.permission_label(), "YOLO");
         let read_only = TurnOptions { read_only: true, ..test_turn_options(InjectionQueue::default()) };
-        assert_eq!(read_only.permission_label(), "READ-ONLY", "a scout is read-only even when the session is YOLO");
+        assert_eq!(
+            read_only.permission_label(),
+            "READ-ONLY",
+            "an explore subagent is read-only even when the session is YOLO"
+        );
     }
 
     /// A handle tool's own result must never be re-bound: binding a slice of
