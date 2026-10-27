@@ -1065,9 +1065,15 @@ impl App {
                 .map(|provider| provider.display_name(provider_id.as_deref().unwrap_or_default()).to_owned())
                 .unwrap_or_default(),
             ConfigKey::ProviderUrl => provider.map(|provider| provider.base_url.clone()).unwrap_or_default(),
-            ConfigKey::ProviderProtocol => {
-                provider.map(|provider| format!("{:?}", provider.protocol)).unwrap_or_default()
-            }
+            // The words `abacus setup` offers them by.
+            ConfigKey::ProviderProtocol => provider
+                .map(|provider| match provider.protocol {
+                    ProviderProtocol::ChatCompletions => "chat completions",
+                    ProviderProtocol::Responses => "responses",
+                    ProviderProtocol::Anthropic => "anthropic",
+                })
+                .unwrap_or_default()
+                .to_owned(),
             // Where the credential comes from, never the credential.
             ConfigKey::ApiKey => match (provider, &provider_id) {
                 (Some(provider), Some(id)) => provider.key_status(id, &self.credentials).label(),
