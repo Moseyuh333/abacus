@@ -199,6 +199,9 @@ struct App {
     idle_compaction: Option<Arc<AtomicBool>>,
     /// Where idle compaction reports back to the serving loop.
     idle_done: mpsc::UnboundedSender<IdleDone>,
+    /// The open thread's presence and inbox: other sessions see it as open,
+    /// and their messages reach it here.
+    mailbox: crate::inbox::Mailbox,
 }
 
 /// Idle compaction finished, written from `basis`. `job` is the flag it could
@@ -233,6 +236,7 @@ pub async fn run(
     let usage = UsageReporter::new(&config.paths, &credentials, "app-server");
     let hive = crate::hive::HiveHandle::load(config.paths.hive_file.clone());
     let (idle_done, mut idle_rx) = mpsc::unbounded_channel::<IdleDone>();
+    let mailbox = crate::inbox::Mailbox::new(config.paths.clone(), crate::presence::FrontEnd::Desktop);
     let mut app = App {
         thread: ThreadState::new(&config, session),
         config,
@@ -258,6 +262,7 @@ pub async fn run(
         idle_due: None,
         idle_compaction: None,
         idle_done,
+        mailbox,
     };
     app.thread_opened();
     let usage_task = app.usage.as_ref().map(UsageReporter::spawn_periodic);
@@ -290,6 +295,8 @@ pub async fn run(
     let (client_calls, mut client_call_rx) = mpsc::unbounded_channel::<crate::client_tools::ClientCall>();
     app.client_calls = Some(client_calls);
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+    let mut inbox_checks = tokio::time::interval(std::time::Duration::from_secs(1));
+    inbox_checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // stdin on its own task: a blocking read must never stall event delivery,
     // or an approval could not be answered while the agent waits on it.
@@ -355,6 +362,10 @@ pub async fn run(
             done = idle_rx.recv() => {
                 let Some(done) = done else { continue };
                 app.idle_compacted(done);
+            }
+            _ = inbox_checks.tick() => {
+                app.check_inbox();
+                app.send_leftover_steer(&events);
             }
         }
     }
@@ -465,6 +476,11 @@ impl App {
                     // person comes back (`thread/compacted`); the
                     // `idle_compaction` config key turns it off.
                     "idleCompaction": true,
+                    // thread/fork, and `forkedFrom` on thread/list.
+                    "fork": true,
+                    // Sessions message each other: `live` on thread/list, and
+                    // a `from` on the userMessage items they send.
+                    "sessionMessages": true,
                 },
                 "idleCompaction": self.config.idle_compaction,
                 "thread": self.thread_snapshot(),
@@ -474,6 +490,7 @@ impl App {
             // ---- threads ----------------------------------------------------
             "thread/list" => {
                 let store = self.store.as_ref().ok_or_else(|| anyhow!("sessions off"))?;
+                let live = crate::presence::live_sessions(&self.config.paths);
                 let threads: Vec<Value> = store
                     .list()?
                     .into_iter()
@@ -484,6 +501,8 @@ impl App {
                             "model": summary.model,
                             "itemCount": summary.message_count,
                             "updatedAt": summary.updated_at.to_rfc3339(),
+                            "forkedFrom": summary.forked_from.map(|id| id.to_string()),
+                            "live": live.get(&summary.id).map(crate::presence::Live::to_json),
                         })
                     })
                     .collect();
@@ -511,6 +530,35 @@ impl App {
                 self.thread_opened();
                 Ok(self.thread_snapshot())
             }
+            // Continue a thread as a new one that remembers where it came
+            // from: the open thread, or the one `threadId` names. The window
+            // switches to the fork; the original is left as it was.
+            "thread/fork" => {
+                self.require_idle()?;
+                let store = self.store.as_ref().ok_or_else(|| anyhow!("sessions off"))?;
+                let original = match params["threadId"].as_str() {
+                    Some(id) if id != self.thread_id() => store.load(id)?,
+                    _ if !self.thread.persisted => return Err(anyhow!("nothing to fork yet — send a message first")),
+                    _ => {
+                        self.persist();
+                        self.thread.session.clone()
+                    }
+                };
+                let store = self.store.as_ref().ok_or_else(|| anyhow!("sessions off"))?;
+                let fork = store.fork(
+                    &original,
+                    self.config.profile.clone(),
+                    self.config.model_ref(),
+                    original.messages.clone(),
+                )?;
+                self.stop_idle_compaction();
+                self.thread_closed();
+                self.tokens.store_total(0);
+                self.thread = ThreadState::new(&self.config, Some(fork));
+                self.thread_opened();
+                notify("thread/started", json!({"threadId": self.thread_id(), "forkedFrom": original.id.to_string()}));
+                Ok(self.thread_snapshot())
+            }
             "thread/name/set" => {
                 let name = params["name"].as_str().unwrap_or_default();
                 let store = self.store.as_ref().ok_or_else(|| anyhow!("sessions off"))?;
@@ -525,6 +573,9 @@ impl App {
                 if !self.config.is_configured() {
                     return Err(anyhow!("connect a provider and choose a model first"));
                 }
+                // The person is here: messages from other sessions may start
+                // turns again.
+                self.mailbox.attended();
                 let TurnInput { text, images, files } = turn_input(&params, &self.config.workspace)?;
                 let typed = text.clone();
                 // A slash command means what it means in the TUI: a skill or
@@ -1289,6 +1340,13 @@ impl App {
     fn begin_turn(&mut self, content: Value, mut item: Value, events: &mpsc::UnboundedSender<AgentEvent>) {
         self.stop_idle_compaction();
         self.thread.messages.push(json!({"role": "user", "content": content}));
+        // A new thread is saved as its first turn starts, as the terminal
+        // saves a session: other sessions can find it and message it while
+        // that turn runs, and what it sends them says who it is from.
+        if !self.thread.persisted {
+            self.persist();
+        }
+        self.mailbox.set_working(true);
         let turn = self.next("turn");
         self.turn_id = Some(turn.clone());
         self.cancel = Arc::new(AtomicBool::new(false));
@@ -1312,6 +1370,14 @@ impl App {
             trace: self.thread.trace.clone(),
             cancel: self.cancel.clone(),
             hive: self.hive.clone(),
+            peers: match &self.store {
+                Some(_) => crate::peers::Peers::new(
+                    self.config.paths.clone(),
+                    self.config.workspace.clone(),
+                    Some(self.thread.session.id),
+                ),
+                None => Default::default(),
+            },
             ..self.thread.state.turn(&self.config, self.services.clone()).with_workspace_stores(&self.config)
         }
     }
@@ -1458,6 +1524,14 @@ impl App {
                 }
                 None => notify("warning", json!({"message": text})),
             },
+            // Another session's message reached the model mid-turn: it joins
+            // the transcript where it landed, like steering.
+            AgentEvent::PeerMessage(message) => {
+                self.flush_streaming();
+                let mut item = peer_item(&message.from.title, message.from.session, &message.text);
+                item["id"] = json!(self.next("item"));
+                self.item("completed", item);
+            }
             AgentEvent::TraceFailed { error } => {
                 notify("warning", json!({"message": format!("training trace off — {error}")}))
             }
@@ -1546,6 +1620,7 @@ impl App {
             self.item("completed", open.tool(&name, "aborted"));
         }
         let turn = self.turn_id.take().unwrap_or_default();
+        self.mailbox.set_working(false);
         // The provider has the conversation cached now; a failed turn may
         // never have reached it.
         if status != "failed" {
@@ -1581,11 +1656,35 @@ impl App {
         let (text, content) = match self.thread.state.injections.take_message() {
             Some(crate::agent::Injection::UserMessage(text)) => (text.clone(), Value::String(text)),
             Some(crate::agent::Injection::UserContent { text, content }) => (text, content),
-            _ => return,
+            _ => {
+                // Another session wrote while nothing was running: its message
+                // is the next turn.
+                if let Some(message) = self.thread.state.injections.take_peer() {
+                    let item = peer_item(&message.from.title, message.from.session, &message.text);
+                    self.begin_turn(Value::String(message.prompt(&self.config.workspace)), item, events);
+                }
+                return;
+            }
         };
         let item = user_item(&content);
         self.begin_turn(content, item, events);
         self.steer_delivered(&text);
+    }
+
+    /// Hand what other sessions sent to the agent, as `send_leftover_steer`
+    /// and the running turn take it.
+    fn check_inbox(&mut self) {
+        match self.mailbox.collect(self.turn_id.is_none()) {
+            crate::inbox::Collected::Nothing => {}
+            crate::inbox::Collected::Messages(messages) => {
+                for message in messages {
+                    self.thread.state.injections.push(crate::agent::Injection::PeerMessage(message));
+                }
+            }
+            crate::inbox::Collected::Held(count) => {
+                notify("warning", json!({"message": crate::inbox::held_notice(count)}))
+            }
+        }
     }
 
     /// Tell the client a steering message reached the model, by the text
@@ -1698,7 +1797,15 @@ impl App {
             return;
         }
         self.thread.persisted = true;
+        self.follow_thread();
         self.sync_after_turn();
+    }
+
+    /// Point the presence record and the inbox at the open thread, once it is
+    /// saved: other sessions can only find a thread that is.
+    fn follow_thread(&mut self) {
+        let id = self.thread.persisted.then_some(self.thread.session.id);
+        self.mailbox.open(id, &self.config.workspace);
     }
 
     /// Upload the thread in the background. A conflict or a sign-in that no
@@ -1740,7 +1847,8 @@ impl App {
 
     /// Record the thread as open: sync must not write over it, and its
     /// tokens are reported as a run of their own.
-    fn thread_opened(&self) {
+    fn thread_opened(&mut self) {
+        self.follow_thread();
         crate::sync::session_opened(self.thread.session.id);
         if let Some(usage) = &self.usage {
             usage.open_session(&self.thread_id(), &self.config.model, self.tokens.clone());
@@ -2014,6 +2122,16 @@ fn user_item(content: &Value) -> Value {
     item
 }
 
+/// Another session's message as a transcript item: a `userMessage`, which is
+/// what a client that predates them shows, saying who it is from.
+fn peer_item(title: &str, session: Option<uuid::Uuid>, text: &str) -> Value {
+    json!({
+        "type": "userMessage",
+        "text": text,
+        "from": {"title": title, "session": session.map(|id| id.to_string())},
+    })
+}
+
 /// The token ledger as a client sees it. `cacheRate` is omitted rather than
 /// zeroed when the endpoint reports no cache figures, so a client can tell "no
 /// hits" from "no information".
@@ -2056,7 +2174,11 @@ fn history_items(messages: &[Value]) -> Vec<Value> {
             // The system prompt is scaffolding, not conversation.
             "system" => continue,
             "user" => {
-                let mut item = user_item(&message["content"]);
+                let shown = crate::inbox::shown(&crate::text::content_text(&message["content"]));
+                let mut item = match shown {
+                    Some((title, text)) => peer_item(&title, None, &text),
+                    None => user_item(&message["content"]),
+                };
                 let empty = item["text"].as_str().is_none_or(|text| text.trim().is_empty())
                     && item.get("images").is_none()
                     && item.get("files").is_none();
@@ -2234,6 +2356,29 @@ mod tests {
         ]);
         let types: Vec<&str> = items.iter().map(|item| item["type"].as_str().unwrap()).collect();
         assert_eq!(types, ["userMessage", "agentMessage", "commandExecution"]);
+    }
+
+    /// A resumed thread shows another session's message as it arrived, not as
+    /// the prompt the model was given.
+    #[test]
+    fn history_shows_who_sent_a_message_from_another_session() {
+        let message = crate::inbox::Message {
+            id: uuid::Uuid::new_v4(),
+            from: crate::inbox::Sender {
+                session: Some(uuid::Uuid::new_v4()),
+                title: "Fork A".into(),
+                workspace: "/work/api".into(),
+            },
+            text: "tests pass here".into(),
+            sent_at: chrono::Utc::now(),
+        };
+        let items = history_items(&[
+            json!({"role": "user", "content": message.prompt(std::path::Path::new("/work/api"))}),
+            json!({"role": "user", "content": "thanks"}),
+        ]);
+        assert_eq!(items[0]["text"], "tests pass here");
+        assert_eq!(items[0]["from"]["title"], "Fork A");
+        assert!(items[1].get("from").is_none());
     }
 
     #[test]

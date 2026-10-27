@@ -122,6 +122,10 @@ pub struct Session {
     /// Time spent with this session open, accumulated across resumes.
     #[serde(default)]
     pub active_secs: u64,
+    /// The session this one was forked from, so forks can be found and shown
+    /// under it. None for one started fresh, and for forks made before 0.7.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<Uuid>,
 }
 
 impl Session {
@@ -145,6 +149,7 @@ impl Session {
             harness: None,
             tokens_used: 0,
             active_secs: 0,
+            forked_from: None,
         }
     }
 
@@ -181,6 +186,8 @@ struct SessionHeader {
     tokens_used: u64,
     #[serde(default)]
     active_secs: u64,
+    #[serde(default)]
+    forked_from: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +197,7 @@ pub struct SessionSummary {
     pub model: String,
     pub updated_at: DateTime<Utc>,
     pub message_count: usize,
+    pub forked_from: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +228,24 @@ impl SessionStore {
         let session = Session::new(self.workspace.clone(), profile, model, messages);
         self.save(&session)?;
         Ok(session)
+    }
+
+    /// Save a fork of `original` holding `messages`, and return it. A fork is
+    /// a branch of the work, so what shapes the work — goal, loop, tasks, the
+    /// rolling summary, the intent — carries over; time and token accounting
+    /// start fresh. It remembers where it came from, so it can be found from
+    /// there and shown under it.
+    pub fn fork(&self, original: &Session, profile: String, model: String, messages: Vec<Value>) -> Result<Session> {
+        let mut fork = Session::new(self.workspace.clone(), profile, model, messages);
+        fork.title = format!("(fork) {}", original.title).chars().take(100).collect();
+        fork.goal = original.goal.clone();
+        fork.ralph_loop = original.ralph_loop.clone();
+        fork.tasks = original.tasks.clone();
+        fork.compaction = original.compaction.clone();
+        fork.intent = original.intent.clone();
+        fork.forked_from = Some(original.id);
+        self.save(&fork)?;
+        Ok(fork)
     }
 
     pub fn save(&self, session: &Session) -> Result<()> {
@@ -364,6 +390,7 @@ fn summaries(headers: Vec<(SessionHeader, u64)>) -> Vec<SessionSummary> {
             model: header.model,
             updated_at: header.updated_at,
             message_count: header.messages.len().saturating_sub(1),
+            forked_from: header.forked_from,
         })
         .collect::<Vec<_>>();
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
@@ -565,6 +592,30 @@ mod tests {
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].tokens_used, 12_345);
         assert!(!usage[0].tokens_estimated);
+    }
+
+    /// A fork carries the work over and remembers where it came from, so
+    /// listings can find it from there and front ends can nest it.
+    #[test]
+    fn a_fork_remembers_its_origin() {
+        let dir = tempdir().unwrap();
+        let paths = AbacusPaths::under(dir.path().join("home"));
+        let store = SessionStore::new(&paths, dir.path().join("project"));
+        let mut original = store.create("p".into(), "m".into(), vec![json!({"role":"system","content":"x"})]).unwrap();
+        original.title = "Fix the parser".into();
+        original.intent = Some("parser keeps its API".into());
+        store.save(&original).unwrap();
+
+        let fork = store.fork(&original, "p".into(), "m".into(), original.messages.clone()).unwrap();
+        assert_eq!(fork.title, "(fork) Fix the parser");
+        assert_eq!(fork.intent.as_deref(), Some("parser keeps its API"));
+        let listed = store.list().unwrap();
+        let forked = listed.iter().find(|summary| summary.id == fork.id).unwrap();
+        assert_eq!(forked.forked_from, Some(original.id));
+        assert_eq!(listed.iter().find(|summary| summary.id == original.id).unwrap().forked_from, None);
+        // A session saved before forks were linked reads as unlinked.
+        let saved = fs::read_to_string(store.path(original.id)).unwrap();
+        assert!(!saved.contains("forked_from"), "an unlinked session writes no field");
     }
 
     #[test]

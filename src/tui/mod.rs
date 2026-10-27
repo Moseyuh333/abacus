@@ -526,6 +526,9 @@ struct App {
     quiet_since: Option<Instant>,
     /// Raised to stop the idle compaction in flight, if there is one.
     idle_compaction: Option<Arc<AtomicBool>>,
+    /// The open session's presence and inbox: other sessions see it as open,
+    /// and their messages reach it here.
+    mailbox: crate::inbox::Mailbox,
     last_board_version: u64,
     reload_services: bool,
     services_reloading: bool,
@@ -923,6 +926,7 @@ async fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut
         app.maybe_idle_sync();
         app.maybe_idle_compact();
         // A worker that finished after its turn ended delivers here.
+        dirty |= app.check_inbox();
         dirty |= app.deliver_pending_injections();
         // A running turn animates (spinner, shimmer, elapsed) even while the
         // stream is silent — e.g. during a long tool call — so redraw on every
@@ -1136,10 +1140,14 @@ fn entries_from_messages(messages: &[Value]) -> Vec<Entry> {
             continue;
         }
         match role {
-            "user" => entries.push(Entry::new(
-                EntryKind::User,
-                content.split("\n\n<attached_file path=\"").next().unwrap_or(content).to_owned(),
-            )),
+            "user" => entries.push(match crate::inbox::shown(content) {
+                // Another session's message, shown as it was when it arrived.
+                Some((title, text)) => Entry::new(EntryKind::System, format!("Message from \"{title}\": {text}")),
+                None => Entry::new(
+                    EntryKind::User,
+                    content.split("\n\n<attached_file path=\"").next().unwrap_or(content).to_owned(),
+                ),
+            }),
             "assistant" => entries.push(Entry::new(EntryKind::Assistant, content.to_owned())),
             // A restored session has no timings — the durations were never
             // persisted — but the outcome is still readable from the output, so
@@ -1263,6 +1271,7 @@ impl App {
                 format!("Continue your last session? Press F12 or /resume {resume_id}."),
             ));
         }
+        let mailbox = crate::inbox::Mailbox::new(config.paths.clone(), crate::presence::FrontEnd::Tui);
         Ok(Self {
             config,
             settings,
@@ -1313,6 +1322,7 @@ impl App {
             last_auto_push: None,
             quiet_since: None,
             idle_compaction: None,
+            mailbox,
             last_board_version: 0,
             reload_services: false,
             services_reloading: false,
@@ -1595,6 +1605,7 @@ impl App {
                 AgentEvent::Notice(notice) => {
                     self.say(notice);
                 }
+                AgentEvent::PeerMessage(message) => self.show_peer_message(&message),
                 AgentEvent::Reasoning(piece) => {
                     self.turn_output_chars = self.turn_output_chars.saturating_add(piece.len());
                     // The status header follows the reasoning even when the
@@ -1775,6 +1786,7 @@ impl App {
     /// half-finished reply to recover, and nothing of it is still in flight.
     fn close_turn(&mut self) {
         crate::recovery::clear();
+        self.mailbox.set_working(false);
         self.running = None;
         self.turn_started = None;
         self.tool_started = None;
@@ -1884,6 +1896,8 @@ impl App {
         if prompt.is_empty() {
             return;
         }
+        // The person is here: messages from other sessions may start turns again.
+        self.mailbox.attended();
         if self.running.is_some() {
             if prompt.starts_with('/') {
                 let prompt = self.input.take();
@@ -2030,6 +2044,7 @@ impl App {
         }
         self.sync_idle_since = None;
         self.cancel_idle_compaction();
+        self.mailbox.set_working(true);
         self.receiving_delta = false;
         self.follow = true;
         self.status = "connecting".to_owned();
@@ -2056,8 +2071,52 @@ impl App {
             session_id: self.session.as_ref().map(|session| session.id.to_string()),
             papercuts: self.papercuts.clone(),
             hive: self.hive.clone(),
+            peers: self.peers(),
             ..self.state.turn(&self.config, self.services.clone())
         }
+    }
+
+    /// The session tools, when sessions are kept at all.
+    fn peers(&self) -> crate::peers::Peers {
+        if self.session_store.is_none() {
+            return Default::default();
+        }
+        crate::peers::Peers::new(
+            self.config.paths.clone(),
+            self.config.workspace.clone(),
+            self.session.as_ref().map(|session| session.id),
+        )
+    }
+
+    /// Point the presence record and the inbox at the session open now.
+    fn follow_session(&mut self) {
+        let id =
+            self.session.as_ref().filter(|session| !crate::sync::is_placeholder(session)).map(|session| session.id);
+        self.mailbox.open(id, &self.config.workspace);
+    }
+
+    /// Hand what other sessions sent to the agent: steering for a running
+    /// turn, or a turn of its own (see `deliver_pending_injections`).
+    fn check_inbox(&mut self) -> bool {
+        match self.mailbox.collect(self.running.is_none()) {
+            crate::inbox::Collected::Nothing => false,
+            crate::inbox::Collected::Messages(messages) => {
+                for message in messages {
+                    self.state.injections.push(crate::agent::Injection::PeerMessage(message));
+                }
+                true
+            }
+            crate::inbox::Collected::Held(count) => {
+                self.say(crate::inbox::held_notice(count));
+                true
+            }
+        }
+    }
+
+    /// A message from another session, as the transcript shows it — the same
+    /// line `entries_from_messages` rebuilds it as.
+    fn show_peer_message(&mut self, message: &crate::inbox::Message) {
+        self.say(format!("Message {}: {}", message.origin(), message.text));
     }
 
     /// Summarise a long session nobody has typed in since its last turn,
@@ -2171,6 +2230,7 @@ impl App {
         }
         // The first persist is where a new session gets its id.
         self.track_usage_run();
+        self.follow_session();
     }
 
     /// Point the usage reporter at the current session: a new run whenever
@@ -2256,6 +2316,7 @@ impl App {
         self.session = session; // `None` is recreated lazily on the first send
         self.scroll = 0;
         self.track_usage_run();
+        self.follow_session();
         self.rebind_remote();
     }
 
@@ -2289,27 +2350,13 @@ impl App {
                 self.status = "nothing to fork yet — send a message first".to_owned();
                 return;
             };
-            let mut fork =
-                match store.create(self.config.profile.clone(), self.config.model_ref(), self.messages.clone()) {
-                    Ok(fork) => fork,
-                    Err(error) => {
-                        self.status = format!("fork failed: {error}");
-                        return;
-                    }
-                };
-            fork.title = format!("(fork) {}", current.title).chars().take(100).collect();
-            // A fork is a branch of the work, so the session state that shapes
-            // it carries over; time and token accounting start fresh.
-            fork.goal = current.goal.clone();
-            fork.ralph_loop = current.ralph_loop.clone();
-            fork.tasks = current.tasks.clone();
-            fork.compaction = current.compaction.clone();
-            fork.intent = current.intent.clone();
-            if let Err(error) = store.save(&fork) {
-                self.status = format!("fork failed: {error}");
-                return;
+            match store.fork(current, self.config.profile.clone(), self.config.model_ref(), self.messages.clone()) {
+                Ok(fork) => fork,
+                Err(error) => {
+                    self.status = format!("fork failed: {error}");
+                    return;
+                }
             }
-            fork
         };
         // The fork is the session open here now; the original goes back to sync.
         if let Some(original) = &self.session {
@@ -2324,6 +2371,7 @@ impl App {
         self.session_initial_active_secs = 0;
         self.started = Instant::now();
         self.track_usage_run();
+        self.follow_session();
         self.rebind_remote();
         self.say(
             "Session forked — the conversation continues in a new session; the \
@@ -2939,6 +2987,12 @@ impl App {
                         "[background subagent finished] {report}\n\nFold this into the work; if \
                          it changes the plan, say so."
                     ));
+                }
+                // Another session wrote while nothing was running: its message
+                // is the turn, sent as written rather than as a typed prompt.
+                Injection::PeerMessage(message) => {
+                    self.show_peer_message(&message);
+                    self.start_turn(String::new(), message.prompt(&self.config.workspace), false);
                 }
             }
         }

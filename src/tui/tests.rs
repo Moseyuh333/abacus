@@ -295,6 +295,7 @@ fn ctrl_shift_enter_forks_the_session_keeping_the_draft() {
     assert_ne!(fork.id, original_id, "a fork is a new session");
     assert!(fork.title.starts_with("(fork)"), "the fork is marked: {}", fork.title);
     assert!(fork.title.ends_with("fix the parser"), "the fork keeps the title: {}", fork.title);
+    assert_eq!(fork.forked_from, Some(original_id), "the fork remembers where it came from");
     assert_eq!(app.input.text(), "then write the tests", "the draft stays in the composer");
     assert!(
         app.messages.iter().any(|message| message["content"] == "fix the parser"),
@@ -309,6 +310,68 @@ fn ctrl_shift_enter_forks_the_session_keeping_the_draft() {
     let original = store.load(&original_id.to_string()).unwrap();
     assert_eq!(original.id, original_id);
     assert_eq!(original.title, "fix the parser");
+}
+
+/// Another session's message reaches an idle session as a turn of its own,
+/// shown as a message from that session rather than as the person's prompt.
+#[tokio::test]
+async fn a_message_from_another_session_starts_a_turn_when_idle() {
+    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
+    app.session_store = Some(SessionStore::new(&app.config.paths, app.config.workspace.clone()));
+    app.messages.push(json!({"role": "user", "content": "fix the parser"}));
+    app.persist_session();
+    let id = app.session.as_ref().unwrap().id;
+    let from = crate::inbox::Sender {
+        session: Some(uuid::Uuid::new_v4()),
+        title: "Fork A".into(),
+        workspace: app.config.workspace.clone(),
+    };
+    crate::inbox::send(&app.config.paths, id, from, "the tests pass on my branch").unwrap();
+
+    assert!(app.check_inbox());
+    assert!(app.deliver_pending_injections());
+
+    assert!(app.running.is_some(), "the message started a turn");
+    let shown = app.entries.iter().find(|entry| entry.text.contains("Message from \"Fork A\"")).expect("shown");
+    assert_eq!(shown.kind, EntryKind::System);
+    assert!(
+        !app.entries.iter().any(|entry| entry.kind == EntryKind::User && entry.text.contains("tests pass")),
+        "not shown as the person's prompt"
+    );
+    let prompt = app.messages.last().unwrap()["content"].as_str().unwrap();
+    assert!(prompt.contains("not from the user") && prompt.contains("the tests pass on my branch"), "{prompt}");
+    // A transcript rebuilt from the saved history shows it the same way.
+    assert!(entries_from_messages(&app.messages).iter().any(|entry| {
+        entry.kind == EntryKind::System && entry.text == "Message from \"Fork A\": the tests pass on my branch"
+    }));
+}
+
+/// Messages that were waiting when a session is opened do not start a turn
+/// on their own: the person opening it is in charge, and they ride along
+/// with what the person sends.
+#[tokio::test]
+async fn messages_waiting_when_a_session_opens_wait_for_the_person() {
+    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
+    let store = SessionStore::new(&app.config.paths, app.config.workspace.clone());
+    let mut session = store.create("test".into(), "test/test-model".into(), Vec::new()).unwrap();
+    session.update_messages(vec![json!({"role": "user", "content": "fix the parser"})]);
+    store.save(&session).unwrap();
+    let from = crate::inbox::Sender { session: None, title: "Fork A".into(), workspace: app.config.workspace.clone() };
+    crate::inbox::send(&app.config.paths, session.id, from, "found the bug").unwrap();
+    app.session_store = Some(store);
+    app.adopt(Some(session));
+
+    assert!(app.check_inbox());
+    assert!(!app.deliver_pending_injections(), "nothing starts on its own");
+    assert!(app.running.is_none());
+    assert!(app.entries.last().unwrap().text.starts_with("A message from another session is waiting"));
+
+    app.input.insert_str("carry on");
+    app.submit();
+    assert!(app.running.is_some());
+    app.mailbox.look_again();
+    assert!(app.check_inbox(), "the person's turn takes it");
+    assert!(app.state.injections.take_peer().is_some_and(|message| message.text == "found the bug"));
 }
 
 #[test]

@@ -453,7 +453,8 @@ fn print_sessions(paths: &AbacusPaths, workspace: PathBuf, all: bool, json: bool
         if sessions.is_empty() { Vec::new() } else { vec![WorkspaceSessions { workspace, sessions }] }
     };
     if json {
-        println!("{}", serde_json::to_string(&sessions_json(&workspaces))?);
+        let live = abacus_agent::presence::live_sessions(paths);
+        println!("{}", serde_json::to_string(&sessions_json(&workspaces, &live))?);
         return Ok(());
     }
     if workspaces.is_empty() {
@@ -478,7 +479,12 @@ fn print_sessions(paths: &AbacusPaths, workspace: PathBuf, all: bool, json: bool
     Ok(())
 }
 
-fn sessions_json(workspaces: &[WorkspaceSessions]) -> serde_json::Value {
+/// `live` says which sessions are open somewhere right now; a front end shows
+/// them as working or open, and nests forks under `forkedFrom`.
+fn sessions_json(
+    workspaces: &[WorkspaceSessions],
+    live: &std::collections::HashMap<uuid::Uuid, abacus_agent::presence::Live>,
+) -> serde_json::Value {
     let workspaces: Vec<_> = workspaces
         .iter()
         .map(|entry| {
@@ -492,6 +498,8 @@ fn sessions_json(workspaces: &[WorkspaceSessions]) -> serde_json::Value {
                         "model": session.model,
                         "updatedAt": session.updated_at.to_rfc3339(),
                         "messageCount": session.message_count,
+                        "forkedFrom": session.forked_from.map(|id| id.to_string()),
+                        "live": live.get(&session.id).map(abacus_agent::presence::Live::to_json),
                     })
                 })
                 .collect();

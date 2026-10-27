@@ -109,6 +109,9 @@ pub enum AgentEvent {
     /// Something the user should know that is not a failure — e.g. the reply
     /// hit the output-token ceiling and was cut short.
     Notice(String),
+    /// A message from another session reached the model, mid-turn or as the
+    /// turn's opening prompt. The front end shows it with who sent it.
+    PeerMessage(crate::inbox::Message),
     Failed {
         error: String,
         messages: Vec<Value>,
@@ -142,6 +145,8 @@ pub enum Injection {
     /// the current tool call finishes. Explicitly *not* a new instruction: it
     /// tells the model what matters without derailing what it is doing.
     SideNote(String),
+    /// Another session's agent wrote to this one (see [`crate::peers`]).
+    PeerMessage(crate::inbox::Message),
 }
 
 impl Injection {
@@ -182,6 +187,16 @@ impl InjectionQueue {
     /// Take everything pending, leaving the queue empty.
     pub fn drain(&self) -> Vec<Injection> {
         self.0.lock().map(|mut queue| std::mem::take(&mut *queue)).unwrap_or_default()
+    }
+
+    /// Take the oldest message from another session, leaving the rest queued.
+    pub fn take_peer(&self) -> Option<crate::inbox::Message> {
+        let mut queue = self.0.lock().ok()?;
+        let index = queue.iter().position(|injection| matches!(injection, Injection::PeerMessage(_)))?;
+        match queue.remove(index) {
+            Injection::PeerMessage(message) => Some(message),
+            _ => None,
+        }
     }
 
     /// Whether a steering message from the person is waiting.
@@ -269,9 +284,12 @@ pub struct TurnOptions {
     /// session, so it is the last thing to move onto something cheap. The role
     /// exists so that stays a decision rather than a hardcode.
     pub summariser: Option<Target>,
-    /// Mid-turn arrivals — user steering and finished background workers —
-    /// drained between tool calls.
+    /// Mid-turn arrivals — user steering, finished background workers, and
+    /// messages from other sessions — drained between tool calls.
     pub injections: InjectionQueue,
+    /// Other sessions: listing, reading and messaging them. Unavailable when
+    /// the conversation is not saved, and for subagents.
+    pub peers: crate::peers::Peers,
     /// Session-wide memo of safety verdicts, so a repeated command is judged
     /// once rather than once per turn.
     pub safety: crate::safety::SafetyCache,
@@ -312,6 +330,7 @@ impl TurnOptions {
             subagent: None,
             summariser: None,
             injections: Default::default(),
+            peers: Default::default(),
             safety: Default::default(),
             trace: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -372,6 +391,9 @@ fn turn_tool_specs(options: &TurnOptions) -> Vec<Value> {
     if options.allow_subagents {
         specs.push(SubagentRuntime::tool_spec());
         specs.push(SubagentRuntime::message_tool_spec());
+    }
+    if options.peers.is_available() {
+        specs.extend(crate::peers::Peers::tool_specs());
     }
     specs
 }
@@ -877,6 +899,7 @@ async fn run_tool(
         .or_else(|| options.papercuts.execute(name, arguments))
         .or_else(|| options.harness.execute(name, arguments))
         .or_else(|| options.handles.execute(name, arguments))
+        .or_else(|| options.peers.execute(name, arguments))
     {
         output
     } else if let Some(output) = options.services.execute(call).await {
@@ -1256,8 +1279,12 @@ async fn request_user_question(
 fn tool_requires_approval(call: &ToolCall, services: &AgentServices) -> bool {
     match call.name.as_str() {
         "goal_status" | "goal_update" | "task_list" | "task_create" | "task_update" | "papercut_record"
-        | "memory_record" | "memory_forget" | "message_subagent" | "ask_user" => false,
-        "spawn_subagents" => true,
+        | "memory_record" | "memory_forget" | "message_subagent" | "ask_user" | "session_list" | "session_read" => {
+            false
+        }
+        // Another session's agent acts on what it is sent, so a message is
+        // judged like any action with effects beyond this conversation.
+        "spawn_subagents" | "session_message" => true,
         _ => services.needs_approval(call),
     }
 }
@@ -1293,6 +1320,9 @@ pub fn tool_reads_only(name: &str) -> bool {
             | "handle_slice"
             | "handle_grep"
             | "handle_recurse"
+            // Other sessions' records, read from disk.
+            | "session_list"
+            | "session_read"
     )
 }
 
@@ -1587,6 +1617,10 @@ fn deliver_injections(options: &TurnOptions, messages: &mut Vec<Value>, events: 
                      doing; if it changes the plan, say so."
                 ))
             }
+            Injection::PeerMessage(message) => {
+                let _ = events.send(AgentEvent::PeerMessage(message.clone()));
+                Value::String(message.prompt(&options.workspace))
+            }
         };
         messages.push(json!({"role": "user", "content": content}));
     }
@@ -1751,6 +1785,61 @@ mod tests {
         }
         assert_eq!(notices.len(), 2);
         assert!(notices[0].starts_with("steering —"), "{}", notices[0]);
+    }
+
+    /// Another session's message reaches the model labelled as such, and the
+    /// front end hears who sent it.
+    #[test]
+    fn a_message_from_another_session_arrives_signed() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let queue = InjectionQueue::default();
+        let message = crate::inbox::Message {
+            id: uuid::Uuid::new_v4(),
+            from: crate::inbox::Sender {
+                session: Some(uuid::Uuid::new_v4()),
+                title: "Fork A".into(),
+                workspace: std::path::PathBuf::from("/tmp"),
+            },
+            text: "the fix is on my branch".into(),
+            sent_at: chrono::Utc::now(),
+        };
+        queue.push(Injection::PeerMessage(message.clone()));
+        let options = test_turn_options(queue);
+        let mut messages = vec![json!({"role":"user","content":"ship it"})];
+
+        deliver_injections(&options, &mut messages, &events);
+
+        let delivered = messages[1]["content"].as_str().unwrap();
+        assert!(delivered.contains("not from the user"), "{delivered}");
+        assert!(delivered.contains("the fix is on my branch"));
+        assert!(matches!(receiver.try_recv(), Ok(AgentEvent::PeerMessage(arrived)) if arrived == message));
+    }
+
+    #[test]
+    fn the_session_tools_are_offered_only_with_sessions() {
+        let without = test_turn_options(InjectionQueue::default());
+        let names = |options: &TurnOptions| -> Vec<String> {
+            turn_tool_specs(options)
+                .iter()
+                .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_owned))
+                .collect()
+        };
+        assert!(!names(&without).iter().any(|name| name.starts_with("session_")));
+        let directory = tempfile::tempdir().unwrap();
+        let with = TurnOptions {
+            peers: crate::peers::Peers::new(
+                crate::config::AbacusPaths::under(directory.path().to_path_buf()),
+                directory.path().to_path_buf(),
+                None,
+            ),
+            ..test_turn_options(InjectionQueue::default())
+        };
+        let offered = names(&with);
+        for tool in ["session_list", "session_read", "session_message"] {
+            assert!(offered.iter().any(|name| name == tool), "{tool} missing");
+        }
+        // Reading other sessions needs no review; messaging one does.
+        assert!(tool_reads_only("session_read") && !tool_reads_only("session_message"));
     }
 
     #[test]

@@ -195,6 +195,7 @@ pub async fn run(
             // Headless output is the answer, not the deliberation.
             AgentEvent::Reasoning(_) => {}
             AgentEvent::Notice(notice) => eprintln!("note: {notice}"),
+            AgentEvent::PeerMessage(message) => eprintln!("message {}: {}", message.origin(), message.text),
             AgentEvent::TraceFailed { error } => {
                 eprintln!("warning: training trace disabled — {error}");
             }
@@ -349,10 +350,18 @@ fn turn_options(
 ) -> TurnOptions {
     // AUTO unless `--yolo`: what the reviewer clears runs, the rest is
     // refused, and nothing waits on a person who is not there.
+    // A run with a session can list, read and message the others. Nothing
+    // reads its own inbox: a one-shot run is not there to answer, so messages
+    // to it wait for the terminal or the desktop to open the session.
+    let peers = match (config.no_session, session_id.as_deref().and_then(|id| id.parse().ok())) {
+        (false, Some(id)) => crate::peers::Peers::new(config.paths.clone(), config.workspace.clone(), Some(id)),
+        _ => Default::default(),
+    };
     TurnOptions {
         trace,
         yolo: yolo.clone(),
         session_id,
+        peers,
         ..state.turn(config, services.clone()).with_workspace_stores(config)
     }
 }

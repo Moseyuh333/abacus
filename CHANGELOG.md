@@ -84,6 +84,24 @@ run.
   capability, the `thread/compacted` notification and the `idle_compaction`
   config key.
 
+- **Sessions can find and message each other.** A fork remembers the session
+  it came from. Every open session (in a terminal, the desktop or a headless
+  run) keeps a small record in `~/.abacus/live/`, so Abacus knows which are
+  open and which are working. The agent has three new tools. `session_list`
+  lists this project's sessions with this one's forks and origin first, and
+  says which are open or working. `session_read` reads a session's recent
+  conversation without tool output. `session_message` writes to another
+  session's agent. A message reaches a working session at its next step and
+  starts a turn in an idle one. A closed session gets it when it is next
+  opened, and the message then waits for what you send first. In AUTO the
+  reviewer checks each message before it goes. Other projects' sessions are
+  reached only when you ask. If messages start six turns in a row without you,
+  the next ones wait for you, so two agents cannot keep each other going
+  unattended. The transcript shows each message with its sender.
+  `abacus sessions --json` and `thread/list` add `forkedFrom` and `live`. The
+  app server adds `thread/fork` and the `fork` and `sessionMessages`
+  capabilities.
+
 - **Fewer commands and tools.** The terminal's commands are now `/profile`,
   `/providers`, `/mode`, `/effort`, `/config`, `/goal`, `/loop`, `/btw`, `/new`,
   `/fork`, `/resume`, `/rename`, `/compact`, `/repair`, `/memory`, `/tools`,

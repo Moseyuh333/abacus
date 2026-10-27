@@ -381,6 +381,9 @@ impl Bridge {
             AgentEvent::ToolStarted { name, summary } => self.tool_started(name, summary, entry),
             AgentEvent::ToolFinished { name, output, refused } => self.tool_finished(name, output, *refused, entry),
             AgentEvent::Notice(text) => self.notice(text, Level::Info),
+            AgentEvent::PeerMessage(message) => {
+                self.notice(&format!("Message {}: {}", message.origin(), message.text), Level::Info)
+            }
             AgentEvent::TraceFailed { error } => {
                 self.notice(&format!("Trace capture stopped: {error}"), Level::Warning)
             }
