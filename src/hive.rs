@@ -386,11 +386,11 @@ impl WorkerLog {
                     "status": "inProgress",
                 }));
             }
-            AgentEvent::ToolFinished { name, output } => {
+            AgentEvent::ToolFinished { name, output, refused } => {
                 if let Some(item) =
                     self.items.iter_mut().rev().find(|item| item["name"] == *name && item["status"] == "inProgress")
                 {
-                    item["status"] = json!("completed");
+                    item["status"] = json!(if *refused { "declined" } else { "completed" });
                     item["output"] = json!(crate::text::clip(output, LOG_TOOL_OUTPUT, "\n…"));
                 }
             }
@@ -832,7 +832,10 @@ mod tests {
         board.record(id, &AgentEvent::Reasoning("look at the router".into()));
         board.record(id, &AgentEvent::ToolStarted { name: "grep".into(), summary: "aux_loss in src".into() });
         assert_eq!(board.all()[0].tool.as_deref(), Some("grep"), "the tool it is in");
-        board.record(id, &AgentEvent::ToolFinished { name: "grep".into(), output: "src/moe.rs:12".into() });
+        board.record(
+            id,
+            &AgentEvent::ToolFinished { name: "grep".into(), output: "src/moe.rs:12".into(), refused: false },
+        );
         board.record(id, &AgentEvent::Delta("Found it ".into()));
         board.record(id, &AgentEvent::Delta("in src/moe.rs.".into()));
 

@@ -1310,9 +1310,10 @@ impl App {
                     None => drop(self.open_tool(&name, &summary, "inProgress")),
                 }
             }
-            AgentEvent::ToolFinished { name, output } => {
+            AgentEvent::ToolFinished { name, output, refused } => {
                 if let Some(open) = self.open_items.remove(&name) {
-                    let mut item = open.tool(&name, "completed");
+                    // A call that was stopped or declined must not read as run.
+                    let mut item = open.tool(&name, if refused { "declined" } else { "completed" });
                     item["output"] = json!(output);
                     self.item("completed", item);
                 }
@@ -1905,11 +1906,12 @@ fn history_items(messages: &[Value]) -> Vec<Value> {
             }
             "tool" => {
                 let name = message["name"].as_str().unwrap_or("tool");
+                let status = if crate::agent::tool_result_refused(content) { "declined" } else { "completed" };
                 let mut item = json!({
                     "id": id,
                     "type": item_type(name),
                     "name": name,
-                    "status": "completed",
+                    "status": status,
                     "output": content,
                 });
                 if let Some(summary) = message["tool_call_id"].as_str().and_then(|call| summaries.get(call)) {
@@ -2062,6 +2064,17 @@ mod tests {
         ]);
         let types: Vec<&str> = items.iter().map(|item| item["type"].as_str().unwrap()).collect();
         assert_eq!(types, ["userMessage", "agentMessage", "commandExecution"]);
+    }
+
+    #[test]
+    fn history_does_not_show_a_refused_call_as_run() {
+        let items = history_items(&[
+            json!({"role": "tool", "name": "run_command", "content": "Blocked by AUTO mode: nobody asked. It was not run."}),
+            json!({"role": "tool", "name": "run_command", "content": "User rejected this tool call. Do not retry it."}),
+            json!({"role": "tool", "name": "run_command", "content": "removed build/"}),
+        ]);
+        let statuses: Vec<&str> = items.iter().map(|item| item["status"].as_str().unwrap()).collect();
+        assert_eq!(statuses, ["declined", "declined", "completed"]);
     }
 
     #[test]

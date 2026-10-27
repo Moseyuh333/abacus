@@ -76,7 +76,7 @@ fn a_turn_maps_to_the_documented_frame_sequence() {
         Some(2),
     );
     bridge.on_event(
-        &AgentEvent::ToolFinished { name: "run_command".into(), output: "ok: 3 passed".into() },
+        &AgentEvent::ToolFinished { name: "run_command".into(), output: "ok: 3 passed".into(), refused: false },
         &usage(),
         Some(2),
     );
@@ -505,7 +505,11 @@ fn a_resync_replays_decisions_as_the_rows_live_viewers_saw() {
         &usage(),
         Some(3),
     );
-    bridge.on_event(&AgentEvent::ToolFinished { name: "write_file".into(), output: "ok".into() }, &usage(), Some(3));
+    bridge.on_event(
+        &AgentEvent::ToolFinished { name: "write_file".into(), output: "ok".into(), refused: false },
+        &usage(),
+        Some(3),
+    );
     let question = bridge.question_opened("Pick", "Which?", &["1 — Rewrite".into(), "2 — Patch".into()], false);
     bridge.question_resolved(&question, &["2".into()], None, By::Terminal, 4);
     bridge.on_event(&AgentEvent::Delta("Done.".into()), &usage(), Some(4));

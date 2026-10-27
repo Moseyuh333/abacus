@@ -173,7 +173,7 @@ async fn text_emitted_tool_calls_are_parsed_when_native_calls_absent() {
                 assert!(summary.contains("target.txt"));
                 saw_read = true;
             }
-            AgentEvent::ToolFinished { name, output } => {
+            AgentEvent::ToolFinished { name, output, .. } => {
                 assert_eq!(name, "read_file");
                 assert!(output.contains("hello"), "tool output should contain file content");
                 saw_result = true;
@@ -206,7 +206,7 @@ async fn auto_review_blocks_an_action_the_user_did_not_ask_for() {
         project.asks("explain what this repository does"),
         TurnOptions { yolo: auto(), ..project.options() },
         |event| match event {
-            AgentEvent::ToolFinished { name, output: text } if name == "run_command" => output = text,
+            AgentEvent::ToolFinished { name, output: text, .. } if name == "run_command" => output = text,
             AgentEvent::Approval(_) => panic!("a decided review must not ask the person"),
             _ => {}
         },

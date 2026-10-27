@@ -64,7 +64,10 @@ run.
   reports `needsSetup` when there is no provider yet. `config/value/write` takes
   `profile`, the modes are `auto` and `yolo`, and approvals offer `accept`,
   `decline` and `cancel`. An approval's `reason` says why the person is asked,
-  and its new `details` field carries the operation itself.
+  and its new `details` field carries the operation itself. A call that did not
+  run, because it was blocked or declined, ends with the status `declined`
+  instead of `completed`, and `streaming-json` marks its `tool.finished` as
+  `refused`.
 
 - **Fewer commands and tools.** The terminal's commands are now `/profile`,
   `/providers`, `/mode`, `/effort`, `/config`, `/goal`, `/loop`, `/btw`, `/new`,

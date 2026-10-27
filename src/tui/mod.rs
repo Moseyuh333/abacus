@@ -1087,8 +1087,8 @@ fn tool_preview(output: &str) -> String {
 
 /// Record a result on a tool row: the outcome read out of it, the collapsed
 /// preview, and the text kept for expansion.
-fn settle(call: &mut ToolCall, output: &str, duration_ms: Option<u64>) {
-    call.status = if tool_failed(output) { ToolStatus::Failed } else { ToolStatus::Ok };
+fn settle(call: &mut ToolCall, output: &str, refused: bool, duration_ms: Option<u64>) {
+    call.status = if refused || tool_failed(output) { ToolStatus::Failed } else { ToolStatus::Ok };
     call.output = tool_preview(output);
     call.full = retain_output(output);
     call.duration_ms = duration_ms;
@@ -1126,7 +1126,7 @@ fn entries_from_messages(messages: &[Value]) -> Vec<Entry> {
             // resumed tool rows keep their pass/fail colouring.
             "tool" => {
                 let mut call = ToolCall::running(message["name"].as_str().unwrap_or("tool"), "");
-                settle(&mut call, content, None);
+                settle(&mut call, content, crate::agent::tool_result_refused(content), None);
                 entries.push(Entry::tool(call));
             }
             _ => {}
@@ -1606,7 +1606,7 @@ impl App {
                     self.status = format!("running {name}");
                     self.push_entry(Entry::tool(ToolCall::running(name, summary)));
                 }
-                AgentEvent::ToolFinished { name, output } => {
+                AgentEvent::ToolFinished { name, output, refused } => {
                     self.receiving_delta = false;
                     // The full tool result (not the preview) lands in the
                     // messages array; estimate its JSON size for the live ctx %.
@@ -1619,7 +1619,7 @@ impl App {
                         self.push_entry(Entry::tool(ToolCall::running(name, "")));
                     }
                     if let Some(call) = self.open_tool() {
-                        settle(call, &output, duration_ms);
+                        settle(call, &output, refused, duration_ms);
                     }
                     self.group_exploration();
                     self.status = "thinking".to_owned();

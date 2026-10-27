@@ -93,6 +93,9 @@ pub enum AgentEvent {
     ToolFinished {
         name: String,
         output: String,
+        /// The call did not run: a guard or the safety reviewer stopped it,
+        /// or the person declined it. `output` says why.
+        refused: bool,
     },
     Done {
         messages: Vec<Value>,
@@ -615,7 +618,7 @@ async fn run_turn_inner(
             // not count under the repeat-call heuristic.
             if call.name == "ask_user" {
                 let answer = request_user_question(&call, &events).await.map(|answer| answer.describe());
-                finish_tool(&call, crate::tools::reply(answer), &mut messages, &events);
+                finish_tool(&call, crate::tools::reply(answer), false, &mut messages, &events);
                 continue;
             }
 
@@ -657,6 +660,7 @@ async fn run_turn_inner(
             // A refused call is shown as an attempt that was stopped, so the
             // person sees what the agent tried and why it did not run.
             let _ = events.send(AgentEvent::ToolStarted { name: call.name.clone(), summary: call.summary() });
+            let refused = refusal.is_some();
             let mut output = match refusal {
                 Some(refusal) => refusal,
                 None => run_tool(&call, &options, &tools, &subagents, &aux).await,
@@ -703,7 +707,7 @@ async fn run_turn_inner(
                 output = options.handles.bind(&source, output).summary();
             }
             tool_calls_executed += 1;
-            finish_tool(&call, output, &mut messages, &events);
+            finish_tool(&call, output, refused, &mut messages, &events);
         }
         if interrupted {
             let _ = events.send(AgentEvent::Done { messages, reason: DoneReason::Interrupted });
@@ -731,14 +735,20 @@ async fn run_turn_inner(
 }
 
 /// Record a tool's result: tell the UI, and put it in the conversation.
-fn finish_tool(call: &ToolCall, output: String, messages: &mut Vec<Value>, events: &mpsc::UnboundedSender<AgentEvent>) {
+fn finish_tool(
+    call: &ToolCall,
+    output: String,
+    refused: bool,
+    messages: &mut Vec<Value>,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) {
     messages.push(json!({
         "role": "tool",
         "tool_call_id": call.id,
         "name": call.name,
         "content": output
     }));
-    let _ = events.send(AgentEvent::ToolFinished { name: call.name.clone(), output });
+    let _ = events.send(AgentEvent::ToolFinished { name: call.name.clone(), output, refused });
 }
 
 /// One string argument of a tool call, if it has one by that name.
@@ -1091,7 +1101,7 @@ async fn review_call(
             if request_approval(call, reason, details, events).await {
                 None
             } else {
-                Some("The user rejected this tool call. Do not retry it without changing the approach.".to_owned())
+                Some("User rejected this tool call. Do not retry it without changing the approach.".to_owned())
             }
         }
     }
@@ -1494,6 +1504,14 @@ fn deliver_injections(options: &TurnOptions, messages: &mut Vec<Value>, events: 
         };
         messages.push(json!({"role": "user", "content": content}));
     }
+}
+
+/// Whether a saved tool result is a refusal: the call did not run because a
+/// guard or the safety reviewer stopped it, or the person declined it. A live
+/// call says so in `ToolFinished`; history only has the text.
+pub fn tool_result_refused(output: &str) -> bool {
+    let head = output.trim_start();
+    head.starts_with("Blocked") || head.starts_with("User rejected")
 }
 
 /// Whether a tool result reads as a failure, for the papercut streak counter.

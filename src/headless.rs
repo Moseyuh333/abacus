@@ -164,9 +164,9 @@ pub async fn run(
                 &format!("{name}: {summary}"),
                 json!({"type": "tool.started", "tool": name, "summary": summary}),
             )?,
-            AgentEvent::ToolFinished { name, output } => {
+            AgentEvent::ToolFinished { name, output, refused } => {
                 if format == OutputFormat::StreamingJson {
-                    emit(json!({"type": "tool.finished", "tool": name, "output": output}))?;
+                    emit(json!({"type": "tool.finished", "tool": name, "output": output, "refused": refused}))?;
                 }
             }
             AgentEvent::Done { messages, .. } => {

@@ -1041,7 +1041,8 @@ fn consecutive_read_only_tools_collapse_into_an_explored_group() {
         ("read_file", "src/b.rs", "fn b() {}"),
     ] {
         let _ = app.event_tx.send(AgentEvent::ToolStarted { name: name.into(), summary: summary.into() });
-        let _ = app.event_tx.send(AgentEvent::ToolFinished { name: name.into(), output: output.into() });
+        let _ =
+            app.event_tx.send(AgentEvent::ToolFinished { name: name.into(), output: output.into(), refused: false });
     }
     assert!(app.drain_agent_events());
     let tools: Vec<_> = app.entries.iter().filter_map(|entry| entry.tool.as_ref()).collect();
@@ -1060,12 +1061,31 @@ fn writes_and_failures_do_not_join_an_exploration_group() {
     let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
     for (name, output) in [("read_file", "content"), ("write_file", "wrote 3 lines"), ("read_file", "Error: missing")] {
         let _ = app.event_tx.send(AgentEvent::ToolStarted { name: name.into(), summary: "x".into() });
-        let _ = app.event_tx.send(AgentEvent::ToolFinished { name: name.into(), output: output.into() });
+        let _ =
+            app.event_tx.send(AgentEvent::ToolFinished { name: name.into(), output: output.into(), refused: false });
     }
     assert!(app.drain_agent_events());
     let tools: Vec<_> = app.entries.iter().filter_map(|entry| entry.tool.as_ref()).collect();
     assert_eq!(tools.len(), 3, "a write and a failure stay individual rows");
     assert!(tools.iter().all(|call| call.name != "explored"));
+}
+
+#[test]
+fn a_refused_call_is_marked_as_not_run_whatever_its_output_says() {
+    let (_directory, mut app) = test_app("http://127.0.0.1:9/v1");
+    for (output, refused) in [
+        ("Blocked by AUTO mode: nobody asked for this. It was not run.", true),
+        ("User rejected this tool call. Do not retry it without changing the approach.", true),
+        ("removed build/", false),
+    ] {
+        let _ =
+            app.event_tx.send(AgentEvent::ToolStarted { name: "run_command".into(), summary: "rm -rf build/".into() });
+        let _ =
+            app.event_tx.send(AgentEvent::ToolFinished { name: "run_command".into(), output: output.into(), refused });
+    }
+    assert!(app.drain_agent_events());
+    let statuses: Vec<_> = app.entries.iter().filter_map(|entry| entry.tool.as_ref()).map(|call| call.status).collect();
+    assert_eq!(statuses, [ui::ToolStatus::Failed, ui::ToolStatus::Failed, ui::ToolStatus::Ok]);
 }
 
 #[tokio::test]
@@ -1851,7 +1871,7 @@ fn editing_the_draft_resets_the_highlight_and_revives_a_dismissed_popup() {
 
 fn tool_entry(output: &str) -> Entry {
     let mut call = ToolCall::running("run_command", "cargo test");
-    settle(&mut call, output, Some(120));
+    settle(&mut call, output, false, Some(120));
     Entry::tool(call)
 }
 
@@ -2456,9 +2476,9 @@ async fn a_snapshot_names_rows_as_the_live_frames_did_even_after_the_terminal_me
     for event in [
         AgentEvent::Delta("Reading.".into()),
         AgentEvent::ToolStarted { name: "read_file".into(), summary: "a.rs".into() },
-        AgentEvent::ToolFinished { name: "read_file".into(), output: "fn a() {}".into() },
+        AgentEvent::ToolFinished { name: "read_file".into(), output: "fn a() {}".into(), refused: false },
         AgentEvent::ToolStarted { name: "read_file".into(), summary: "b.rs".into() },
-        AgentEvent::ToolFinished { name: "read_file".into(), output: "fn b() {}".into() },
+        AgentEvent::ToolFinished { name: "read_file".into(), output: "fn b() {}".into(), refused: false },
         AgentEvent::Delta("Done.".into()),
     ] {
         let _ = app.event_tx.send(event);
@@ -2518,7 +2538,11 @@ async fn a_resync_shows_how_dialogs_ended_where_they_happened_and_only_once() {
         Inbound::Approve { ref_id: "b1".into(), approval_id, decision: ApprovalDecision::Once },
     );
     let _ = app.event_tx.send(AgentEvent::ToolStarted { name: "write_file".into(), summary: "notes.txt".into() });
-    let _ = app.event_tx.send(AgentEvent::ToolFinished { name: "write_file".into(), output: "wrote 1 line".into() });
+    let _ = app.event_tx.send(AgentEvent::ToolFinished {
+        name: "write_file".into(),
+        output: "wrote 1 line".into(),
+        refused: false,
+    });
     assert!(app.drain_agent_events());
 
     // The terminal answers a question.

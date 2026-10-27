@@ -379,7 +379,7 @@ impl Bridge {
             // once the terminal holds the request.
             AgentEvent::Approval(_) | AgentEvent::UserQuestion(_) => self.close_text(),
             AgentEvent::ToolStarted { name, summary } => self.tool_started(name, summary, entry),
-            AgentEvent::ToolFinished { name, output } => self.tool_finished(name, output, entry),
+            AgentEvent::ToolFinished { name, output, refused } => self.tool_finished(name, output, *refused, entry),
             AgentEvent::Notice(text) => self.notice(text, Level::Info),
             AgentEvent::TraceFailed { error } => {
                 self.notice(&format!("Trace capture stopped: {error}"), Level::Warning)
@@ -728,7 +728,7 @@ impl Bridge {
         self.set_status(State::Tool, &format!("running {name}"));
     }
 
-    fn tool_finished(&mut self, name: &str, output: &str, entry: Option<u64>) {
+    fn tool_finished(&mut self, name: &str, output: &str, refused: bool, entry: Option<u64>) {
         self.close_text();
         // One that began before sharing did: the entry it is in names it.
         let open = match self.tool.take() {
@@ -744,7 +744,7 @@ impl Bridge {
                 }
             }
         };
-        let status = if tool_failed(output) { ToolState::Failed } else { ToolState::Ok };
+        let status = if refused || tool_failed(output) { ToolState::Failed } else { ToolState::Ok };
         let (output, clipped) = protocol::clip_tool_output(output);
         self.emit(Outbound::Tool(finish_frame(open, status, output, clipped)));
         self.set_status(State::Thinking, "thinking");
