@@ -67,7 +67,10 @@ run.
   and its new `details` field carries the operation itself. A call that did not
   run, because it was blocked or declined, ends with the status `declined`
   instead of `completed`, and `streaming-json` marks its `tool.finished` as
-  `refused`.
+  `refused`. A steering message joins the transcript where the model reads it,
+  announced by `turn/steer/delivered`, and `turn/steer/withdraw` takes one back
+  before then. One the turn ended before reaching starts the next turn, as it
+  does in the terminal, and `turn/completed` says `continues` when it will.
 
 - **Fewer commands and tools.** The terminal's commands are now `/profile`,
   `/providers`, `/mode`, `/effort`, `/config`, `/goal`, `/loop`, `/btw`, `/new`,

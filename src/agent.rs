@@ -144,6 +144,24 @@ pub enum Injection {
     SideNote(String),
 }
 
+impl Injection {
+    /// Whether this is the person steering, as opposed to a note or a report.
+    fn is_message(&self) -> bool {
+        matches!(self, Self::UserMessage(_) | Self::UserContent { .. })
+    }
+
+    /// The person's words, for a steering message.
+    pub fn message_text(&self) -> Option<&str> {
+        match self {
+            Self::UserMessage(text) | Self::UserContent { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+}
+
+/// What a delivered steering message is announced with, before its text.
+pub const STEERING_NOTICE: &str = "steering — ";
+
 /// A queue of pending injections, shared between the TUI (user steering), the
 /// subagent runtime (finished background workers), and the running turn, which
 /// drains it between tool calls.
@@ -164,6 +182,27 @@ impl InjectionQueue {
     /// Take everything pending, leaving the queue empty.
     pub fn drain(&self) -> Vec<Injection> {
         self.0.lock().map(|mut queue| std::mem::take(&mut *queue)).unwrap_or_default()
+    }
+
+    /// Whether a steering message from the person is waiting.
+    pub fn has_message(&self) -> bool {
+        self.0.lock().is_ok_and(|queue| queue.iter().any(Injection::is_message))
+    }
+
+    /// Take back a steering message the model has not read yet: the oldest
+    /// one with this text. False when there is none, because it was delivered.
+    pub fn withdraw(&self, text: &str) -> bool {
+        let Ok(mut queue) = self.0.lock() else { return false };
+        let index = queue.iter().position(|injection| injection.message_text() == Some(text));
+        index.map(|index| queue.remove(index)).is_some()
+    }
+
+    /// Take the oldest steering message from the person, leaving everything
+    /// else queued in order.
+    pub fn take_message(&self) -> Option<Injection> {
+        let mut queue = self.0.lock().ok()?;
+        let index = queue.iter().position(Injection::is_message)?;
+        Some(queue.remove(index))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1477,11 +1516,11 @@ fn deliver_injections(options: &TurnOptions, messages: &mut Vec<Value>, events: 
     for injection in options.injections.drain() {
         let content = match &injection {
             Injection::UserMessage(text) => {
-                let _ = events.send(AgentEvent::Notice(format!("steering — {text}")));
+                let _ = events.send(AgentEvent::Notice(format!("{STEERING_NOTICE}{text}")));
                 Value::String(text.clone())
             }
             Injection::UserContent { text, content } => {
-                let _ = events.send(AgentEvent::Notice(format!("steering — {text}")));
+                let _ = events.send(AgentEvent::Notice(format!("{STEERING_NOTICE}{text}")));
                 content.clone()
             }
             Injection::SideNote(note) => {
@@ -1551,6 +1590,34 @@ fn system_prompt(workspace: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_steering_message_can_be_withdrawn_until_the_model_reads_it() {
+        let queue = InjectionQueue::default();
+        queue.push(Injection::UserMessage("again".into()));
+        queue.push(Injection::SideNote("again".into()));
+        queue.push(Injection::UserMessage("again".into()));
+        assert!(queue.withdraw("again"));
+        assert!(queue.withdraw("again"));
+        assert!(!queue.withdraw("again"), "a side note is not a steering message");
+        assert!(matches!(queue.drain().as_slice(), [Injection::SideNote(_)]));
+    }
+
+    #[test]
+    fn the_oldest_steering_message_is_taken_and_the_rest_keep_their_order() {
+        let queue = InjectionQueue::default();
+        queue.push(Injection::SideNote("note".into()));
+        queue.push(Injection::UserMessage("first".into()));
+        queue.push(Injection::SubagentReport("report".into()));
+        queue.push(Injection::UserMessage("second".into()));
+        assert!(queue.has_message());
+        assert!(matches!(queue.take_message(), Some(Injection::UserMessage(text)) if text == "first"));
+        assert!(matches!(queue.take_message(), Some(Injection::UserMessage(text)) if text == "second"));
+        assert!(!queue.has_message());
+        assert!(queue.take_message().is_none());
+        let rest = queue.drain();
+        assert!(matches!(rest.as_slice(), [Injection::SideNote(_), Injection::SubagentReport(_)]), "{rest:?}");
+    }
 
     #[test]
     fn merges_trailing_system_messages_into_the_leading_one() {

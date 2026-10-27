@@ -318,6 +318,7 @@ pub async fn run(
             event = event_rx.recv() => {
                 let Some(event) = event else { continue };
                 app.handle_event(event);
+                app.send_leftover_steer(&events);
             }
             call = client_call_rx.recv() => {
                 let Some(call) = call else { continue };
@@ -505,10 +506,12 @@ impl App {
                 if self.turn_id.is_some() {
                     let content = self.user_content(&text, images);
                     self.thread.state.injections.push(match content {
-                        Value::String(_) => crate::agent::Injection::UserMessage(text),
-                        content => crate::agent::Injection::UserContent { text, content },
+                        Value::String(_) => crate::agent::Injection::UserMessage(text.clone()),
+                        content => crate::agent::Injection::UserContent { text: text.clone(), content },
                     });
-                    return Ok(json!({"steered": true, "turnId": self.turn_id()}));
+                    // It joins the transcript when the model reads it, which
+                    // `turn/steer/delivered` announces with this same text.
+                    return Ok(json!({"steered": true, "turnId": self.turn_id(), "text": text}));
                 }
                 if method == "turn/steer" {
                     return Err(anyhow!("no turn is running to steer"));
@@ -517,6 +520,11 @@ impl App {
                 let content = self.user_content(&text, images);
                 self.start_turn(content, command.then_some(typed), events);
                 Ok(json!({"turnId": self.turn_id(), "threadId": self.thread_id()}))
+            }
+            // Take back a steering message the model has not read yet.
+            "turn/steer/withdraw" => {
+                let text = params["text"].as_str().ok_or_else(|| anyhow!("text required"))?;
+                Ok(json!({"withdrawn": self.thread.state.injections.withdraw(text)}))
             }
             "commands/list" => {
                 let mut commands = vec![
@@ -1220,16 +1228,20 @@ impl App {
         if let Some(shown) = shown {
             item["text"] = json!(shown);
         }
+        self.begin_turn(content, item, events);
+    }
+
+    /// Start the agent on `content`, announcing `item` as the person's message.
+    fn begin_turn(&mut self, content: Value, mut item: Value, events: &mpsc::UnboundedSender<AgentEvent>) {
         self.thread.messages.push(json!({"role": "user", "content": content}));
         let turn = self.next("turn");
         self.turn_id = Some(turn.clone());
         self.cancel = Arc::new(AtomicBool::new(false));
 
-        let item_id = self.next("item");
         notify("turn/started", json!({"threadId": self.thread_id(), "turnId": turn}));
         // The user's own message is an item too, so a client that replays
         // `item/*` alone reconstructs the whole transcript.
-        item["id"] = json!(item_id);
+        item["id"] = json!(self.next("item"));
         self.item("completed", item);
 
         let options = TurnOptions {
@@ -1318,7 +1330,19 @@ impl App {
                     self.item("completed", item);
                 }
             }
-            AgentEvent::Notice(text) => notify("warning", json!({"message": text})),
+            AgentEvent::Notice(text) => match text.strip_prefix(crate::agent::STEERING_NOTICE) {
+                // The model read a steering message: it joins the transcript
+                // here, where it landed.
+                Some(steer) => {
+                    // What the model said before reading it is finished; what
+                    // it says next is a reply of its own, below the message.
+                    self.flush_streaming();
+                    let item = json!({"id": self.next("item"), "type": "userMessage", "text": steer});
+                    self.item("completed", item);
+                    self.steer_delivered(steer);
+                }
+                None => notify("warning", json!({"message": text})),
+            },
             AgentEvent::TraceFailed { error } => {
                 notify("warning", json!({"message": format!("training trace off — {error}")}))
             }
@@ -1420,8 +1444,34 @@ impl App {
                 "turnId": turn,
                 "status": status,
                 "name": self.thread.session.title,
+                // A steering message this turn did not reach starts the next
+                // one at once; a client holding messages for later waits.
+                "continues": self.thread.state.injections.has_message(),
             }),
         );
+    }
+
+    /// A steering message the turn ended before reaching was meant for now,
+    /// not for whenever the person next types: it starts the next turn, as in
+    /// the terminal.
+    fn send_leftover_steer(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
+        if self.turn_id.is_some() {
+            return;
+        }
+        let (text, content) = match self.thread.state.injections.take_message() {
+            Some(crate::agent::Injection::UserMessage(text)) => (text.clone(), Value::String(text)),
+            Some(crate::agent::Injection::UserContent { text, content }) => (text, content),
+            _ => return,
+        };
+        let item = user_item(&content);
+        self.begin_turn(content, item, events);
+        self.steer_delivered(&text);
+    }
+
+    /// Tell the client a steering message reached the model, by the text
+    /// `turn/start` answered with when it was sent.
+    fn steer_delivered(&self, text: &str) {
+        notify("turn/steer/delivered", json!({"threadId": self.thread_id(), "text": text}));
     }
 
     /// Publish what the working tree looks like now, per file. A client shows
