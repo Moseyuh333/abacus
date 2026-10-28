@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.3 — 2026-10-28
+
+Abacus for Linux on arm64. Nothing else changed.
+
+- **Linux on arm64.** The release has `abacus-aarch64-unknown-linux-gnu`,
+  built and tested on an arm64 machine, and CI runs there on every push. The
+  installer sets it up on arm64 Linux, which it used to turn away with "no
+  prebuilt release", and Abacus Desktop 0.1.4 has arm64 Linux packages to go
+  with it.
+
 ## 0.7.2 — 2026-10-28
 
 Two changes to what a front end shows of the agent's work. The Abacus Desktop
