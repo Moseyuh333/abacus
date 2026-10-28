@@ -1155,11 +1155,13 @@ fn preferred_provider_id(old_id: &str, provider: &ProviderConfig) -> String {
 /// models that expose reasoning, and sending one to a model that does not is
 /// how you collect 400s.
 ///
-/// The ladder spans both worlds: OpenAI-shaped protocols know
-/// `minimal|low|medium|high`, while the Anthropic Messages API knows
-/// `low|medium|high|xhigh|max`. Each end is mapped to what it accepts rather
-/// than sending a level the endpoint would reject.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+/// The ladder spans both worlds: the Anthropic Messages API knows
+/// `low|medium|high|xhigh|max`, and OpenAI-shaped endpoints accept whatever
+/// subset their models do — OpenAI's own stops at `high` on most models,
+/// while others take `xhigh` or `max` and refuse `high`. So the chosen level
+/// is sent as is, and a rejection settles what the endpoint accepts (see
+/// `Provider::learn`). Ordered from least to most effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     /// As little as the model allows — fastest and cheapest.
@@ -1175,6 +1177,8 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
+    pub const ALL: [Self; 6] = [Self::Minimal, Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Minimal => "minimal",
@@ -1195,16 +1199,6 @@ impl ReasoningEffort {
             "xhigh" | "x-high" | "extra-high" => Some(Self::XHigh),
             "max" | "maximum" => Some(Self::Max),
             _ => None,
-        }
-    }
-
-    /// The level as OpenAI-shaped protocols (`reasoning_effort`,
-    /// `reasoning.effort`) accept it. They top out at `high`, so the two
-    /// Anthropic-only rungs above it clamp down rather than 400.
-    pub fn openai_label(self) -> &'static str {
-        match self {
-            Self::XHigh | Self::Max => "high",
-            other => other.label(),
         }
     }
 
@@ -1744,14 +1738,11 @@ mod tests {
         );
     }
 
-    /// Each protocol only knows its own rungs: sending `xhigh` to an
-    /// OpenAI-shaped endpoint, or `minimal` to Anthropic, is a 400.
+    /// Anthropic has no `minimal`, so it is the one level that is mapped
+    /// before sending; everything else goes out as chosen.
     #[test]
-    fn effort_levels_map_to_what_each_protocol_accepts() {
-        assert_eq!(ReasoningEffort::XHigh.openai_label(), "high");
-        assert_eq!(ReasoningEffort::Max.openai_label(), "high");
-        assert_eq!(ReasoningEffort::Minimal.openai_label(), "minimal");
-        assert_eq!(ReasoningEffort::Medium.openai_label(), "medium");
+    fn effort_levels_map_to_what_anthropic_accepts() {
+        assert!(ReasoningEffort::ALL.windows(2).all(|pair| pair[0] < pair[1]), "ALL runs least to most");
         assert_eq!(ReasoningEffort::Minimal.anthropic_effort(), "low");
         assert_eq!(ReasoningEffort::XHigh.anthropic_effort(), "xhigh");
         assert_eq!(ReasoningEffort::Max.anthropic_effort(), "max");

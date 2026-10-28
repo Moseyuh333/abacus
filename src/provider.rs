@@ -75,6 +75,12 @@ pub struct Provider {
     /// catches the known ones, and this catches everything it does not.
     /// Shared across clones for the same reason `learned_output_cap` is.
     prefers_adaptive_thinking: Arc<AtomicBool>,
+    /// What to send in place of `reasoning_effort` on the OpenAI-shaped
+    /// protocols once the endpoint has refused it: the nearest level its
+    /// rejection listed, or `None` to leave the field out and take the
+    /// model's default. Empty until a rejection says otherwise. Shared across
+    /// clones for the same reason `learned_output_cap` is.
+    learned_effort: Arc<std::sync::Mutex<Option<Option<crate::config::ReasoningEffort>>>>,
     /// Optional one-request gate shared by the main and auxiliary providers.
     stream_gate: Option<Arc<Semaphore>>,
     /// Set once the endpoint rejects a system message that is not first.
@@ -197,6 +203,7 @@ impl Provider {
             session_id: uuid::Uuid::new_v4().simple().to_string(),
             reasoning_effort: config.reasoning_effort,
             prefers_adaptive_thinking: Arc::new(AtomicBool::new(false)),
+            learned_effort: Arc::default(),
             stream_gate: config.one_stream.then(|| Arc::new(Semaphore::new(1))),
             prefers_leading_system: Arc::new(AtomicBool::new(false)),
             caches_prompt: Arc::new(AtomicBool::new(config.prompt_cache)),
@@ -226,6 +233,13 @@ impl Provider {
             0 => Some(configured),
             cap => Some(configured.min(cap as usize)),
         }
+    }
+
+    /// The effort to send on the OpenAI-shaped protocols: the chosen one,
+    /// unless a rejection has taught us what this endpoint takes instead.
+    fn openai_effort(&self) -> Option<crate::config::ReasoningEffort> {
+        let learned = *self.learned_effort.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        learned.unwrap_or(self.reasoning_effort)
     }
 
     /// Approximate tokens processed so far this session.
@@ -501,6 +515,7 @@ impl Provider {
     fn learn(&self, error: &anyhow::Error, body: &mut Value, messages: &[Value]) -> bool {
         let first = |flag: &AtomicBool| !flag.swap(true, Ordering::Relaxed);
         let chat = self.protocol == ProviderProtocol::ChatCompletions;
+        let responses = self.protocol == ProviderProtocol::Responses;
         let anthropic = self.protocol == ProviderProtocol::Anthropic;
         let mut rebuild_messages = false;
 
@@ -531,6 +546,23 @@ impl Provider {
             self.learned_output_cap.store(cap as u64, Ordering::Relaxed);
             let field = if chat { self.output_tokens_field() } else { "max_tokens" };
             body[field] = json!(cap);
+        // The endpoint refused the effort level. It is sent as chosen because
+        // the accepted set differs by model — one stops at `high`, another
+        // takes `xhigh` and refuses `high` — so the refusal decides.
+        } else if (chat || responses)
+            && let Some(sent) = self.openai_effort()
+            && let Some(fallback) = rejected_effort(error, sent)
+        {
+            *self.learned_effort.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fallback);
+            let field = if chat { "reasoning_effort" } else { "reasoning" };
+            match fallback {
+                Some(effort) if chat => body[field] = json!(effort.label()),
+                Some(effort) => body[field] = json!({"effort": effort.label()}),
+                None => {
+                    body.as_object_mut().map(|body| body.remove(field));
+                }
+            }
+            self.connection.apply_to_body(body);
         // An Anthropic-compatible gateway that does not know `cache_control`.
         // Caching is an optimisation, so it is dropped rather than allowed to
         // fail the turn.
@@ -572,8 +604,8 @@ impl Provider {
         if let Some(max_tokens) = self.effective_output_tokens() {
             body[self.output_tokens_field()] = json!(max_tokens);
         }
-        if let Some(effort) = self.reasoning_effort {
-            body["reasoning_effort"] = json!(effort.openai_label());
+        if let Some(effort) = self.openai_effort() {
+            body["reasoning_effort"] = json!(effort.label());
         }
         // Routing is an OpenRouter extension. Sending it to an endpoint that
         // does not know the field risks a 400 from the stricter servers.
@@ -600,8 +632,8 @@ impl Provider {
         if let Some(max_tokens) = self.effective_output_tokens() {
             body["max_output_tokens"] = json!(max_tokens);
         }
-        if let Some(effort) = self.reasoning_effort {
-            body["reasoning"] = json!({"effort": effort.openai_label()});
+        if let Some(effort) = self.openai_effort() {
+            body["reasoning"] = json!({"effort": effort.label()});
         }
         if let Some(session) = self.openrouter_session() {
             body["session_id"] = json!(session);
@@ -1159,6 +1191,42 @@ fn is_max_tokens_rejection(error: &anyhow::Error) -> bool {
 fn is_leading_system_rejection(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}").to_ascii_lowercase();
     text.contains("system message") && (text.contains("beginning") || text.contains("first") || text.contains("start"))
+}
+
+/// What to send instead of the effort level `sent`, when `error` refuses it;
+/// `None` when the error is about something else.
+///
+/// The refusal must be about reasoning and quote the level that was sent —
+/// `unexpected reasoning "high"`, or OpenAI's "does not support 'max' with this
+/// model. Supported values are: 'low', 'medium', and 'high'." When it lists
+/// other levels, the nearest one at or below `sent` is taken (else the nearest
+/// above); when it lists none, the field is dropped and the model's own
+/// default applies, which is always accepted.
+fn rejected_effort(
+    error: &anyhow::Error,
+    sent: crate::config::ReasoningEffort,
+) -> Option<Option<crate::config::ReasoningEffort>> {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    if !(text.contains("effort") || text.contains("reasoning")) || !is_quoted(&text, sent.label()) {
+        return None;
+    }
+    let listed: Vec<_> = crate::config::ReasoningEffort::ALL
+        .into_iter()
+        .filter(|&effort| effort != sent && is_quoted(&text, effort.label()))
+        .collect();
+    let below = listed.iter().copied().filter(|&effort| effort < sent).max();
+    Some(below.or_else(|| listed.into_iter().min()))
+}
+
+/// Whether `word` appears in `text` between quote marks of any kind, including
+/// the escaped ones of a JSON error body echoed inside a string.
+fn is_quoted(text: &str, word: &str) -> bool {
+    const QUOTES: &[char] = &['"', '\'', '`', '\\'];
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + word.len()..].chars().next();
+        before.is_some_and(|c| QUOTES.contains(&c)) && after.is_some_and(|c| QUOTES.contains(&c))
+    })
 }
 
 /// Whether the endpoint refused the prompt-cache markers. Anthropic-compatible
@@ -2000,6 +2068,49 @@ mod tests {
         // request carries one value rather than two.
         provider.connection.headers = vec![("X-OpenCode-Session".to_owned(), "mine".to_owned())];
         assert_eq!(provider.opencode_session(), None);
+    }
+
+    /// XHigh and Max used to go out as `high` on OpenAI-shaped endpoints, and
+    /// a model that refuses `high` 400'd on both. The chosen level is sent as
+    /// is now; a refusal steps to what the endpoint listed, or drops the field.
+    #[test]
+    fn a_refused_effort_falls_back_to_what_the_endpoint_accepts() {
+        use crate::config::ReasoningEffort::{High, Max, XHigh};
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            profile: "test".into(),
+            max_steps: 8,
+            no_session: true,
+            ..Config::for_endpoint(
+                directory.path().to_path_buf(),
+                "http://127.0.0.1:9/v1".into(),
+                "test".into(),
+                crate::config::AbacusPaths::under(directory.path().join("home")),
+            )
+        };
+        config.reasoning_effort = Some(Max);
+        let provider = Provider::new(&config).unwrap();
+        let mut body = provider.chat_body(&[], &[]);
+        assert_eq!(body["reasoning_effort"], json!("max"), "sent as chosen, not clamped");
+
+        // OpenAI lists what it takes: the nearest level below wins.
+        let openai = anyhow!(
+            r#"400 Bad Request: {{"error":{{"message":"Unsupported value: 'reasoning_effort' does not support 'max' with this model. Supported values are: 'low', 'medium', and 'high'."}}}}"#
+        );
+        assert!(provider.learn(&openai, &mut body, &[]));
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert_eq!(provider.with_model("aux").chat_body(&[], &[])["reasoning_effort"], json!("high"), "remembered");
+
+        // A refusal that lists nothing drops the field: the default always works.
+        let bare = anyhow!(r#"400 Bad Request: {{"detail":"unexpected reasoning "high""}}"#);
+        assert!(provider.learn(&bare, &mut body, &[]));
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(provider.chat_body(&[], &[]).get("reasoning_effort").is_none());
+
+        // Errors about something else, or a level that was not sent, teach nothing.
+        assert_eq!(rejected_effort(&anyhow!("400: unexpected reasoning \"high\""), XHigh), None);
+        assert_eq!(rejected_effort(&anyhow!("400: model 'high-speed' not found"), High), None);
+        assert_eq!(rejected_effort(&anyhow!("effort must be one of 'xhigh', 'max'; got 'high'"), High), Some(Some(XHigh)));
     }
 
     /// The body is the whole contract: an adaptive model must get
