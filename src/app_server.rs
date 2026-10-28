@@ -180,6 +180,10 @@ struct App {
     /// The provider's prompt count at the last usage report, so a reply with
     /// several tool calls reports once.
     reported_context: u64,
+    /// The thread's goal and task list as last told to the front end, so
+    /// each change is reported once.
+    reported_goal: Value,
+    reported_tasks: Value,
     /// YOLO when set, AUTO otherwise. Shared with the running turn, so a
     /// switch applies from its next tool call.
     yolo: Arc<AtomicBool>,
@@ -260,6 +264,8 @@ pub async fn run(
         provider,
         tokens,
         reported_context: 0,
+        reported_goal: Value::Null,
+        reported_tasks: Value::Null,
         yolo,
         cancel: Arc::new(AtomicBool::new(false)),
         turn_id: None,
@@ -509,6 +515,11 @@ impl App {
                     // writable config keys.
                     "commandRun": true,
                     "agentLimits": true,
+                    // The thread snapshot carries the `goal` and the
+                    // `taskList`; thread/goal/updated and
+                    // thread/taskList/updated report each change.
+                    "goal": true,
+                    "taskList": true,
                 },
                 "idleCompaction": self.config.idle_compaction,
                 "maxSteps": self.config.max_steps,
@@ -1028,6 +1039,7 @@ impl App {
                 if self.thread.persisted {
                     self.persist();
                 }
+                self.report_work();
                 if let Some((shown, prompt)) = reply.start {
                     // Mid-turn it steers, as anything sent then does.
                     if self.turn_id.is_some() {
@@ -1392,8 +1404,27 @@ impl App {
             "contextTokens": self.context_tokens(),
             "tokensUsed": self.tokens.total(),
             "usage": token_usage(&self.tokens.snapshot()),
+            "goal": goal_item(self.thread.state.goal.snapshot()),
+            "taskList": self.thread.state.tasks.snapshot(),
             "items": history_items(&self.thread.messages),
         })
+    }
+
+    /// Tell the front end what changed in the work the thread is pinned to:
+    /// the goal (the model updated it, a turn counted against it, a command
+    /// set it) and the task list. Each once per change.
+    fn report_work(&mut self) {
+        let thread = self.thread_id();
+        let goal = json!({"threadId": thread, "goal": goal_item(self.thread.state.goal.snapshot())});
+        if goal != self.reported_goal {
+            notify("thread/goal/updated", goal.clone());
+            self.reported_goal = goal;
+        }
+        let tasks = json!({"threadId": thread, "tasks": self.thread.state.tasks.snapshot()});
+        if tasks != self.reported_tasks {
+            notify("thread/taskList/updated", tasks.clone());
+            self.reported_tasks = tasks;
+        }
     }
 
     async fn git(&self, args: &[&str]) -> Result<String> {
@@ -1638,6 +1669,9 @@ impl App {
                     item["output"] = json!(output);
                     self.item("completed", item);
                 }
+                if matches!(name.as_str(), "goal_update" | "task_create" | "task_update") {
+                    self.report_work();
+                }
             }
             AgentEvent::Notice(text) => match text.strip_prefix(crate::agent::STEERING_NOTICE) {
                 // The model read a steering message: it joins the transcript
@@ -1783,6 +1817,8 @@ impl App {
             usage.spawn_report(false);
         }
         self.report_usage();
+        // The turn counted against the goal.
+        self.report_work();
         notify(
             "turn/completed",
             json!({
@@ -2127,6 +2163,20 @@ fn parse_numstat(line: &str) -> Option<Value> {
         "removed": count(removed),
         "binary": added == "-",
     }))
+}
+
+/// The thread's goal as a client shows it, or null when none is set.
+fn goal_item(goal: Option<crate::goal::Goal>) -> Value {
+    goal.map_or(Value::Null, |goal| {
+        json!({
+            "objective": goal.objective,
+            "status": goal.status,
+            // Turns run toward it.
+            "iterations": goal.iterations,
+            // The model's latest word on it.
+            "note": goal.note,
+        })
+    })
 }
 
 /// A background worker as a client lists it.
@@ -2734,5 +2784,18 @@ mod tests {
         assert_eq!(item_type("run_command"), "commandExecution");
         assert_eq!(item_type("apply_patch"), "fileChange");
         assert_eq!(item_type("grep"), "functionCall");
+    }
+
+    #[test]
+    fn goals_reach_the_client_with_status_and_progress() {
+        assert_eq!(goal_item(None), Value::Null);
+        let goal = crate::goal::GoalState::default();
+        goal.create("Ship the parser").unwrap();
+        goal.increment_iteration().unwrap();
+        goal.execute("goal_update", r#"{"status":"paused","note":"waiting on review"}"#).unwrap();
+        assert_eq!(
+            goal_item(goal.snapshot()),
+            json!({"objective": "Ship the parser", "status": "paused", "iterations": 1, "note": "waiting on review"})
+        );
     }
 }
