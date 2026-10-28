@@ -1095,7 +1095,8 @@ pub(super) fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let field = block.inner(editor);
         frame.render_widget(block, editor);
         let value = input.text();
-        let shown = if *key == ConfigKey::ApiKey { "•".repeat(value.chars().count()) } else { value.clone() };
+        let shown =
+            if *key == ConfigKey::ApiKey { ui::glyphs().mask.repeat(value.chars().count()) } else { value.clone() };
         // Long values (a token command, a body) slide so the cursor stays in
         // view rather than typing off the edge.
         let (_, column) = input.cursor_position();

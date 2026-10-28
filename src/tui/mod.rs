@@ -40,9 +40,9 @@ use serde_json::{Value, json};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicI32, Ordering},
     },
     time::{Duration, Instant},
@@ -684,15 +684,26 @@ pub async fn run(
     // Kitty keyboard protocol: lets the terminal distinguish Shift+Enter from
     // plain Enter (and report press/release/repeat). The escape sequence is
     // harmless on terminals that don't understand it — they simply ignore it —
-    // so we push it unconditionally rather than gating on a capability query
-    // that returns false on macOS Terminal.app and many SSH muxers.
-    let _ = execute!(
-        stdout,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
-        )
-    );
-    KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
+    // so we push it rather than gating on a capability query that returns false
+    // on macOS Terminal.app and many SSH muxers.
+    //
+    // Pop first. A previous run that died before its teardown (a closed window,
+    // a killed process, a prompt interrupted with Ctrl+C) can leave a level
+    // pushed, and in that state a terminal reports keypad keys as kitty
+    // codepoints -- which nothing in the Windows event source decodes, so the
+    // numpad stays dead in every later run until the window is closed (issue
+    // #10). Popping an empty stack is a no-op the terminal ignores, so this is
+    // safe whether or not anything was left behind.
+    if keyboard_flags_enabled() {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+            )
+        );
+        KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
+    }
     let restore = TerminalRestore;
     install_terminal_guards();
     let backend = CrosstermBackend::new(stdout);
@@ -815,7 +826,7 @@ pub async fn run(
     // persisted and synced, so leave with the shell-conventional code.
     if PENDING_SIGNAL.load(Ordering::SeqCst) != 0 {
         GRACEFUL_EXIT.store(true, Ordering::SeqCst);
-        std::process::exit(PENDING_SIGNAL.swap(0, Ordering::SeqCst));
+        exit_after_restore(PENDING_SIGNAL.swap(0, Ordering::SeqCst));
     }
     Ok(())
 }
@@ -858,6 +869,51 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, Show);
 }
 
+/// Whether to use the kitty keyboard protocol at all.
+///
+/// `ABACUS_KEYBOARD=none` turns it off for a terminal that mishandles it. The
+/// default keeps it on: it is what distinguishes Shift+Enter from Enter and
+/// what reports key releases, and without it a terminal that was left in kitty
+/// mode by an earlier run stays in it.
+fn keyboard_flags_enabled() -> bool {
+    !matches!(
+        std::env::var("ABACUS_KEYBOARD").map(|value| value.trim().to_ascii_lowercase()).as_deref(),
+        Ok("none" | "off" | "0" | "false")
+    )
+}
+
+/// Leave the process, giving the terminal back first.
+///
+/// Both hard exits go through here, so "restore before exit" is one line to
+/// audit instead of a rule that two call sites have to remember.
+fn exit_after_restore(code: i32) -> ! {
+    restore_terminal();
+    std::process::exit(code)
+}
+
+/// Opt-in key log, `ABACUS_DEBUG_KEYS=<path>`: one line per key event.
+///
+/// A terminal that sends nothing the event source recognises looks exactly like
+/// a terminal sending nothing at all, so a bug like the dead numeric keypad is
+/// diagnosed from this file instead of guessed at. Off unless the variable is
+/// set; nothing else reads it.
+fn log_key(key: &KeyEvent) {
+    static LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let Some(file) = LOG
+        .get_or_init(|| {
+            let path = std::env::var("ABACUS_DEBUG_KEYS").ok()?;
+            std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new)
+        })
+        .as_ref()
+    else {
+        return;
+    };
+    let line = format!("{:?} modifiers={:?} kind={:?} state={:?}\n", key.code, key.modifiers, key.kind, key.state);
+    if let Ok(mut file) = file.lock() {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 /// Cover the two exits `Drop` cannot see: a panic, whose message would
 /// otherwise print *into* the raw-mode alternate screen where it is both
 /// illegible and invisible, and a termination signal.
@@ -897,7 +953,7 @@ fn install_terminal_guards() {
                     if let Some(path) = crate::recovery::flush() {
                         eprintln!("Interrupted mid-reply; the partial text is in {}", path.display());
                     }
-                    std::process::exit(code);
+                    exit_after_restore(code);
                 }
             });
         }
@@ -937,6 +993,7 @@ async fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut
         if event::poll(Duration::from_millis(wait))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    log_key(&key);
                     if app.sync_idle_since.is_some() {
                         app.sync_idle_since = Some(Instant::now());
                     }

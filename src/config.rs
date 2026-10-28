@@ -1257,6 +1257,12 @@ pub struct UiSettings {
     /// font and is never selected automatically.
     #[serde(default)]
     pub glyphs: crate::ui::GlyphChoice,
+    /// Which language the console commands speak: `auto` follows the operating
+    /// system, `en` and `zh-CN` name one outright. `ABACUS_LANG` overrides it
+    /// for a single run. The TUI is not translated yet, so this governs
+    /// `abacus setup` and `abacus doctor`.
+    #[serde(default)]
+    pub language: Option<String>,
     /// Show the model's reasoning in the transcript, where the provider streams
     /// it apart from the answer.
     #[serde(default = "default_true")]
@@ -1354,6 +1360,7 @@ impl Default for UiSettings {
             show_tooltips: true,
             theme: crate::theme::ThemeChoice::Auto,
             glyphs: crate::ui::GlyphChoice::Auto,
+            language: None,
             show_thinking: true,
             check_updates: true,
             show_token_rate: false,

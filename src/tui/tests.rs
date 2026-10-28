@@ -70,6 +70,29 @@ fn restoring_the_terminal_is_idempotent_and_claim_gated() {
     assert!(!TERMINAL_CLAIMED.load(Ordering::SeqCst), "still released");
 }
 
+/// The kitty protocol is what a terminal left in it misbehaves with, so there
+/// has to be a way out of it that does not involve closing the window.
+#[test]
+fn the_keyboard_protocol_can_be_turned_off_from_the_environment() {
+    static ENV: Mutex<()> = Mutex::new(());
+    let _guard = ENV.lock().unwrap_or_else(|error| error.into_inner());
+    unsafe {
+        std::env::remove_var("ABACUS_KEYBOARD");
+    }
+    assert!(keyboard_flags_enabled(), "on by default");
+    unsafe {
+        std::env::set_var("ABACUS_KEYBOARD", " none ");
+    }
+    assert!(!keyboard_flags_enabled(), "trimmed and case-folded");
+    unsafe {
+        std::env::set_var("ABACUS_KEYBOARD", "kitty");
+    }
+    assert!(keyboard_flags_enabled(), "any other value keeps the default");
+    unsafe {
+        std::env::remove_var("ABACUS_KEYBOARD");
+    }
+}
+
 /// The composer is drawn at the centred content cap, not the frame width.
 /// Measuring the frame counted fewer wrapped rows than were rendered, so on
 /// a wide terminal the box stopped growing and finished lines scrolled out
