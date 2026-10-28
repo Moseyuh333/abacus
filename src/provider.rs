@@ -2110,7 +2110,10 @@ mod tests {
         // Errors about something else, or a level that was not sent, teach nothing.
         assert_eq!(rejected_effort(&anyhow!("400: unexpected reasoning \"high\""), XHigh), None);
         assert_eq!(rejected_effort(&anyhow!("400: model 'high-speed' not found"), High), None);
-        assert_eq!(rejected_effort(&anyhow!("effort must be one of 'xhigh', 'max'; got 'high'"), High), Some(Some(XHigh)));
+        assert_eq!(
+            rejected_effort(&anyhow!("effort must be one of 'xhigh', 'max'; got 'high'"), High),
+            Some(Some(XHigh))
+        );
     }
 
     /// The body is the whole contract: an adaptive model must get
