@@ -311,6 +311,8 @@ pub struct WorkerLog {
     /// The text and reasoning items still being streamed into, by id.
     open_text: Option<String>,
     open_reasoning: Option<String>,
+    /// What the next call is for, by tool name, until that call starts.
+    description: Option<(String, String)>,
 }
 
 impl WorkerLog {
@@ -356,16 +358,23 @@ impl WorkerLog {
         match event {
             AgentEvent::Delta(text) => self.stream("agentMessage", text),
             AgentEvent::Reasoning(text) => self.stream("reasoning", text),
+            AgentEvent::ToolDescribed { name, description } => {
+                self.description = Some((name.clone(), description.clone()));
+            }
             AgentEvent::ToolStarted { name, summary } => {
                 // A tool call ends whatever was streaming.
                 self.open_text = None;
                 self.open_reasoning = None;
-                self.push(json!({
+                let mut item = json!({
                     "type": crate::app_server::item_type(name),
                     "name": name,
                     "command": summary,
                     "status": "inProgress",
-                }));
+                });
+                if let Some((_, description)) = self.description.take().filter(|(tool, _)| tool == name) {
+                    item["description"] = json!(description);
+                }
+                self.push(item);
             }
             AgentEvent::ToolFinished { name, output, refused } => {
                 if let Some(item) =
@@ -757,6 +766,8 @@ mod tests {
         board.describe(id, "qwen3-coder", "make the report fast");
         board.record(id, &AgentEvent::Delta("Reading first.".into()));
         board.record(id, &AgentEvent::AgentMessage { from: "callers".into(), text: "keep the keys".into() });
+        board
+            .record(id, &AgentEvent::ToolDescribed { name: "send_message".into(), description: "Telling main".into() });
         board.record(id, &AgentEvent::ToolStarted { name: "send_message".into(), summary: "main".into() });
         board.record(id, &AgentEvent::MessageSent { to: "main".into(), text: "one query now".into() });
         board.record(
@@ -770,6 +781,7 @@ mod tests {
         assert_eq!(items[2]["text"], "keep the keys");
         assert_eq!(items[2]["from"], serde_json::json!({"title": "callers", "agent": true}));
         assert_eq!(items[3]["message"], "one query now");
+        assert_eq!(items[3]["description"], "Telling main");
         assert_eq!(items[3]["status"], "completed");
     }
 

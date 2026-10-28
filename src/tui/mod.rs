@@ -1608,7 +1608,7 @@ impl App {
                 }
                 AgentEvent::SubagentReport(_) => self.say(crate::agent::REPORT_NOTICE),
                 AgentEvent::AgentMessage { from, text } => self.say(crate::agent::message_notice(&from, &text)),
-                AgentEvent::MessageSent { .. } => {}
+                AgentEvent::MessageSent { .. } | AgentEvent::ToolDescribed { .. } => {}
                 AgentEvent::Notice(notice) => {
                     self.say(notice);
                 }

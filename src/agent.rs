@@ -121,6 +121,13 @@ pub enum AgentEvent {
     },
     /// The report of background subagents that finished reached the model.
     SubagentReport(String),
+    /// What the next call of `name` is for, in the model's words, sent before
+    /// its approval and its `ToolStarted`: a front end shows it in place of
+    /// the command or pattern.
+    ToolDescribed {
+        name: String,
+        description: String,
+    },
     /// What a `send_message` call says, right after its `ToolStarted`.
     MessageSent {
         to: String,
@@ -643,6 +650,9 @@ async fn run_turn_inner(
                 let answer = request_user_question(&call, &events).await.map(|answer| answer.describe());
                 finish_tool(&call, crate::tools::reply(answer), false, &mut messages, &events);
                 continue;
+            }
+            if let Some(description) = call.description() {
+                let _ = events.send(AgentEvent::ToolDescribed { name: call.name.clone(), description });
             }
 
             // The repeat-blocker exists to break mutation loops. Inspection is

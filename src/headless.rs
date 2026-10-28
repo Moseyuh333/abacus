@@ -199,7 +199,7 @@ pub async fn run(
             AgentEvent::AgentMessage { from, text } => {
                 eprintln!("note: {}", crate::agent::message_notice(&from, &text))
             }
-            AgentEvent::MessageSent { .. } => {}
+            AgentEvent::MessageSent { .. } | AgentEvent::ToolDescribed { .. } => {}
             AgentEvent::PeerMessage(message) => eprintln!("message {}: {}", message.origin(), message.text),
             AgentEvent::TraceFailed { error } => {
                 eprintln!("warning: training trace disabled — {error}");

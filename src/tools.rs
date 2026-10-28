@@ -164,6 +164,14 @@ impl ToolCall {
         }
     }
 
+    /// What the call is for, in the model's words, when it said: a front end
+    /// shows it in place of a command or pattern that reads poorly.
+    pub fn description(&self) -> Option<String> {
+        let args: Value = serde_json::from_str(&self.arguments).ok()?;
+        let description = crate::text::squeeze(args["description"].as_str()?);
+        (!description.is_empty()).then(|| crate::text::clip(&description, 120, "…"))
+    }
+
     pub fn needs_approval(&self) -> bool {
         matches!(
             self.name.as_str(),
@@ -999,6 +1007,12 @@ pub fn tool_specs() -> Vec<Value> {
             "Fast gitignore-aware regex search across workspace text files. Use this before opening files.",
             [
                 req("query", string("Rust-compatible regular expression")),
+                opt(
+                    "description",
+                    string(
+                        "Say what this is for in a few plain words, starting with an -ing verb: the person reads it in place of the pattern ('Finding every caller of stock_report')",
+                    ),
+                ),
                 opt("path", string("Workspace-relative path; defaults to .")),
                 opt("glob", strings("Optional include globs such as **/*.rs")),
                 opt("case_sensitive", boolean("Defaults to true")),
@@ -1011,6 +1025,12 @@ pub fn tool_specs() -> Vec<Value> {
             "Find files and directories by gitignore-aware glob pattern.",
             [
                 req("pattern", string("Glob such as src/**/*.rs")),
+                opt(
+                    "description",
+                    string(
+                        "Say what this is for in a few plain words, starting with an -ing verb: the person reads it in place of the glob ('Listing the migrations')",
+                    ),
+                ),
                 opt("path", string("Workspace-relative search root; defaults to .")),
                 opt("max_results", integer("Defaults to 500")),
             ],
@@ -1115,6 +1135,12 @@ pub fn tool_specs() -> Vec<Value> {
             "Run a shell command in the workspace.",
             [
                 req("command", string("Shell command")),
+                opt(
+                    "description",
+                    string(
+                        "Say what this is for in a few plain words, starting with an -ing verb: the person reads it in place of the command ('Running the unit tests', 'Checking which branch this is')",
+                    ),
+                ),
                 opt(
                     "timeout_seconds",
                     integer(
@@ -1503,6 +1529,29 @@ mod tests {
         assert_eq!(call("browser_click", r#"{"ref":7,"element":"Sign in button"}"#), "Sign in button");
         assert_eq!(call("browser_click", r#"{"ref":7}"#), "element 7");
         assert_eq!(call("browser_read_page", "{}"), "");
+    }
+
+    /// What a call is for reads in place of its command or pattern, when the
+    /// model said, and those tools offer the field.
+    #[test]
+    fn a_call_says_what_it_is_for_when_the_model_did() {
+        let call = |arguments: &str| {
+            super::ToolCall { id: "1".into(), name: "run_command".into(), arguments: arguments.into() }.description()
+        };
+        assert_eq!(
+            call(r#"{"command":"cargo test","description":"  Running the\n unit tests "}"#).as_deref(),
+            Some("Running the unit tests")
+        );
+        assert_eq!(call(r#"{"command":"cargo test","description":"  "}"#), None);
+        assert_eq!(call(r#"{"command":"cargo test"}"#), None);
+        let long = call(&format!(r#"{{"command":"x","description":"{}"}}"#, "a".repeat(300))).unwrap();
+        assert_eq!((long.chars().count(), long.ends_with('…')), (121, true), "clipped to 120, then the ellipsis");
+        let described: Vec<String> = super::tool_specs()
+            .iter()
+            .filter(|spec| spec["function"]["parameters"]["properties"].get("description").is_some())
+            .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(described, ["grep", "glob", "run_command"]);
     }
 
     #[test]

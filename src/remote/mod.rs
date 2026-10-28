@@ -385,7 +385,7 @@ impl Bridge {
             AgentEvent::AgentMessage { from, text } => {
                 self.notice(&crate::agent::message_notice(from, text), Level::Info)
             }
-            AgentEvent::MessageSent { .. } => {}
+            AgentEvent::MessageSent { .. } | AgentEvent::ToolDescribed { .. } => {}
             AgentEvent::PeerMessage(message) => {
                 self.notice(&format!("Message {}: {}", message.origin(), message.text), Level::Info)
             }

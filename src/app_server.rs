@@ -144,6 +144,8 @@ struct OpenItem {
     id: String,
     kind: &'static str,
     summary: String,
+    /// What the call is for, in the model's words.
+    description: Option<String>,
     /// What a `send_message` call said.
     message: Option<String>,
 }
@@ -155,6 +157,9 @@ impl OpenItem {
             "id": self.id, "type": self.kind, "name": name,
             "command": self.summary, "status": status,
         });
+        if let Some(description) = &self.description {
+            item["description"] = json!(description);
+        }
         if let Some(message) = &self.message {
             item["message"] = json!(message);
         }
@@ -183,6 +188,8 @@ struct App {
     turn_id: Option<String>,
     /// Tool name -> the item its call opened.
     open_items: HashMap<String, OpenItem>,
+    /// Tool name -> what its next call is for, until that call's item opens.
+    descriptions: HashMap<String, String>,
     /// Server-initiated requests waiting on the client, by request id.
     pending_approvals: HashMap<String, oneshot::Sender<ApprovalDecision>>,
     pending_questions: HashMap<String, oneshot::Sender<UserAnswer>>,
@@ -257,6 +264,7 @@ pub async fn run(
         cancel: Arc::new(AtomicBool::new(false)),
         turn_id: None,
         open_items: HashMap::new(),
+        descriptions: HashMap::new(),
         pending_approvals: HashMap::new(),
         pending_questions: HashMap::new(),
         pending_client_calls: HashMap::new(),
@@ -493,6 +501,9 @@ impl App {
                     // `from` an agent (`from.agent`), `report` on a report;
                     // a send_message call's item carries its `message`.
                     "subagentMessages": true,
+                    // A tool item, and a command's approval, carry the
+                    // model's `description` of what the call is for.
+                    "toolDescriptions": true,
                 },
                 "idleCompaction": self.config.idle_compaction,
                 "thread": self.thread_snapshot(),
@@ -1484,7 +1495,8 @@ impl App {
         if !self.open_items.contains_key(kind) {
             let id = self.next("item");
             self.item("started", json!({"id": id, "type": kind, "text": ""}));
-            self.open_items.insert(kind.to_owned(), OpenItem { id, kind, summary: String::new(), message: None });
+            let open = OpenItem { id, kind, summary: String::new(), description: None, message: None };
+            self.open_items.insert(kind.to_owned(), open);
         }
         let open = self.open_items.get_mut(kind).expect("opened above");
         open.summary.push_str(&text);
@@ -1502,8 +1514,13 @@ impl App {
 
     /// Open the item for a tool call and announce it at `status`.
     fn open_tool(&mut self, name: &str, summary: &str, status: &str) -> String {
-        let open =
-            OpenItem { id: self.next("item"), kind: item_type(name), summary: summary.to_owned(), message: None };
+        let open = OpenItem {
+            id: self.next("item"),
+            kind: item_type(name),
+            summary: summary.to_owned(),
+            description: self.descriptions.remove(name),
+            message: None,
+        };
         self.item("started", open.tool(name, status));
         let id = open.id.clone();
         self.open_items.insert(name.to_owned(), open);
@@ -1574,6 +1591,9 @@ impl App {
                 item["id"] = json!(self.next("item"));
                 self.item("completed", item);
             }
+            AgentEvent::ToolDescribed { name, description } => {
+                self.descriptions.insert(name, description);
+            }
             AgentEvent::MessageSent { text, .. } => {
                 if let Some(open) = self.open_items.get_mut("send_message") {
                     open.message = Some(text);
@@ -1592,6 +1612,7 @@ impl App {
                     Some(open) => open.id.clone(),
                     None => self.open_tool(&request.tool, &request.summary, "awaitingApproval"),
                 };
+                let description = self.open_items.get(&request.tool).and_then(|open| open.description.clone());
                 emit(json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -1610,6 +1631,7 @@ impl App {
                         "cwd": self.config.workspace,
                         "reason": request.reason,
                         "details": request.details,
+                        "description": description,
                         "availableDecisions": ["accept", "decline", "cancel"],
                     }
                 }));
@@ -2240,7 +2262,17 @@ fn history_items(messages: &[Value]) -> Vec<Value> {
             Some((id, call.summary()))
         })
         .collect();
-    // And what each `send_message` said, as the live item carries it.
+    // What each call was for, and what each `send_message` said, as the live
+    // items carry them.
+    let descriptions: HashMap<&str, String> = messages
+        .iter()
+        .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+        .filter_map(|call| {
+            let arguments = call["function"]["arguments"].as_str().unwrap_or_default();
+            let parsed = ToolCall { id: String::new(), name: String::new(), arguments: arguments.to_owned() };
+            Some((call["id"].as_str()?, parsed.description()?))
+        })
+        .collect();
     let sent: HashMap<&str, String> = messages
         .iter()
         .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
@@ -2312,6 +2344,9 @@ fn history_items(messages: &[Value]) -> Vec<Value> {
                 });
                 if let Some(summary) = message["tool_call_id"].as_str().and_then(|call| summaries.get(call)) {
                     item["command"] = json!(summary);
+                }
+                if let Some(description) = message["tool_call_id"].as_str().and_then(|call| descriptions.get(call)) {
+                    item["description"] = json!(description);
                 }
                 if let Some(said) = message["tool_call_id"].as_str().and_then(|call| sent.get(call)) {
                     item["message"] = json!(said);
@@ -2514,6 +2549,28 @@ mod tests {
         assert_eq!(items[1]["from"]["title"], "callers, perf");
         assert_eq!(items[2]["command"], "perf");
         assert_eq!(items[2]["message"], "keep the keys");
+    }
+
+    /// A reopened thread shows what each call was for, as the live one did.
+    #[test]
+    fn history_keeps_what_each_call_was_for() {
+        let items = history_items(&[
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "run_command",
+                     "arguments": "{\"command\": \"git status -sb\", \"description\": \"Checking which branch this is\"}"}},
+                    {"id": "call_2", "type": "function", "function": {"name": "run_command",
+                     "arguments": "{\"command\": \"ls\"}"}},
+                ],
+            }),
+            json!({"role": "tool", "name": "run_command", "tool_call_id": "call_1", "content": "## main"}),
+            json!({"role": "tool", "name": "run_command", "tool_call_id": "call_2", "content": "src"}),
+        ]);
+        assert_eq!(items[0]["command"], "git status -sb");
+        assert_eq!(items[0]["description"], "Checking which branch this is");
+        assert!(items[1].get("description").is_none());
     }
 
     /// A reopened thread shows where compaction cut its history, and how
