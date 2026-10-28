@@ -88,6 +88,13 @@ pub fn reply(result: Result<String>) -> String {
     result.unwrap_or_else(|error| format!("Error: {error:#}"))
 }
 
+/// A call's arguments, for a tool that is handed them as JSON. A call to a
+/// tool that takes nothing may come with no arguments at all rather than
+/// `{}`: some models send that, and it means the same.
+pub fn call_arguments(arguments: &str) -> serde_json::Result<Value> {
+    if arguments.trim().is_empty() { Ok(json!({})) } else { serde_json::from_str(arguments) }
+}
+
 /// `output`, or `note` when there was none.
 fn or_note(output: String, note: &str) -> String {
     if output.trim().is_empty() { note.to_owned() } else { output }

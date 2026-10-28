@@ -100,7 +100,7 @@ impl ClientTools {
         if !self.tools.contains_key(name) {
             return None;
         }
-        let arguments = match serde_json::from_str::<Value>(arguments) {
+        let arguments = match crate::tools::call_arguments(arguments) {
             Ok(value) => value,
             Err(error) => return Some(error_result(&format!("invalid arguments: {error}"))),
         };
@@ -192,5 +192,20 @@ mod tests {
         drop(calls);
         let result = tools.execute("browser_click", r#"{"ref": 3}"#).await.unwrap();
         assert!(result.text.starts_with("Error:"), "{}", result.text);
+    }
+
+    /// A model may call a tool that takes nothing with no arguments at all;
+    /// that once failed every `browser_screenshot` before it reached the window.
+    #[tokio::test]
+    async fn a_call_with_no_arguments_reaches_the_front_end() {
+        let (tools, mut calls) = browser(&[]).unwrap();
+        let front_end = tokio::spawn(async move {
+            let call = calls.recv().await.unwrap();
+            assert_eq!(call.arguments, json!({}));
+            call.respond.send(ClientResult { text: "Clicked".into(), images: Vec::new() }).unwrap();
+        });
+        let result = tools.execute("browser_click", "").await.unwrap();
+        front_end.await.unwrap();
+        assert_eq!(result.text, "Clicked");
     }
 }

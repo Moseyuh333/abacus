@@ -209,7 +209,7 @@ impl McpManager {
     pub async fn execute(&self, name: &str, arguments: &str) -> Option<String> {
         let tool = self.tools.get(name)?;
         let result = async {
-            let arguments: Value = serde_json::from_str(arguments).context("invalid MCP arguments")?;
+            let arguments = crate::tools::call_arguments(arguments).context("invalid MCP arguments")?;
             let client = self.servers.get(&tool.server).context("MCP server is not connected")?;
             let result = client.request("tools/call", json!({"name":tool.original_name,"arguments":arguments})).await?;
             format_tool_result(&result)
