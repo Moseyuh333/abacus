@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.2 — 2026-10-28
+
+Two changes to what a front end shows of the agent's work. The Abacus Desktop
+release that goes with it shows both.
+
+- **Commands and searches say what they are for.** `run_command`, `grep` and
+  `glob` take an optional `description`: the model's few words on what the
+  call is for, such as "Running the unit tests" or "Checking which branch this
+  is". The app server puts it on the call's item and on a command's approval,
+  so a client can show it in place of the raw command or pattern, and a
+  reopened thread keeps it.
+
+- **Subagents' messages and reports arrive as what they are.** A subagent's
+  message, and the report of background subagents that finished, reached a
+  client as the prompts that carried them, and arriving mid-turn they showed
+  only as a warning. They are now `userMessage` items from the agent that sent
+  them (`report` set on a report): mid-turn, when they open a turn, and in a
+  reopened thread. A `send_message` call's item carries the message, and a
+  worker's transcript gets the messages it received. In a report, each
+  worker's answer starts on its own line after its status.
+
 ## 0.7.1 — 2026-10-27
 
 This release reworks how Abacus is configured and how it asks permission. It
