@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.4 — 2026-10-28
+
+The arm64 Linux build runs on older systems. Nothing else changed.
+
+- **arm64 Linux needs glibc 2.34, not 2.39.** 0.7.3's arm64 binary did not
+  start on Ubuntu 22.04, Debian 12 or RHEL 9, and so not on Jetson boards or
+  Raspberry Pi OS either. It is now built on Ubuntu 22.04 and needs glibc 2.34,
+  like the x86_64 binary, and a release checks that both Linux binaries start
+  on 2.34.
+
 ## 0.7.3 — 2026-10-28
 
 Abacus for Linux on arm64. Nothing else changed.
