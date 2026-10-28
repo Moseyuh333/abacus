@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.5 — 2026-10-28
+
+What Abacus Desktop 0.1.5 builds on, a fix for its browser, and the reasoning
+effort sent as chosen.
+
+- **Browser screenshots work.** A model may call a tool that takes nothing with
+  empty arguments rather than `{}`, and front-end and MCP tools failed on that:
+  every `browser_screenshot` and `browser_read_page` a Claude model made in
+  Abacus Desktop came back as "invalid arguments", so it concluded the browser
+  could not see pages. Empty arguments now mean `{}`.
+- **A screenshot is not shown as your message.** The image a tool shows the
+  model follows its result unannounced; the transcript used to show it as
+  "[browser_screenshot: 1 image(s) attached]" from you, and the image itself in
+  a reopened thread. Threads saved before this are cleaned up too.
+- **The reasoning effort you choose is the one sent.** XHigh and Max went out as
+  "high" on OpenAI-shaped endpoints, and models that refuse "high" failed at
+  both. The level is sent as chosen; when an endpoint refuses it and lists what
+  it takes, the nearest level at or below the choice is used from then on.
+- **Front ends run the terminal's text commands** — `/memory`, `/goal`,
+  `/usage`, `/repair` and `/tools` — and set the steps per turn and the tool
+  output kept. The steps per turn default to 128, which is what actually ran
+  before (512 was clamped), and go up to 1024.
+- **Front ends see the goal and the task list.** The thread carries both, and
+  the app server reports each change, so a window can pin them as the
+  terminal's task strip does.
+
 ## 0.7.4 — 2026-10-28
 
 The arm64 Linux build runs on older systems. Nothing else changed.
