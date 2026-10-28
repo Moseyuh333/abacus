@@ -18,7 +18,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             binary: abacus
-          - os: ubuntu-24.04-arm
+          # 22.04, not 24.04: aarch64 links with GNU ld, which on 24.04 makes
+          # the binary need glibc 2.39. Built here it needs 2.34, like x86_64.
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             binary: abacus
           - os: macos-15-intel
@@ -42,6 +44,17 @@ jobs:
       - name: Stage binary (Unix)
         if: runner.os != 'Windows'
         run: cp target/${{ matrix.target }}/release/${{ matrix.binary }} abacus-${{ matrix.target }}
+      - name: Check the glibc it needs (Linux)
+        if: runner.os == 'Linux'
+        # The newest glibc version the binary cannot start without (a weak
+        # need may be missing). 2.34 is Ubuntu 22.04, Debian 12 and RHEL 9.
+        run: |
+          need=$(readelf -V -W abacus-${{ matrix.target }} | awk '/Name: GLIBC_/ && $5 != "WEAK" { sub("GLIBC_", "", $3); print $3 }' | sort -uV | tail -n 1)
+          echo "abacus-${{ matrix.target }} needs glibc $need"
+          if [ "$(printf '%s\n' "$need" 2.34 | sort -V | tail -n 1)" != 2.34 ]; then
+            echo "::error::abacus-${{ matrix.target }} needs glibc $need; a release must start on 2.34"
+            exit 1
+          fi
       - name: Stage binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
