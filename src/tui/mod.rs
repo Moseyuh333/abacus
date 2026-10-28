@@ -39,7 +39,7 @@ use ratatui::{
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     io::{self, Stdout},
     sync::{
         Arc,
@@ -257,19 +257,6 @@ struct UsagePanel {
     records: Vec<SessionUsage>,
     tab: UsageTab,
     range: UsageRange,
-}
-
-#[derive(Default)]
-struct UsageStats {
-    sessions: usize,
-    total_tokens: u64,
-    tokens_estimated: bool,
-    favorite_model: Option<String>,
-    active_days: usize,
-    most_active_day: Option<NaiveDate>,
-    longest_session: u64,
-    longest_streak: usize,
-    current_streak: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

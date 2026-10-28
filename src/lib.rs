@@ -3,6 +3,7 @@ pub mod agent;
 pub mod app_server;
 pub mod client_tools;
 pub mod clipboard;
+pub mod commands;
 pub mod compaction;
 pub mod config;
 pub mod console;

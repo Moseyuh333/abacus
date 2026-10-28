@@ -550,6 +550,86 @@ async fn app_server_completes_commands_and_files_and_expands_what_the_person_typ
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
 }
 
+/// The terminal's text commands, as the desktop runs them: each answers with
+/// what to show, `/goal` starts a turn on its objective, and the agent's limits
+/// are settings the window can change.
+#[tokio::test]
+async fn app_server_runs_the_terminal_commands_and_writes_the_agent_limits() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let sync = sync_server::SyncServer::start("secret-token").await;
+    let device = SignedIn::new(&sync, "secret-token");
+    let (model, requests) = recording_model_endpoint();
+    let mut child = device
+        .command(&model, &["app-server"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let request = |id: u32, method: &str, params: serde_json::Value| {
+        format!("{}\n", serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+    };
+    let run = |name: &str, argument: &str| serde_json::json!({"name": name, "argument": argument});
+    for frame in [
+        request(1, "initialize", serde_json::json!({})),
+        request(2, "config/value/write", serde_json::json!({"key": "max_steps", "value": 300})),
+        request(3, "config/value/write", serde_json::json!({"key": "max_steps", "value": 5000})),
+        request(4, "config/value/write", serde_json::json!({"key": "tool_output_limit", "value": 50_000})),
+        request(5, "command/run", run("memory", "")),
+        request(6, "command/run", run("tools", "")),
+        request(7, "command/run", run("repair", "")),
+        request(8, "command/run", run("memory", "nonsense")),
+        request(9, "command/run", run("goal", "tidy the parser")),
+    ] {
+        input.write_all(frame.as_bytes()).await.unwrap();
+    }
+
+    let mut replies = std::collections::HashMap::new();
+    let mut user_item = serde_json::Value::Null;
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if let Some(id) = frame["id"].as_u64() {
+                replies.insert(id, frame.clone());
+            }
+            if frame["method"] == "item/completed" && frame["params"]["item"]["type"] == "userMessage" {
+                user_item = frame["params"]["item"].clone();
+            }
+            if frame["method"] == "turn/completed" {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(finished, Ok(true), "the goal's turn should complete");
+
+    let initialize = &replies[&1]["result"];
+    assert_eq!(initialize["capabilities"]["commandRun"], true);
+    assert_eq!(initialize["maxSteps"], 128, "the default is what runs");
+    assert_eq!(replies[&2]["result"]["maxSteps"], 300, "above the old ceiling of 128");
+    assert!(replies[&3]["error"]["message"].as_str().unwrap().contains("between 1 and 1024"));
+    assert_eq!(replies[&4]["result"]["toolOutputLimit"], 50_000);
+    let text = |id: u64| replies[&id]["result"]["text"].as_str().unwrap_or_default().to_owned();
+    assert!(text(5).starts_with("No memories here yet"), "{}", text(5));
+    assert!(text(6).contains("Tools: ") && text(6).contains("read_file"), "{}", text(6));
+    assert!(text(7).starts_with("No corruption found"), "{}", text(7));
+    assert!(replies[&8]["error"]["message"].as_str().unwrap().contains("Usage: /memory"));
+    assert_eq!(text(9), "Goal set: tidy the parser");
+    assert_eq!(user_item["text"], "tidy the parser");
+    assert!(requests.lock().unwrap().join("\n").contains("tidy the parser"), "the goal reaches the model");
+
+    let settings = std::fs::read_to_string(device.directory.path().join("home/config.toml")).unwrap_or_default();
+    assert!(settings.contains("max_steps = 300"), "saved for the next session too:\n{settings}");
+
+    input.write_all(request(10, "shutdown", serde_json::json!({})).as_bytes()).await.unwrap();
+    drop(input);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
+}
+
 /// A model endpoint whose reply to each chat request `answer` picks from the
 /// request itself, and that keeps every request.
 fn scripted_model_endpoint(answer: fn(&str) -> String) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {

@@ -1,6 +1,7 @@
 //! The `/usage` panel: activity heatmap, totals, and the per-model breakdown.
 
 use super::*;
+use crate::commands::{UsageStats, format_duration, usage_date, usage_stats};
 
 pub(super) fn draw_usage(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(panel) = &app.usage_panel else {
@@ -154,48 +155,6 @@ pub(super) fn usage_legend() -> Line<'static> {
     ])
 }
 
-pub(super) fn usage_stats(records: &[&SessionUsage], today: NaiveDate) -> UsageStats {
-    let mut stats = UsageStats { sessions: records.len(), ..UsageStats::default() };
-    let mut dates = HashSet::new();
-    let mut daily = BTreeMap::<NaiveDate, u64>::new();
-    let mut models = HashMap::<String, (usize, u64)>::new();
-    for record in records {
-        let date = usage_date(record);
-        dates.insert(date);
-        *daily.entry(date).or_default() += record.tokens_used.max(1);
-        let model = models.entry(record.model.clone()).or_default();
-        model.0 += 1;
-        model.1 = model.1.saturating_add(record.tokens_used);
-        stats.total_tokens = stats.total_tokens.saturating_add(record.tokens_used);
-        stats.tokens_estimated |= record.tokens_estimated;
-        stats.longest_session = stats.longest_session.max(record.active_secs);
-    }
-    stats.active_days = dates.len();
-    stats.favorite_model =
-        models.into_iter().max_by_key(|(_, (sessions, tokens))| (*tokens, *sessions)).map(|(model, _)| model);
-    stats.most_active_day = daily.into_iter().max_by_key(|(_, activity)| *activity).map(|(date, _)| date);
-
-    let mut sorted_dates = dates.into_iter().collect::<Vec<_>>();
-    sorted_dates.sort_unstable();
-    let mut run = 0;
-    let mut previous = None;
-    for date in &sorted_dates {
-        run = if previous.is_some_and(|value| *date == value + ChronoDuration::days(1)) { run + 1 } else { 1 };
-        stats.longest_streak = stats.longest_streak.max(run);
-        previous = Some(*date);
-    }
-    if let Some(last) = sorted_dates.last().copied()
-        && last >= today - ChronoDuration::days(1)
-    {
-        let mut date = last;
-        while sorted_dates.binary_search(&date).is_ok() {
-            stats.current_streak += 1;
-            date -= ChronoDuration::days(1);
-        }
-    }
-    stats
-}
-
 pub(super) fn usage_stats_wide(stats: &UsageStats, width: usize) -> Vec<Line<'static>> {
     let left_width = width / 2;
     vec![
@@ -295,28 +254,6 @@ pub(super) fn usage_model_lines(records: &[&SessionUsage], current_model: &str, 
         ]));
     }
     lines
-}
-
-pub(super) fn usage_date(record: &SessionUsage) -> NaiveDate {
-    record.created_at.with_timezone(&Local).date_naive()
-}
-
-pub(super) fn format_duration(seconds: u64) -> String {
-    if seconds == 0 {
-        return "—".to_owned();
-    }
-    let days = seconds / 86_400;
-    let hours = seconds % 86_400 / 3_600;
-    let minutes = seconds % 3_600 / 60;
-    if days > 0 {
-        format!("{days}d {hours}h {minutes}m")
-    } else if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else if minutes > 0 {
-        format!("{minutes}m")
-    } else {
-        format!("{seconds}s")
-    }
 }
 
 impl App {

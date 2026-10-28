@@ -504,8 +504,15 @@ impl App {
                     // A tool item, and a command's approval, carry the
                     // model's `description` of what the call is for.
                     "toolDescriptions": true,
+                    // command/run answers /memory, /goal, /usage, /repair
+                    // and /tools; `max_steps` and `tool_output_limit` are
+                    // writable config keys.
+                    "commandRun": true,
+                    "agentLimits": true,
                 },
                 "idleCompaction": self.config.idle_compaction,
+                "maxSteps": self.config.max_steps,
+                "toolOutputLimit": self.config.tool_output_limit,
                 "thread": self.thread_snapshot(),
             })),
             "shutdown" => Ok(json!({})),
@@ -655,6 +662,14 @@ impl App {
                     |command| json!({"name": command.name, "description": command.description, "kind": "plugin"}),
                 ));
                 Ok(json!({"commands": commands}))
+            }
+            // The terminal's commands that answer with text: the window shows
+            // what they say. `/goal` may start a turn as well, as it does in
+            // the terminal.
+            "command/run" => {
+                let name = params["name"].as_str().ok_or_else(|| anyhow!("name required"))?;
+                let argument = params["argument"].as_str().unwrap_or_default().trim();
+                self.run_command(name, argument, events)
             }
             "tools/register" => {
                 let calls = self.client_calls.clone().ok_or_else(|| anyhow!("front-end tools are not available"))?;
@@ -959,9 +974,74 @@ impl App {
                     self.stop_idle_compaction();
                 }
             }
+            // Saved for every session; the next turn runs with them.
+            "max_steps" => {
+                let steps = value.as_u64().ok_or_else(|| anyhow!("max_steps must be a number"))? as usize;
+                crate::config::check_max_steps(steps)?;
+                self.settings.agent.max_steps = steps;
+                self.settings.save(&self.config.paths)?;
+                self.config.max_steps = steps;
+            }
+            "tool_output_limit" => {
+                let limit = value.as_u64().ok_or_else(|| anyhow!("tool_output_limit must be a number"))? as usize;
+                crate::config::check_tool_output_limit(limit)?;
+                self.settings.agent.tool_output_limit = limit;
+                self.settings.save(&self.config.paths)?;
+                self.config.tool_output_limit = limit;
+            }
             other => return Err(anyhow!("`{other}` is not a writable key")),
         }
         Ok(self.config_state())
+    }
+
+    /// One of the terminal's text-answering commands, for `command/run`.
+    fn run_command(&mut self, name: &str, argument: &str, events: &mpsc::UnboundedSender<AgentEvent>) -> Result<Value> {
+        let text = match name {
+            "memory" | "memories" => crate::commands::memory(&self.thread.state.memories, argument)?,
+            "tools" | "skills" | "plugins" | "mcps" => crate::commands::extensions(&self.services),
+            "repair" => {
+                self.require_idle()?;
+                let (said, repaired) = crate::commands::repair(&mut self.thread.messages);
+                if repaired && self.thread.persisted {
+                    self.persist();
+                }
+                said
+            }
+            "usage" => {
+                // The open thread counts too, as of now.
+                if self.thread.persisted {
+                    self.persist();
+                }
+                let store = self.store.as_ref().ok_or_else(|| anyhow!("sessions off"))?;
+                crate::commands::usage_report(
+                    &store.usage()?,
+                    &self.config.model_ref(),
+                    chrono::Local::now().date_naive(),
+                )
+            }
+            "goal" => {
+                let reply = crate::commands::goal(&self.thread.state.goal, argument);
+                if reply.paused {
+                    self.cancel.store(true, Ordering::Relaxed);
+                }
+                let said = reply.said.map_err(|error| anyhow!("goal error: {error:#}"))?;
+                if self.thread.persisted {
+                    self.persist();
+                }
+                if let Some((shown, prompt)) = reply.start {
+                    // Mid-turn it steers, as anything sent then does.
+                    if self.turn_id.is_some() {
+                        self.thread.state.injections.push(crate::agent::Injection::UserMessage(prompt));
+                    } else {
+                        let content = self.user_content(&prompt, Vec::new());
+                        self.start_turn(content, Some(shown), events);
+                    }
+                }
+                return Ok(json!({"text": said, "turnId": self.turn_id}));
+            }
+            other => return Err(anyhow!("`/{other}` is not a command the app server runs")),
+        };
+        Ok(json!({"text": text}))
     }
 
     fn mode(&self) -> Permission {
@@ -984,6 +1064,8 @@ impl App {
             "contextWindow": self.config.model_limits.context_window,
             "needsSetup": !self.config.is_configured(),
             "idleCompaction": self.config.idle_compaction,
+            "maxSteps": self.config.max_steps,
+            "toolOutputLimit": self.config.tool_output_limit,
         })
     }
 

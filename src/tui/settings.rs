@@ -354,12 +354,8 @@ pub(super) fn validate_settings(settings: &Settings) -> Result<()> {
             .with_context(|| format!("the active profile's provider `{provider}` does not exist"))?;
         reqwest::Url::parse(&provider.base_url).context("the provider's base URL is invalid")?;
     }
-    if !(1..=128).contains(&settings.agent.max_steps) {
-        bail!("max steps must be between 1 and 128");
-    }
-    if !(2_000..=200_000).contains(&settings.agent.tool_output_limit) {
-        bail!("tool output limit must be between 2000 and 200000");
-    }
+    crate::config::check_max_steps(settings.agent.max_steps)?;
+    crate::config::check_tool_output_limit(settings.agent.tool_output_limit)?;
     if settings.feedback.enabled {
         crate::feedback::FeedbackClient::new(&settings.feedback.endpoint)?;
     }
@@ -525,8 +521,9 @@ impl App {
         {
             self.config.model_limits = before.2;
         }
-        self.config.max_steps = self.settings.agent.max_steps.clamp(1, 128);
-        self.config.tool_output_limit = self.settings.agent.tool_output_limit.clamp(2_000, 200_000);
+        let (steps, output) = (crate::config::MAX_STEPS, crate::config::TOOL_OUTPUT_LIMIT);
+        self.config.max_steps = self.settings.agent.max_steps.clamp(*steps.start(), *steps.end());
+        self.config.tool_output_limit = self.settings.agent.tool_output_limit.clamp(*output.start(), *output.end());
         self.config.token_compression = self.settings.agent.token_compression;
         self.config.one_stream = self.settings.agent.one_stream;
         self.config.prompt_cache = self.settings.agent.prompt_cache;
@@ -939,16 +936,12 @@ impl App {
                 ConfigKey::SearchApiKeyEnv => self.settings.search.api_key_env = optional(trimmed),
                 ConfigKey::MaxSteps => {
                     let number = trimmed.parse::<usize>().context("max steps must be a number")?;
-                    if !(1..=128).contains(&number) {
-                        bail!("max steps must be between 1 and 128");
-                    }
+                    crate::config::check_max_steps(number)?;
                     self.settings.agent.max_steps = number;
                 }
                 ConfigKey::ToolOutputLimit => {
                     let number = trimmed.parse::<usize>().context("tool output limit must be a number")?;
-                    if !(2_000..=200_000).contains(&number) {
-                        bail!("tool output limit must be between 2000 and 200000");
-                    }
+                    crate::config::check_tool_output_limit(number)?;
                     self.settings.agent.tool_output_limit = number;
                 }
                 ConfigKey::ContentWidth => {

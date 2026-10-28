@@ -17,11 +17,6 @@ pub(super) fn expiry(seconds: u64) -> String {
     format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
 }
 
-/// The row a 1-based `number` names in a listing.
-pub(super) fn numbered<'a, T>(rows: &'a [T], number: &str) -> Option<&'a T> {
-    rows.get(number.trim().parse::<usize>().ok()?.saturating_sub(1))
-}
-
 impl App {
     /// Run `input` if it is a slash command. Returns whether it was one.
     pub(super) fn slash_command(&mut self, input: &str) -> bool {
@@ -308,41 +303,10 @@ impl App {
         self.report(result, format!("effort {label}"), "configuration error");
     }
 
-    /// `/tools`: everything the agent can reach — its tools, then what
-    /// extensions add: skills, plugin commands, MCP tools.
+    /// `/tools`: everything the agent can reach.
     pub(super) fn list_extensions(&mut self) {
-        let services = self.services.clone();
-        let mut names: Vec<String> = services
-            .tool_specs()
-            .iter()
-            .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_owned))
-            .collect();
-        names.extend(["goal_status", "goal_update", "spawn_subagents"].map(str::to_owned));
-        let mut sections = vec![format!("Tools: {}", names.join(", "))];
-        let skills: Vec<String> = services
-            .skills
-            .read()
-            .expect("skill registry lock")
-            .list()
-            .map(|skill| format!("  /{}  {}", skill.name, skill.description))
-            .collect();
-        if !skills.is_empty() {
-            sections.push(format!("Skills (run one with /<name>):\n{}", skills.join("\n")));
-        }
-        let plugins: Vec<String> = services
-            .plugins
-            .list()
-            .map(|plugin| format!("  {} {}  {}", plugin.name, plugin.version, plugin.description))
-            .collect();
-        if !plugins.is_empty() {
-            sections.push(format!("Plugins:\n{}", plugins.join("\n")));
-        }
-        let mcp: Vec<String> =
-            services.mcp.tools().map(|tool| format!("  {}  {}", tool.exposed_name, tool.description)).collect();
-        if !mcp.is_empty() {
-            sections.push(format!("MCP tools:\n{}", mcp.join("\n")));
-        }
-        self.say(sections.join("\n\n"));
+        let listing = crate::commands::extensions(&self.services);
+        self.say(listing);
     }
 
     pub(super) fn mode_command(&mut self, argument: &str) {
@@ -384,46 +348,21 @@ impl App {
             self.status = "cannot repair while a turn is running".to_owned();
             return;
         }
-        let fixes = crate::session::repair_messages(&mut self.messages);
-        if fixes.is_empty() {
-            return self.say("No corruption found: every tool call parses and has a result.");
+        let (said, repaired) = crate::commands::repair(&mut self.messages);
+        if repaired {
+            self.ctx_chars = message_chars(&self.messages);
+            self.persist_session();
         }
-        self.ctx_chars = message_chars(&self.messages);
-        self.persist_session();
-        self.say(format!("Repaired the session history: {}.", fixes.join("; ")));
+        self.say(said);
     }
 
     /// `/memory`: what Abacus remembers in this workspace, numbered, and
     /// `forget` to remove one.
     pub(super) fn memory_command(&mut self, argument: &str) {
-        let argument = argument.trim();
-        let (verb, rest) =
-            argument.split_once(char::is_whitespace).map_or((argument, ""), |(verb, rest)| (verb, rest.trim()));
-        // One ordering for display and forgetting alike, or the numbers shown
-        // would target different entries.
-        let memories = self.state.memories.snapshot();
-        match verb {
-            "" => {}
-            "forget" | "delete" => {
-                let reference = rest.to_ascii_lowercase();
-                if let Some(memory) = numbered(&memories, reference.strip_prefix('m').unwrap_or(&reference))
-                    && self.state.memories.remove(memory.id)
-                {
-                    return self.say(format!("Memory \"{}\" forgotten.", memory.title));
-                }
-                return self.fail("Usage: /memory forget m<number> — numbers from /memory");
-            }
-            _ => return self.fail("Usage: /memory [forget m1]"),
+        match crate::commands::memory(&self.state.memories, argument) {
+            Ok(said) => self.say(said),
+            Err(error) => self.fail(error.to_string()),
         }
-        if memories.is_empty() {
-            return self.say("No memories here yet. Abacus records facts and decisions worth keeping as it works.");
-        }
-        let mut lines = vec![format!("Memories ({}), newest first:", memories.len())];
-        lines.extend(memories.iter().enumerate().map(|(index, memory)| {
-            format!("  m{}. {} — {}", index + 1, memory.title, ui::truncate(&memory.body, 120))
-        }));
-        lines.push("/memory forget m1 removes one.".to_owned());
-        self.say(lines.join("\n"));
     }
 
     /// Shift+Tab: AUTO and YOLO, back and forth, for this session.
@@ -432,71 +371,25 @@ impl App {
     }
 
     pub(super) fn goal_command(&mut self, argument: &str) {
-        let argument = argument.trim();
-        let (result, start_prompt) = if argument.is_empty() {
-            (
-                Ok(self
-                    .state
-                    .goal
-                    .snapshot()
-                    .map(|goal| {
-                        format!(
-                            "Goal · {:?}\n{}{}",
-                            goal.status,
-                            goal.objective,
-                            goal.note.map(|note| format!("\n\nLatest update: {note}")).unwrap_or_default()
-                        )
-                    })
-                    .unwrap_or_else(|| "No goal is set. Use /goal <objective>.".to_owned())),
-                None,
-            )
-        } else if argument == "pause" {
-            let result = self.state.goal.pause().map(|_| "Goal paused. Use /goal resume when ready.".to_owned());
-            if result.is_ok()
-                && let Some(handle) = self.running.take()
+        let reply = crate::commands::goal(&self.state.goal, argument);
+        if reply.paused
+            && let Some(handle) = self.running.take()
+        {
+            handle.abort();
+            self.approval = None;
+            self.receiving_delta = false;
+            if let Some(state) = &mut self.ralph_loop
+                && state.is_active()
             {
-                handle.abort();
-                self.approval = None;
-                self.receiving_delta = false;
-                if let Some(state) = &mut self.ralph_loop
-                    && state.is_active()
-                {
-                    let _ = state.pause();
-                }
+                let _ = state.pause();
             }
-            (result, None)
-        } else if argument == "resume" {
-            match self.state.goal.resume() {
-                Ok(goal) => (Ok("Goal resumed.".to_owned()), Some(("Resume goal".to_owned(), goal.objective))),
-                Err(error) => (Err(error), None),
-            }
-        } else if argument == "clear" {
-            (self.state.goal.set(None).map(|()| "Goal cleared.".to_owned()), None)
-        } else if matches!(argument, "done" | "complete") {
-            (
-                Ok(self
-                    .state
-                    .goal
-                    .execute("goal_update", r#"{"status":"complete"}"#)
-                    .unwrap_or_else(|| "Error: no goal is set".to_owned())),
-                None,
-            )
-        } else if let Some(objective) = argument.strip_prefix("edit ") {
-            (self.state.goal.edit(objective).map(|goal| format!("Goal updated: {}", goal.objective)), None)
-        } else {
-            match self.state.goal.create(argument) {
-                Ok(goal) => {
-                    (Ok(format!("Goal set: {}", goal.objective)), Some((goal.objective.clone(), goal.objective)))
-                }
-                Err(error) => (Err(error), None),
-            }
-        };
-        match result {
+        }
+        match reply.said {
             Ok(text) => self.say(text),
             Err(error) => self.fail(format!("Goal error: {error:#}")),
         }
         self.persist_session();
-        if let Some((display, prompt)) = start_prompt {
+        if let Some((display, prompt)) = reply.start {
             self.start_turn(display, prompt, true);
         }
     }

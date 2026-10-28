@@ -538,8 +538,9 @@ impl Config {
 
     /// The settings that are the agent's rather than the model's.
     fn apply_agent_settings(&mut self, cli: &Cli, settings: &Settings) {
-        self.max_steps = cli.max_steps.unwrap_or(settings.agent.max_steps).clamp(1, 128);
-        self.tool_output_limit = settings.agent.tool_output_limit.clamp(2_000, 200_000);
+        self.max_steps = cli.max_steps.unwrap_or(settings.agent.max_steps).clamp(*MAX_STEPS.start(), *MAX_STEPS.end());
+        self.tool_output_limit =
+            settings.agent.tool_output_limit.clamp(*TOOL_OUTPUT_LIMIT.start(), *TOOL_OUTPUT_LIMIT.end());
         self.permission = if cli.yes { Permission::Yolo } else { cli.mode.unwrap_or(settings.agent.mode) };
         self.no_session = cli.no_session;
         self.trace_enabled = settings.trace.enabled;
@@ -1358,12 +1359,39 @@ impl Default for UiSettings {
     }
 }
 
+/// What `max_steps` may be set to. The default used to read 512 while every
+/// load clamped it to 128; the default is now what runs, and the ceiling is
+/// high enough for long unattended turns.
+pub const MAX_STEPS: std::ops::RangeInclusive<usize> = 1..=1024;
+/// What `tool_output_limit` may be set to, in characters.
+pub const TOOL_OUTPUT_LIMIT: std::ops::RangeInclusive<usize> = 2_000..=200_000;
+
+/// `max_steps` as the terminal's settings and the app server accept it.
+pub fn check_max_steps(steps: usize) -> Result<()> {
+    if !MAX_STEPS.contains(&steps) {
+        bail!("max steps must be between {} and {}", MAX_STEPS.start(), MAX_STEPS.end());
+    }
+    Ok(())
+}
+
+/// `tool_output_limit` as the terminal's settings and the app server accept it.
+pub fn check_tool_output_limit(characters: usize) -> Result<()> {
+    if !TOOL_OUTPUT_LIMIT.contains(&characters) {
+        bail!("tool output limit must be between {} and {}", TOOL_OUTPUT_LIMIT.start(), TOOL_OUTPUT_LIMIT.end());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentSettings {
     /// AUTO reviews what could do harm before it runs; YOLO runs everything.
     pub mode: Permission,
+    /// Model round trips one turn may take before it stops, within
+    /// [`MAX_STEPS`].
     pub max_steps: usize,
+    /// Characters of tool output kept before truncation, within
+    /// [`TOOL_OUTPUT_LIMIT`].
     pub tool_output_limit: usize,
     /// Balanced high-savings mode for upstream tokens.
     #[serde(default)]
@@ -1441,7 +1469,7 @@ impl Default for AgentSettings {
     fn default() -> Self {
         Self {
             mode: Permission::Auto,
-            max_steps: 512,
+            max_steps: 128,
             tool_output_limit: 30_000,
             token_compression: false,
             one_stream: false,
