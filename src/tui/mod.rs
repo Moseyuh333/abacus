@@ -1140,6 +1140,8 @@ fn entries_from_messages(messages: &[Value]) -> Vec<Entry> {
             continue;
         }
         match role {
+            // A screenshot a tool showed the model: nobody said it.
+            "user" if crate::agent::is_tool_images(content) => {}
             "user" => entries.push(match crate::inbox::shown(content) {
                 // Another session's message, shown as it was when it arrived.
                 Some((title, text)) => Entry::new(EntryKind::System, format!("Message from \"{title}\": {text}")),
@@ -2985,6 +2987,8 @@ impl App {
                     self.show_peer_message(&message);
                     self.start_turn(String::new(), message.prompt(&self.config.workspace), false);
                 }
+                // A tool's images belong to the turn that called it.
+                Injection::ToolImages { .. } => {}
             }
         }
         pending.for_each(|injection| self.state.injections.push(injection));

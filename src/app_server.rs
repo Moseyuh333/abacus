@@ -1865,7 +1865,7 @@ impl App {
                 self.begin_turn(Value::String(message.prompt(&self.config.workspace)), item, events);
                 return;
             }
-            Some(Injection::SideNote(_)) | None => return,
+            Some(Injection::SideNote(_) | Injection::ToolImages { .. }) | None => return,
         };
         let item = user_item(&content);
         self.begin_turn(content, item, events);
@@ -1947,12 +1947,11 @@ impl App {
         if let Some((name, responder)) = self.pending_client_calls.remove(id) {
             let mut answer = crate::client_tools::read_result(result, error);
             // Tool results are text; a screenshot reaches the model as an image
-            // in the message that follows the call, the way steering does.
+            // in the message that follows the call, which the transcript
+            // leaves out: nobody sent it.
             let images = std::mem::take(&mut answer.images);
             if !images.is_empty() {
-                let text = format!("[{name}: {} image(s) attached]", images.len());
-                let content = crate::context::with_images(json!(format!("The image(s) {name} returned:")), images);
-                self.thread.state.injections.push(crate::agent::Injection::UserContent { text, content });
+                self.thread.state.injections.push(crate::agent::Injection::ToolImages { tool: name.clone(), images });
             }
             let _ = responder.send(answer);
             return;
@@ -2438,6 +2437,10 @@ fn history_items(messages: &[Value]) -> Vec<Value> {
             }
             "user" => {
                 let said = crate::text::content_text(&message["content"]);
+                // A screenshot a tool showed the model: nobody said it.
+                if crate::agent::is_tool_images(&said) {
+                    continue;
+                }
                 let mut item = if let Some((title, text)) = crate::inbox::shown(&said) {
                     peer_item(&title, None, &text)
                 } else {
@@ -2760,6 +2763,21 @@ mod tests {
         assert_eq!(items[2]["command"], "fizzbuzz.py");
         // A result whose call is gone still shows, just without a summary.
         assert!(items[3].get("command").is_none());
+    }
+
+    #[test]
+    fn history_leaves_out_the_screenshots_tools_showed() {
+        let shown = crate::context::with_images(
+            json!("The image(s) browser_screenshot returned:"),
+            vec!["data:image/png;base64,QUJD".into()],
+        );
+        let items = history_items(&[
+            json!({"role": "user", "content": "how does the page look?"}),
+            json!({"role": "tool", "name": "browser_screenshot", "content": "Screenshot of the page"}),
+            json!({"role": "user", "content": shown}),
+        ]);
+        let types: Vec<&str> = items.iter().map(|item| item["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["userMessage", "functionCall"]);
     }
 
     #[test]

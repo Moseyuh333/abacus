@@ -171,6 +171,10 @@ pub enum Injection {
     SideNote(String),
     /// Another session's agent wrote to this one (see [`crate::peers`]).
     PeerMessage(crate::inbox::Message),
+    /// What a front-end tool showed the model (a browser screenshot), right
+    /// after the call's result. Nobody sent it, so it is not shown as a
+    /// message.
+    ToolImages { tool: String, images: Vec<String> },
 }
 
 impl Injection {
@@ -180,9 +184,10 @@ impl Injection {
     }
 
     /// Whether, left over when a turn ends, this starts the next one. A side
-    /// note nudges a running turn and has nothing to nudge without one.
+    /// note nudges a running turn and has nothing to nudge without one, and a
+    /// tool's images belong to the turn that called it.
     fn starts_turn(&self) -> bool {
-        !matches!(self, Self::SideNote(_))
+        !matches!(self, Self::SideNote(_) | Self::ToolImages { .. })
     }
 
     /// The person's words, for a steering message.
@@ -1463,9 +1468,24 @@ fn deliver_injections(options: &TurnOptions, messages: &mut Vec<Value>, events: 
                 let _ = events.send(AgentEvent::PeerMessage(message.clone()));
                 Value::String(message.prompt(&options.workspace))
             }
+            // No notice: the tool showed it, nobody said it.
+            Injection::ToolImages { tool, images } => {
+                crate::context::with_images(json!(format!("{TOOL_IMAGES}{tool} returned:")), images.clone())
+            }
         };
         messages.push(json!({"role": "user", "content": content}));
     }
+}
+
+/// How the images a tool showed are introduced to the model.
+const TOOL_IMAGES: &str = "The image(s) ";
+
+/// Whether a user message is the images a tool showed (see
+/// [`Injection::ToolImages`]), not anything a person or agent sent.
+pub fn is_tool_images(text: &str) -> bool {
+    text.strip_prefix(TOOL_IMAGES)
+        .and_then(|rest| rest.strip_suffix(" returned:"))
+        .is_some_and(|tool| !tool.is_empty() && !tool.contains(char::is_whitespace))
 }
 
 /// How a message from another agent reads to the one receiving it.
@@ -1774,6 +1794,26 @@ mod tests {
         }
         // Reading other sessions needs no review; messaging one does.
         assert!(tool_reads_only("session_read") && !tool_reads_only("session_message"));
+    }
+
+    #[test]
+    fn a_tool_s_images_reach_the_model_without_a_notice() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let queue = InjectionQueue::default();
+        let images = vec!["data:image/jpeg;base64,QUJD".to_owned()];
+        queue.push(Injection::ToolImages { tool: "browser_screenshot".into(), images });
+        assert!(!queue.has_starter(), "a screenshot does not start a turn of its own");
+        let options = test_turn_options(queue);
+        let mut messages = vec![json!({"role":"user","content":"how does the page look?"})];
+
+        deliver_injections(&options, &mut messages, &events);
+
+        assert_eq!(messages.len(), 2);
+        let said = crate::text::content_text(&messages[1]["content"]);
+        assert!(is_tool_images(&said), "{said}");
+        assert_eq!(crate::text::content_images(&messages[1]["content"]), ["data:image/jpeg;base64,QUJD"]);
+        assert!(receiver.try_recv().is_err(), "nothing for the transcript to show");
+        assert!(!is_tool_images("The image(s) you sent returned:"));
     }
 
     #[test]
