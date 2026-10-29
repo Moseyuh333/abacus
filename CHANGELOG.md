@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+Three console changes for issues #11, #10 and #3.
+
+- **The setup wizard is readable on a console that is not UTF-8.** A Windows
+  console decodes output with a codepage, and Rust writes UTF-8, so on a console
+  set to 936 (the Chinese default) the arrow in front of `Paste an API key`
+  arrived as `釟?` and a Chinese provider name typed at a prompt came back as
+  invalid UTF-8. Abacus now switches the console to UTF-8 at startup, input
+  codepage included, and falls back to the ASCII glyph set if the console
+  refuses, so the interface degrades to plain characters instead of mojibake.
+  The API-key mask in the provider editor comes from the glyph table for the
+  same reason.
+
+- **The numeric keypad keeps working across runs.** A run that ended without
+  giving the terminal back could leave the kitty keyboard protocol pushed, and
+  in that state a terminal reports keypad keys as codepoints the Windows event
+  source does not decode: the numpad stayed dead in every later run until the
+  window was closed. Abacus now pops the protocol before pushing it, every hard
+  exit goes through one restore path, and `ABACUS_KEYBOARD=none` turns the
+  protocol off for a terminal that mishandles it. `ABACUS_DEBUG_KEYS=<path>`
+  writes one line per key event, for diagnosing a terminal that sends nothing
+  recognisable.
+
+- **`setup` and `doctor` can speak Chinese.** Their strings now come from a
+  catalog (`src/i18n.rs`) with English and Simplified Chinese tables, chosen by
+  `ABACUS_LANG`, then `ui.language`, then the operating system's locale, then
+  English. The zh-CN table is community-review pending. The TUI is not
+  translated yet; the catalog is the piece that work grows from.
+
 ## 0.7.5 — 2026-10-28
 
 What Abacus Desktop 0.1.5 builds on, a fix for its browser, and the reasoning
