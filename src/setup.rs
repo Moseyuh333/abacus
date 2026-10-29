@@ -13,6 +13,7 @@ use anyhow::{Result, bail};
 
 use crate::config::{AbacusPaths, Credentials, ProviderProtocol, Settings};
 use crate::console;
+use crate::i18n::{self, Key};
 use crate::providers::{self, Connection, KeyStatus, PRESETS, Preset, ProviderConfig};
 
 /// What the machine already offers for one preset.
@@ -50,8 +51,8 @@ fn print_presets(ready: &[Ready]) {
     for (index, (preset, ready)) in PRESETS.iter().zip(ready).enumerate() {
         let status = match (ready, preset.env_key) {
             (Ready::KeyFound, Some(name)) => console::ok(&format!("{} {name}", marks.pass)),
-            (Ready::Running, _) => console::ok(&format!("{} running", marks.pass)),
-            (Ready::NotRunning, _) => console::dim("  not running"),
+            (Ready::Running, _) => console::ok(&format!("{} {}", marks.pass, i18n::t(Key::SetupPresetRunning))),
+            (Ready::NotRunning, _) => console::dim(&format!("  {}", i18n::t(Key::SetupPresetNotRunning))),
             (_, Some(name)) => console::dim(&format!("  {name}")),
             (_, None) => String::new(),
         };
@@ -63,35 +64,35 @@ fn print_presets(ready: &[Ready]) {
             status,
         );
     }
-    println!(
-        "    {}  Custom endpoint (OpenAI-compatible, Responses or Anthropic)",
-        console::accent(&format!("{:>2}", PRESETS.len() + 1)),
-    );
+    println!("    {}  {}", console::accent(&format!("{:>2}", PRESETS.len() + 1)), i18n::t(Key::SetupCustomEndpoint),);
 }
 
 pub async fn run(paths: &AbacusPaths) -> Result<()> {
     if !io::stdin().is_terminal() {
-        bail!("setup needs an interactive terminal; configure {} directly", paths.config_file.display());
+        bail!(i18n::t(Key::SetupNeedsTerminal).replace("{}", &paths.config_file.display().to_string()));
     }
     let mut settings = Settings::load(paths)?;
+    // Before the first line is printed: the wizard is the whole interface for a
+    // new user, so it should be in their language from the banner on.
+    i18n::init(settings.ui.language.as_deref());
     let mut credentials = Credentials::load(paths)?;
-    console::banner("Fast, focused coding from the terminal.");
+    console::banner(i18n::t(Key::SetupBannerSubtitle));
     if settings.is_configured() {
         console::blank();
-        console::field("profile", &settings.default_profile);
+        console::field(i18n::t(Key::SetupFieldProfile), &settings.default_profile);
         if let Some(profile) = settings.active_profile() {
-            console::field("model", &profile.model);
+            console::field(i18n::t(Key::DoctorFieldModel), &profile.model);
         }
         console::blank();
-        if !console::confirm("Abacus is set up already. Connect another provider?", false)? {
-            println!("  {}", console::dim("Nothing changed. /config and /profile manage what is there."));
+        if !console::confirm(i18n::t(Key::SetupAlreadyConfigured), false)? {
+            println!("  {}", console::dim(i18n::t(Key::SetupNothingChanged)));
             return Ok(());
         }
     }
 
     // ---- 1/2 provider ------------------------------------------------------
-    console::step(1, 2, "Connect a provider");
-    console::note("Keys stay on this machine. Anything else can be changed later in /config → Providers.");
+    console::step(1, 2, i18n::t(Key::SetupStepProvider));
+    console::note(i18n::t(Key::SetupKeysStayLocal));
     console::blank();
     let ready = survey().await;
     print_presets(&ready);
@@ -102,10 +103,13 @@ pub async fn run(paths: &AbacusPaths) -> Result<()> {
         .or_else(|| ready.iter().position(|ready| *ready == Ready::Running))
         .unwrap_or(0);
     let choice = loop {
-        let answer = console::prompt("Provider", Some(&(suggested + 1).to_string()))?;
+        let answer = console::prompt(i18n::t(Key::SetupPromptProvider), Some(&(suggested + 1).to_string()))?;
         match answer.trim().parse::<usize>() {
             Ok(number) if (1..=PRESETS.len() + 1).contains(&number) => break number - 1,
-            _ => println!("      {}", console::err(&format!("Pick a number from 1 to {}.", PRESETS.len() + 1))),
+            _ => println!(
+                "      {}",
+                console::err(&i18n::t(Key::SetupPickProviderNumber).replace("{}", &(PRESETS.len() + 1).to_string()))
+            ),
         }
     };
     let (id, provider) = match PRESETS.get(choice) {
@@ -116,14 +120,16 @@ pub async fn run(paths: &AbacusPaths) -> Result<()> {
     let mut stored_key = false;
     if let KeyStatus::Missing(env) = provider.key_status(&id, &credentials) {
         console::blank();
+        let credentials_file = paths.credentials_file.display().to_string();
         if let Some(env) = &env {
-            console::note(&format!("{env} is not set. A pasted key is kept in {}.", paths.credentials_file.display()));
+            console::note(&i18n::t(Key::SetupEnvNotSet).replacen("{}", env, 1).replacen("{}", &credentials_file, 1));
         } else {
-            console::note(&format!("A pasted key is kept in {}.", paths.credentials_file.display()));
+            console::note(&i18n::t(Key::SetupKeyStoredIn).replace("{}", &credentials_file));
         }
         let pasted = rpassword::prompt_password(format!(
-            "  {} Paste an API key (blank to skip): ",
-            console::accent(console::marks().arrow)
+            "  {} {} ",
+            console::accent(console::marks().arrow),
+            i18n::t(Key::SetupPasteKey)
         ))?;
         if !pasted.trim().is_empty() {
             credentials.keys.insert(id.clone(), pasted.trim().to_owned());
@@ -134,32 +140,33 @@ pub async fn run(paths: &AbacusPaths) -> Result<()> {
         println!(
             "  {} {}",
             console::ok(console::marks().pass),
-            console::dim(&format!("Using {name} from your environment."))
+            console::dim(&i18n::t(Key::SetupUsingEnvKey).replace("{}", &name))
         );
     }
 
     // ---- 2/2 model -----------------------------------------------------------
-    console::step(2, 2, "Choose a model");
-    print!("       {}", console::dim("Asking the provider what it serves… "));
+    console::step(2, 2, i18n::t(Key::SetupStepModel));
+    print!("       {} ", console::dim(i18n::t(Key::SetupAskingProvider)));
     io::stdout().flush()?;
     let connection = Connection::resolve(&id, &provider, &credentials);
     let model = match providers::refresh_catalog(paths, &connection).await {
         Ok(catalog) if !catalog.models.is_empty() => {
-            println!("{}", console::ok(&format!("{} found", catalog.models.len())));
+            println!(
+                "{}",
+                console::ok(&i18n::t(Key::SetupModelsFound).replace("{}", &catalog.models.len().to_string()))
+            );
             let ids: Vec<String> = catalog.models.into_iter().map(|card| card.id).collect();
             choose_model(&ids)?
         }
         Ok(_) => {
-            println!("{}", console::warn("none listed"));
-            console::note("The provider answered but listed no models; type one.");
+            println!("{}", console::warn(i18n::t(Key::SetupModelsNone)));
+            console::note(i18n::t(Key::SetupModelsNoneHint));
             prompt_model()?
         }
         Err(error) => {
-            println!("{}", console::err("unreachable"));
+            println!("{}", console::err(i18n::t(Key::SetupUnreachable)));
             console::note(&crate::text::clip(&crate::text::flat(&format!("{error:#}")), 200, ""));
-            console::note(
-                "Type the model to use; the connection can be fixed later in /config or with `abacus doctor`.",
-            );
+            console::note(i18n::t(Key::SetupUnreachableHint));
             prompt_model()?
         }
     };
@@ -180,15 +187,15 @@ pub async fn run(paths: &AbacusPaths) -> Result<()> {
     let provider = &settings.providers[&id];
     console::blank();
     println!("  {}", console::dim(&console::marks().rule.repeat(console::WIDTH)));
-    println!("  {} {}", console::ok(console::marks().pass), console::bold("Ready"));
+    println!("  {} {}", console::ok(console::marks().pass), console::bold(i18n::t(Key::SetupReady)));
     console::blank();
-    console::field("profile", &profile);
-    console::field("endpoint", &provider.base_url);
-    console::field("auth", &provider.key_status(&id, &credentials).label());
-    console::field("settings", &paths.config_file.display().to_string());
+    console::field(i18n::t(Key::SetupFieldProfile), &profile);
+    console::field(i18n::t(Key::SetupFieldEndpoint), &provider.base_url);
+    console::field(i18n::t(Key::SetupFieldAuth), &provider.key_status(&id, &credentials).label());
+    console::field(i18n::t(Key::SetupFieldSettings), &paths.config_file.display().to_string());
     console::blank();
-    println!("  {}  {}", console::dim("start"), console::accent("cd your-project && abacus"));
-    println!("  {}  {}", console::dim("check"), console::accent("abacus doctor"));
+    println!("  {}  {}", console::dim(i18n::t(Key::SetupFieldStart)), console::accent(i18n::t(Key::SetupStartCommand)));
+    println!("  {}  {}", console::dim(i18n::t(Key::SetupFieldCheck)), console::accent(i18n::t(Key::SetupCheckCommand)));
     console::blank();
     Ok(())
 }
@@ -209,21 +216,20 @@ fn from_preset(settings: &Settings, preset: &Preset) -> (String, ProviderConfig)
 
 fn custom_provider(settings: &Settings) -> Result<(String, ProviderConfig)> {
     console::blank();
-    let name = console::prompt("Name", Some("Custom"))?;
+    let name = console::prompt(i18n::t(Key::SetupPromptName), Some("Custom"))?;
     let base_url = loop {
-        let raw = console::prompt("API base URL (with /v1 where it has one)", Some("http://localhost:8000/v1"))?;
+        let raw = console::prompt(i18n::t(Key::SetupPromptBaseUrl), Some("http://localhost:8000/v1"))?;
         match providers::normalise_base_url(&raw) {
             Ok(url) => break url,
             Err(error) => println!("      {}", console::err(&format!("{error}"))),
         }
     };
-    let protocol = match console::prompt("Protocol — 1 chat completions, 2 responses, 3 anthropic", Some("1"))?.trim()
-    {
+    let protocol = match console::prompt(i18n::t(Key::SetupPromptProtocol), Some("1"))?.trim() {
         "2" | "responses" => ProviderProtocol::Responses,
         "3" | "anthropic" => ProviderProtocol::Anthropic,
         _ => ProviderProtocol::ChatCompletions,
     };
-    let env = console::prompt("Environment variable with the API key (blank for none)", None)?;
+    let env = console::prompt(i18n::t(Key::SetupPromptEnvVar), None)?;
     let base = Some(providers::slug(&name)).filter(|slug| !slug.is_empty()).unwrap_or_else(|| "custom".to_owned());
     let id = providers::unused_id(&base, |candidate| settings.providers.contains_key(candidate));
     let provider = ProviderConfig {
@@ -249,18 +255,18 @@ fn choose_model(models: &[String]) -> Result<String> {
             .collect::<Vec<_>>();
         console::blank();
         if matched.is_empty() {
-            println!("      {}", console::warn("Nothing matches that filter."));
+            println!("      {}", console::warn(i18n::t(Key::SetupFilterNoMatch)));
         }
         for (index, model) in matched.iter().take(PAGE).enumerate() {
             println!("    {}  {model}", console::accent(&format!("{:>2}", index + 1)));
         }
         let hidden = matched.len().saturating_sub(PAGE);
         if hidden > 0 {
-            println!("        {}", console::dim(&format!("+{hidden} more — type a fragment to filter")));
+            println!("        {}", console::dim(&i18n::t(Key::SetupFilterMore).replace("{}", &hidden.to_string())));
         }
         console::blank();
-        println!("        {}", console::dim("number to pick  ·  text to filter  ·  blank to type an id"));
-        let answer = console::prompt("Model", None)?;
+        println!("        {}", console::dim(i18n::t(Key::SetupModelHint)));
+        let answer = console::prompt(i18n::t(Key::SetupPromptModel), None)?;
         if answer.is_empty() {
             return prompt_model();
         }
@@ -268,7 +274,7 @@ fn choose_model(models: &[String]) -> Result<String> {
             if index >= 1 && index <= matched.len().min(PAGE) {
                 return Ok(matched[index - 1].clone());
             }
-            println!("      {}", console::err("That number is not on the list."));
+            println!("      {}", console::err(i18n::t(Key::SetupModelNotListed)));
             continue;
         }
         filter = answer;
@@ -279,11 +285,11 @@ fn choose_model(models: &[String]) -> Result<String> {
 /// throw away everything already chosen, a harsh penalty for pressing enter.
 fn prompt_model() -> Result<String> {
     loop {
-        let model = console::prompt("Model id", None)?;
+        let model = console::prompt(i18n::t(Key::SetupPromptModelId), None)?;
         if !model.trim().is_empty() {
             return Ok(model.trim().to_owned());
         }
-        println!("      {}", console::err("A model id is required."));
+        println!("      {}", console::err(i18n::t(Key::SetupModelIdRequired)));
     }
 }
 
