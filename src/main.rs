@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
     let mut settings = Settings::load(&paths)?;
     // The app server sets a provider up from the front end rather than
     // through the terminal wizard, so it starts either way.
-    let app_server = matches!(cli.command, Some(Command::AppServer));
+    let app_server = matches!(cli.command, Some(Command::AppServer { .. }));
     if !settings.is_configured() && !cli.has_inline_provider() && !app_server {
         if matches!(cli.command, Some(Command::Doctor)) {
             println!("Abacus {}", env!("CARGO_PKG_VERSION"));
@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
     let store = (!cli.no_session).then_some(store);
 
     let Some(prompt) = cli.prompt else {
-        return if matches!(cli.command, Some(Command::AppServer)) {
+        return if matches!(cli.command, Some(Command::AppServer { .. })) {
             app_server::run(config, settings, session, store, services).await
         } else {
             tui::run(config, settings, credentials, session, store, services).await

@@ -120,6 +120,12 @@ impl ToolCall {
         let args: Value = serde_json::from_str(&self.arguments).unwrap_or(Value::Null);
         match self.name.as_str() {
             "run_command" => args["command"].as_str().unwrap_or("shell command").to_owned(),
+            // The first line that says something; the code itself is in the approval.
+            "run_python" => args["code"]
+                .as_str()
+                .and_then(|code| code.lines().map(str::trim).find(|line| !line.is_empty()))
+                .map(|line| crate::text::clip(line, 80, "…"))
+                .unwrap_or_else(|| "Python".to_owned()),
             "edit_file" | "write_file" | "read_file" | "delete_file" => {
                 args["path"].as_str().unwrap_or("unknown path").to_owned()
             }
@@ -188,6 +194,7 @@ impl ToolCall {
                 | "delete_file"
                 | "move_file"
                 | "run_command"
+                | "run_python"
                 | "git_commit"
                 // Skill authoring writes a file into the workspace or the user
                 // home. Listing it here is what puts it in front of AUTO's
@@ -260,6 +267,7 @@ impl ToolExecutor {
             "git_log" => self.git_log(&call.arguments).await,
             "git_commit" => self.git_commit(&call.arguments).await,
             "run_command" => self.run_command(&call.arguments).await,
+            "run_python" => self.run_python(&call.arguments).await,
             other => Err(anyhow!("unknown tool: {other}")),
         };
 
@@ -275,6 +283,10 @@ impl ToolExecutor {
             "git_commit" => self.preview_git_commit(&call.arguments),
             "move_file" => Ok(format!("Move {}", call.summary())),
             "run_command" => Ok(format!("$ {}", call.summary())),
+            "run_python" => Ok(serde_json::from_str::<Value>(&call.arguments)
+                .ok()
+                .and_then(|args| args["code"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| call.summary())),
             _ => Ok(call.summary()),
         };
         truncate(result.unwrap_or_else(|error| format!("Could not prepare preview: {error:#}")), 12_000)
@@ -801,6 +813,33 @@ impl ToolExecutor {
         }
     }
 
+    /// Run Python the model wrote, as a script in the workspace: a chat's
+    /// calculator, data tool and plotter. It runs the way `run_command` runs
+    /// a command, with its timeout and output limits.
+    async fn run_python(&self, arguments: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            code: String,
+            #[serde(default = "default_timeout")]
+            timeout_seconds: u64,
+        }
+
+        let args: Args = parse_args(arguments)?;
+        if args.code.trim().is_empty() {
+            bail!("code cannot be empty");
+        }
+        let script = std::env::temp_dir().join(format!("abacus-python-{}.py", uuid::Uuid::new_v4()));
+        fs::write(&script, &args.code).context("could not write the script")?;
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let command = json!({
+            "command": format!("{python} \"{}\"", script.display()),
+            "timeout_seconds": args.timeout_seconds,
+        });
+        let result = self.run_command(&command.to_string()).await;
+        let _ = fs::remove_file(&script);
+        result
+    }
+
     async fn run_command(&self, arguments: &str) -> Result<String> {
         #[derive(Deserialize)]
         struct Args {
@@ -997,6 +1036,24 @@ impl ToolExecutor {
             Ok(path)
         }
     }
+}
+
+/// `run_python`, offered in a chat (see [`crate::agent::CHAT_TOOLS`]).
+pub fn python_tool_spec() -> Value {
+    tool(
+        "run_python",
+        "Run a Python 3 script and get what it prints. Use it for calculations, data work, and anything better computed than guessed. Each call is a fresh process; files it writes stay in the chat's folder.",
+        [
+            req("code", string("The whole script; print what you want to see")),
+            opt(
+                "description",
+                string(
+                    "Say what this is for in a few plain words, starting with an -ing verb ('Computing the loan payments')",
+                ),
+            ),
+            opt("timeout_seconds", integer("Timeout, defaults to 120 and caps at 600")),
+        ],
+    )
 }
 
 pub fn tool_specs() -> Vec<Value> {
@@ -1577,6 +1634,24 @@ mod tests {
     }
     use std::process::Command as StdCommand;
     use tempfile::tempdir;
+
+    /// A chat's Python runs in the chat's folder and answers with what it
+    /// printed; the script it ran is not left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn python_runs_in_the_workspace_and_answers_with_its_output() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let tools = ToolExecutor::new(root.clone());
+        let code = "import os\nopen('out.txt', 'w').write('kept')\nprint(sum(range(10)), os.getcwd())";
+        let call = tool_call("run_python", serde_json::json!({"code": code}).to_string());
+        let output = tools.execute(&call).await;
+        assert!(output.contains("45") && output.contains(&*root.to_string_lossy()), "{output}");
+        assert_eq!(fs::read_to_string(root.join("out.txt")).unwrap(), "kept");
+        assert_eq!(call.summary(), "import os");
+        assert!(call.needs_approval(), "Python is reviewed like a command");
+        assert!(tools.execute(&tool_call("run_python", r#"{"code":"  "}"#)).await.starts_with("Error"));
+    }
 
     #[tokio::test]
     async fn grep_skips_the_git_directory() {

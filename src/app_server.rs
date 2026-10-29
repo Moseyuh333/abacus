@@ -65,7 +65,7 @@ const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Tools whose call is a shell command, and so maps onto the client's
 /// command-execution rendering rather than a generic function call.
-const COMMAND_TOOLS: &[&str] = &["run_command"];
+const COMMAND_TOOLS: &[&str] = &["run_command", "run_python"];
 /// Tools that change files. Split out because a front end shows a diff for
 /// these and a log for everything else.
 const FILE_CHANGE_TOOLS: &[&str] =
@@ -122,7 +122,7 @@ impl ThreadState {
                 config.workspace.clone(),
                 config.profile.clone(),
                 config.model_ref(),
-                initial_messages(&config.workspace),
+                if config.chat { crate::agent::chat_messages() } else { initial_messages(&config.workspace) },
             )
         });
         let state = SessionState::open(config, Some(&session));
@@ -2905,6 +2905,7 @@ mod tests {
     #[test]
     fn tools_map_onto_client_item_kinds() {
         assert_eq!(item_type("run_command"), "commandExecution");
+        assert_eq!(item_type("run_python"), "commandExecution", "a chat's Python runs like a command");
         assert_eq!(item_type("apply_patch"), "fileChange");
         assert_eq!(item_type("grep"), "functionCall");
     }

@@ -218,7 +218,13 @@ pub enum Command {
     },
     /// Serve a session over newline-delimited JSON on stdin/stdout, for a
     /// desktop front end. One process, one workspace, one active session.
-    AppServer,
+    AppServer {
+        /// Hold conversations rather than work on a project: the model gets
+        /// the web, Python and questions to the person, not the files,
+        /// shell or git of the folder
+        #[arg(long)]
+        chat: bool,
+    },
     /// Install the newest release, and update the desktop app if it is installed
     Update {
         /// Also install the desktop app if it is not installed yet
@@ -429,6 +435,9 @@ pub struct Config {
     /// Summarise a long session that sits idle while its prompt cache is
     /// still warm (see [`Config::compacts_when_idle`]).
     pub idle_compaction: bool,
+    /// A conversation rather than work on the workspace: a chat's own system
+    /// prompt and tools (see `abacus app-server --chat`).
+    pub chat: bool,
     pub paths: AbacusPaths,
 }
 
@@ -456,6 +465,7 @@ impl Config {
             one_stream: false,
             prompt_cache: true,
             idle_compaction: true,
+            chat: false,
             paths,
         }
     }
@@ -535,6 +545,7 @@ impl Config {
             settings.agent.tool_output_limit.clamp(*TOOL_OUTPUT_LIMIT.start(), *TOOL_OUTPUT_LIMIT.end());
         self.permission = if cli.yes { Permission::Yolo } else { cli.mode.unwrap_or(settings.agent.mode) };
         self.no_session = cli.no_session;
+        self.chat = matches!(cli.command, Some(Command::AppServer { chat: true }));
         self.trace_enabled = settings.trace.enabled;
         self.web_search = settings.search.resolve();
         self.token_compression = settings.agent.token_compression;
