@@ -3,5 +3,5 @@
 .env
 .abacus/
 .claude/settings.local.json
+.omh/
 /src_server/
-
