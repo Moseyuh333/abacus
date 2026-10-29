@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.7.6 — 2026-10-29
+
+What Abacus Desktop 0.1.6 builds on: goals that keep going, chats, and
+reports from the window.
 
 - **A goal keeps going until it is done.** While a goal is active, every turn
   that ends by itself starts another, telling the model the goal isn't done
