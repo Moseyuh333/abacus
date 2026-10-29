@@ -14,6 +14,9 @@
   Headless `--goal` makes the prompt the goal and runs until it is complete or
   paused; the JSON result says which in `goal`. A saved loop in an old session
   is ignored.
+- **Reports from front ends.** `feedback/submit` sends a report where the
+  terminal's `/feedback` sends it (capability `feedback`), naming the front end
+  that sent it.
 
 ## 0.7.5 — 2026-10-28
 

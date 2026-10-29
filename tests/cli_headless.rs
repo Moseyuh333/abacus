@@ -634,6 +634,84 @@ async fn app_server_runs_the_terminal_commands_and_writes_the_agent_limits() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
 }
 
+/// The window's "Report a bug" goes where the terminal's /feedback goes, and
+/// says which window sent it.
+#[tokio::test]
+async fn app_server_sends_a_report_where_feedback_goes() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let reports = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        let body = r#"{"id":"fb-1","message":"Thanks"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        request
+    });
+    let sync = sync_server::SyncServer::start("secret-token").await;
+    let device = SignedIn::new(&sync, "secret-token");
+    std::fs::write(
+        device.directory.path().join("home/config.toml"),
+        format!("[feedback]\nendpoint = \"http://{address}/v1/feedback\"\n"),
+    )
+    .unwrap();
+    let (model, _) = recording_model_endpoint();
+    let mut child = device
+        .command(&model, &["app-server"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let report = serde_json::json!({
+        "category": "Bug",
+        "message": "The plan bar overlaps the composer",
+        "client": "abacus-desktop 0.1.6",
+    });
+    for frame in [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "feedback/submit", "params": {"message": "  "}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "feedback/submit", "params": report}),
+    ] {
+        input.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+    }
+    let mut replies = std::collections::HashMap::new();
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if let Some(id) = frame["id"].as_u64() {
+                replies.insert(id, frame);
+                if replies.len() == 3 {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(answered, Ok(true));
+    assert_eq!(replies[&1]["result"]["capabilities"]["feedback"], true);
+    assert!(replies[&2]["error"]["message"].as_str().unwrap().contains("describe what happened"));
+    assert_eq!(replies[&3]["result"]["id"], "fb-1");
+
+    let sent = reports.join().unwrap();
+    let body: serde_json::Value = serde_json::from_str(sent.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["category"], "bug");
+    assert_eq!(body["message"], "The plan bar overlaps the composer");
+    assert!(body["app_version"].as_str().unwrap().ends_with("(abacus-desktop 0.1.6)"), "{body}");
+
+    input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\"}\n").await.unwrap();
+    drop(input);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
+}
+
 /// A model endpoint whose reply to each chat request `answer` picks from the
 /// request itself, and that keeps every request.
 fn scripted_model_endpoint(answer: fn(&str) -> String) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {

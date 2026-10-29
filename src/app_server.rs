@@ -528,6 +528,9 @@ impl App {
                     // thread/taskList/updated report each change.
                     "goal": true,
                     "taskList": true,
+                    // feedback/submit sends a report where the terminal's
+                    // /feedback sends it.
+                    "feedback": true,
                 },
                 "idleCompaction": self.config.idle_compaction,
                 "maxSteps": self.config.max_steps,
@@ -664,6 +667,42 @@ impl App {
             "turn/steer/withdraw" => {
                 let text = params["text"].as_str().ok_or_else(|| anyhow!("text required"))?;
                 Ok(json!({"withdrawn": self.thread.state.injections.withdraw(text)}))
+            }
+            // A report from the window: what the terminal's /feedback sends,
+            // to the same place.
+            "feedback/submit" => {
+                if !self.settings.feedback.enabled {
+                    return Err(anyhow!("feedback is turned off in the settings"));
+                }
+                let message = params["message"].as_str().unwrap_or_default().trim();
+                if message.is_empty() {
+                    return Err(anyhow!("describe what happened or what you would like changed"));
+                }
+                let category = params["category"].as_str().unwrap_or_default().to_ascii_lowercase();
+                let include_diagnostics = params["includeDiagnostics"].as_bool().unwrap_or(false);
+                let version = env!("CARGO_PKG_VERSION");
+                let payload = crate::feedback::FeedbackPayload {
+                    category: if FEEDBACK_CATEGORIES.contains(&category.as_str()) {
+                        category
+                    } else {
+                        "general".into()
+                    },
+                    message: message.to_owned(),
+                    include_diagnostics,
+                    diagnostics: if include_diagnostics { self.services.diagnostics() } else { Vec::new() },
+                    session_id: self.thread.persisted.then(|| self.thread_id()),
+                    workspace: self.config.workspace_name().to_owned(),
+                    // Which window sent it, when one says.
+                    app_version: match params["client"].as_str() {
+                        Some(client) => format!("{version} ({client})"),
+                        None => version.to_owned(),
+                    },
+                    os: std::env::consts::OS.to_owned(),
+                    arch: std::env::consts::ARCH.to_owned(),
+                };
+                let receipt =
+                    crate::feedback::FeedbackClient::new(&self.settings.feedback.endpoint)?.submit(&payload).await?;
+                Ok(json!({"id": receipt.id, "message": receipt.message}))
             }
             "commands/list" => {
                 let mut commands = vec![
@@ -2386,6 +2425,9 @@ fn peer_item(title: &str, session: Option<uuid::Uuid>, text: &str) -> Value {
 pub(crate) fn agent_item(from: &str, text: &str) -> Value {
     json!({"type": "userMessage", "text": text, "from": {"title": from, "agent": true}})
 }
+
+/// What a report may be about, as the terminal's /feedback offers them.
+const FEEDBACK_CATEGORIES: [&str; 4] = ["general", "bug", "feature", "performance"];
 
 /// The turn an unfinished goal started by itself, as a client item: a
 /// `userMessage` from the goal, which a client that predates it shows like
