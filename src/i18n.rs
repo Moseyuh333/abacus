@@ -159,6 +159,7 @@ pub enum Key {
     DoctorSummaryPassed,
     DoctorSummaryWarnings,
     DoctorSummaryFailures,
+    DoctorProblemsFound,
 
     // -- shared words --------------------------------------------------------
     WordUnset,
@@ -266,6 +267,7 @@ impl Key {
         Key::DoctorSummaryPassed,
         Key::DoctorSummaryWarnings,
         Key::DoctorSummaryFailures,
+        Key::DoctorProblemsFound,
         Key::WordUnset,
         Key::WordNo,
         Key::WordProvider,
@@ -371,6 +373,7 @@ impl Key {
             Key::DoctorSummaryPassed => "doctor.summary_passed",
             Key::DoctorSummaryWarnings => "doctor.summary_warnings",
             Key::DoctorSummaryFailures => "doctor.summary_failures",
+            Key::DoctorProblemsFound => "doctor.problems_found",
             Key::WordUnset => "word.unset",
             Key::WordNo => "word.no",
             Key::WordProvider => "word.provider",

@@ -95,6 +95,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("doctor.summary_passed", "{} All checks passed"),
     ("doctor.summary_warnings", "{} {}, nothing blocking"),
     ("doctor.summary_failures", "{} {} found"),
+    ("doctor.problems_found", "doctor found one or more problems"),
     ("word.unset", "unset"),
     ("word.no", "no"),
     ("word.provider", "provider"),

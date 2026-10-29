@@ -843,5 +843,6 @@ async fn doctor(config: &Config, settings: &Settings) -> Result<()> {
     println!("  {summary}");
     console::blank();
 
-    if failures == 0 { Ok(()) } else { anyhow::bail!("doctor found one or more problems") }
+    // The last line a failing run prints, so it is in the reader's language too.
+    if failures == 0 { Ok(()) } else { anyhow::bail!(i18n::t(Key::DoctorProblemsFound)) }
 }
