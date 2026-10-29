@@ -116,7 +116,7 @@ impl CompactionState {
     }
 
     /// Context injected as a system message every turn so the model retains the
-    /// long-arc state of the goal/loop across compactions.
+    /// long-arc state of the goal across compactions.
     pub fn prompt_context(&self) -> String {
         match self.snapshot() {
             Some(summary) if !summary.trim().is_empty() => format!(

@@ -9,7 +9,6 @@ use crate::{
     diff::{DiffDocument, DiffLineKind},
     input::{InputBuffer, InputMode},
     provider::Provider,
-    ralph::{RalphLoop, RalphStatus},
     remote::{AcceptResult, Bridge, By, Inbound, InputKind, LinkState, SnapshotReason},
     services::AgentServices,
     session::{Session, SessionState, SessionStore, SessionUsage},
@@ -68,7 +67,6 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/effort", "Reasoning effort: minimal, low, medium, high, xhigh, max, auto"),
     ("/config", "Settings, by tab"),
     ("/goal", "Set or manage a persistent goal"),
-    ("/loop", "Repeat a prompt until it prints a completion word"),
     ("/btw", "Note something for the running turn without derailing it"),
     ("/new", "Start a new session"),
     ("/fork", "Continue this conversation in a new session"),
@@ -122,6 +120,9 @@ enum TurnOutcome {
 
 /// The provider picker's value for "a custom endpoint", which no preset has.
 const CUSTOM_PROVIDER: &str = "\u{0}custom";
+
+/// Where an unfinished goal started a turn by itself.
+const GOAL_CARRIES_ON: &str = "Goal not done yet, carrying on.";
 
 /// Fingerprint deciding whether the memoised transcript is still valid: the
 /// entries revision, the render width, and the spinner phase. The phase only
@@ -456,7 +457,6 @@ struct App {
     /// Ctrl+P: the subagent detail overlay.
     workers_overlay: bool,
     workers_scroll: u16,
-    ralph_loop: Option<RalphLoop>,
     entries: Vec<Entry>,
     /// The number the transcript gave its newest entry (`Entry::id`).
     last_entry_id: u64,
@@ -1142,6 +1142,8 @@ fn entries_from_messages(messages: &[Value]) -> Vec<Entry> {
         match role {
             // A screenshot a tool showed the model: nobody said it.
             "user" if crate::agent::is_tool_images(content) => {}
+            // The turn an unfinished goal started by itself.
+            "user" if crate::goal::is_carry_on(content) => entries.push(Entry::new(EntryKind::System, GOAL_CARRIES_ON)),
             "user" => entries.push(match crate::inbox::shown(content) {
                 // Another session's message, shown as it was when it arrived.
                 Some((title, text)) => Entry::new(EntryKind::System, format!("Message from \"{title}\": {text}")),
@@ -1192,7 +1194,6 @@ impl App {
         let provider = Provider::with_tokens(&config, tokens.clone())?;
         let aux_provider = provider.for_role(config.roles.aux.as_ref());
         let workers = crate::workers::Workers::default();
-        let ralph_loop = session.as_ref().and_then(|session| session.ralph_loop.clone());
         let messages =
             session.as_ref().map(|value| value.messages.clone()).unwrap_or_else(|| initial_messages(&config.workspace));
         let ctx_chars = message_chars(&messages);
@@ -1282,7 +1283,6 @@ impl App {
             mouse_captured: true,
             workers_overlay: false,
             workers_scroll: 0,
-            ralph_loop,
             entries,
             last_entry_id,
             input: InputBuffer::new(),
@@ -1654,29 +1654,20 @@ impl App {
                     self.status = "thinking".to_owned();
                 }
                 AgentEvent::Done { messages, reason } => {
-                    let assistant_output = crate::text::last_reply(&messages).to_owned();
                     self.messages = messages;
                     // Resynthe live ctx estimate from the authoritative messages.
                     self.ctx_chars = message_chars(&self.messages);
-                    let mut continue_loop = false;
-                    if let Some(state) = &mut self.ralph_loop {
-                        if state.is_active() {
-                            let completed = state.observe_output(&assistant_output);
-                            continue_loop = state.is_active();
-                            self.status = if completed {
-                                format!("loop completed after {} iteration(s)", state.iteration)
-                            } else if state.status == RalphStatus::MaxIterations {
-                                format!("loop stopped at {} iteration(s)", state.iteration)
-                            } else {
-                                "loop continuing".to_owned()
-                            };
-                        } else if state.status == RalphStatus::Paused {
-                            self.status = "loop paused".to_owned();
-                        }
-                    }
+                    // A turn that ended by itself carries an active goal on,
+                    // unless something waiting starts the next turn anyway:
+                    // the goal carries on once that one ends. A turn the
+                    // person stopped ends the run of turns.
+                    let goal = (reason != DoneReason::Interrupted && !self.state.injections.has_starter())
+                        .then(|| self.state.goal.after_turn(self.turn_had_tools))
+                        .flatten();
+                    let carries_on = matches!(goal, Some(crate::goal::Next::Turn(_)));
                     self.persist_session();
                     self.report_usage();
-                    if !continue_loop {
+                    if !carries_on {
                         self.sync_idle_since = Some(Instant::now());
                         self.quiet_since = Some(Instant::now());
                     }
@@ -1715,16 +1706,19 @@ impl App {
                         }
                     }
                     self.close_turn();
-                    if reason == DoneReason::Complete && !continue_loop {
+                    if reason == DoneReason::Complete && !carries_on {
                         self.start_draft();
                     }
-                    if continue_loop {
-                        self.continue_ralph_loop();
-                    } else if !matches!(
-                        self.ralph_loop.as_ref().map(|state| state.status),
-                        Some(RalphStatus::Completed | RalphStatus::MaxIterations | RalphStatus::Paused)
-                    ) {
-                        self.status = "ready".to_owned();
+                    match goal {
+                        Some(crate::goal::Next::Turn(prompt)) => self.carry_on_goal(prompt),
+                        Some(crate::goal::Next::Stalled) => {
+                            self.say(
+                                "Goal paused: two turns in a row ended without doing any work. \
+                                 /goal resume carries on.",
+                            );
+                            self.status = "goal paused".to_owned();
+                        }
+                        None => self.status = "ready".to_owned(),
                     }
                 }
                 AgentEvent::Failed { error, messages } => {
@@ -1746,9 +1740,6 @@ impl App {
                         );
                     }
                     self.status = "error".to_owned();
-                    if let Some(state) = &mut self.ralph_loop {
-                        let _ = state.pause();
-                    }
                     self.persist_session();
                     self.report_usage();
                     self.sync_idle_since = Some(Instant::now());
@@ -2022,7 +2013,8 @@ impl App {
                 effective_prompt
             })
         } else {
-            // Ralph iterations must receive the exact same prompt bytes every time.
+            // Nobody typed it (an unfinished goal, another session's
+            // message), so it goes to the model as it is.
             effective_prompt
         };
         // Resolve `[image:…]` paste tokens and `@file.png` references into
@@ -2203,7 +2195,6 @@ impl App {
         };
         session.update_messages(self.messages.clone());
         self.state.save(session);
-        session.ralph_loop = self.ralph_loop.clone();
         session.tokens_used = self.provider.tokens_used();
         session.active_secs = self.session_initial_active_secs.saturating_add(self.started.elapsed().as_secs());
         // A fresh screen that has never received a prompt is not a real session
@@ -2304,7 +2295,6 @@ impl App {
             session.as_ref().map_or_else(|| initial_messages(&self.config.workspace), |s| s.messages.clone());
         self.ctx_chars = message_chars(&self.messages);
         self.set_entries(entries_from_messages(&self.messages));
-        self.ralph_loop = session.as_ref().and_then(|session| session.ralph_loop.clone());
         self.tokens.store_total(session.as_ref().map_or(0, |session| session.tokens_used));
         self.session_initial_active_secs = session.as_ref().map_or(0, |s| s.active_secs);
         self.started = Instant::now();
@@ -2883,17 +2873,11 @@ impl App {
             self.interrupt();
             return true;
         }
-        if let Some(state) = &mut self.ralph_loop {
-            state.cancel();
-        }
         self.status = "interrupting…".to_owned();
         false
     }
 
     fn interrupt(&mut self) {
-        if let Some(state) = &mut self.ralph_loop {
-            state.cancel();
-        }
         if let Some(handle) = self.running.take() {
             handle.abort();
             // An aborted turn never reports `Done`; settle the browsers here.

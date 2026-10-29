@@ -26,7 +26,6 @@ pub mod peers;
 pub mod presence;
 pub mod provider;
 pub mod providers;
-pub mod ralph;
 pub mod recovery;
 pub mod remote;
 pub mod roles;

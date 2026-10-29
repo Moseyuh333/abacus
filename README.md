@@ -128,7 +128,7 @@ selected block, `Y` copies the last reply, `i` returns to typing. Press `F1` or
 | `/effort <level>` | Reasoning effort: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto` |
 | `/config` | Settings, by tab: profile, providers, agent, search, interface, privacy |
 | `/config raw` | Edit the whole config file inside Abacus (`Ctrl+S` saves) |
-| `/goal`, `/loop` | Long-running work (see below) |
+| `/goal` | Long-running work (see below) |
 | `/btw <note>` | Note something for the running turn without derailing it |
 | `/new`, `/fork` | Start a fresh session, or continue this one in a copy |
 | `/resume [id]`, `/rename <title>` | Resume a saved session (a list without an id), rename this one |
@@ -191,12 +191,11 @@ abacus --profile local -p "Review the error handling in src/"
 `--output-format` takes `plain` (default), `json` (one object at the end) or
 `streaming-json` (one event per line). `--no-session` skips saving the run.
 
-`--loop` replays the same prompt until the model prints the completion promise
-or the iteration cap is reached:
+`--goal` makes the prompt the goal and keeps working, turn after turn, until the
+model marks it complete or pauses it:
 
 ```sh
-abacus -p "Implement the importer, run all tests, and print DONE when they pass" \
-  --loop --max-iterations 20 --completion-promise DONE --yolo
+abacus -p "Implement the importer and get the whole test suite green" --goal --yolo
 ```
 
 Other per-run overrides: `--profile`, `--model` (`provider/model`, or a model on
@@ -366,22 +365,14 @@ For a remote server, use `transport = "http"` with `url` and optional `headers`.
 Each MCP call asks for approval unless the server has `auto_approve = true`.
 `abacus mcp` lists connected servers and their tools.
 
-## Goals, loops and subagents
+## Goals and subagents
 
 `/goal <objective>` sets a goal for the session and starts working on it. The
-goal stays above the composer and survives resume. `/goal pause`, `/goal resume`,
-`/goal edit <text>` and `/goal clear` manage it.
-
-`/loop` sends the same prompt again after each turn until the model prints a
-completion word you choose:
-
-```text
-/loop "Fix the failing tests and print DONE when the suite passes" --max-iterations 20 --completion-promise DONE
-```
-
-`/loop status`, `/loop pause`, `/loop resume` and `/cancel-loop` control it. Set
-`--max-iterations` so a loop that never converges stops. See
-[docs/how-to-use-loops.md](docs/how-to-use-loops.md).
+goal stays above the composer and survives resume. While it is active, every
+turn that ends by itself starts another, until the model marks the goal
+complete, or pauses it because it needs you. `/goal pause`, `/goal resume`,
+`/goal edit <text>` and `/goal clear` manage it, and two turns in a row that do
+no work pause it too. See [docs/how-to-use-goals.md](docs/how-to-use-goals.md).
 
 Ask the agent to split work across subagents and it runs them in parallel with
 `spawn_subagents`. Up to eight workers run in separate git worktrees seeded with

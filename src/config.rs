@@ -115,17 +115,9 @@ pub struct Cli {
     #[arg(long, value_name = "FORMAT", value_parser = parse_tool_format)]
     pub tool_format: Option<ToolFormat>,
 
-    /// Drive a headless Ralph loop that replays the prompt until the completion promise appears or the iteration limit is reached
-    #[arg(long = "loop")]
-    pub loop_run: bool,
-
-    /// Maximum iterations for --loop (defaults to unlimited; setting a limit is strongly recommended)
+    /// Make the prompt the goal and keep working, turn after turn, until the model marks it complete or pauses it
     #[arg(long)]
-    pub max_iterations: Option<u32>,
-
-    /// Completion promise that ends a --loop (defaults to COMPLETE)
-    #[arg(long)]
-    pub completion_promise: Option<String>,
+    pub goal: bool,
 
     #[command(subcommand)]
     pub command: Option<Command>,

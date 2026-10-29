@@ -2174,17 +2174,25 @@ async fn ctrl_c_arm_resets_so_a_later_interrupt_is_not_a_quit() {
     assert!(!app.quit);
 }
 
+/// A goal keeps the agent going: a turn that ends while it is active starts
+/// another, until the model marks it complete.
 #[tokio::test]
-async fn ralph_replays_the_exact_prompt_until_the_promise_appears() {
+async fn an_active_goal_carries_on_until_the_model_completes_it() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
+        let complete = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"goal_update","arguments":"{\"status\":\"complete\"}"}}]}}]}"#;
+        let answers = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Started on it.\"}}]}\n\ndata: [DONE]\n\n".to_owned(),
+            format!(
+                "data: {complete}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+            ),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"All done.\"}}]}\n\ndata: [DONE]\n\n".to_owned(),
+        ];
         let mut requests = Vec::new();
-        for content in ["still working", "DONE"] {
+        for body in answers {
             let (mut stream, _) = listener.accept().await.unwrap();
             requests.push(read_http_request(&mut stream).await);
-            let body =
-                format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\ndata: [DONE]\n\n");
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
@@ -2194,30 +2202,29 @@ async fn ralph_replays_the_exact_prompt_until_the_promise_appears() {
         requests
     });
     let (_directory, mut app) = test_app(&format!("http://{address}/v1"));
-    std::fs::write(app.config.workspace.join("task.md"), "mutable task details").unwrap();
-    app.ralph_loop = Some(RalphLoop::new("Use @task.md exactly".into(), "DONE".into(), Some(3)).unwrap());
-    app.continue_ralph_loop();
-    for _ in 0..200 {
+    app.goal_command("Ship the parser");
+    for _ in 0..300 {
         sleep(Duration::from_millis(10)).await;
         app.drain_agent_events();
-        if app.ralph_loop.as_ref().is_some_and(|state| state.status == RalphStatus::Completed) {
+        if app.running.is_none()
+            && app.state.goal.snapshot().is_some_and(|goal| goal.status == crate::goal::GoalStatus::Complete)
+        {
             break;
         }
     }
-    assert_eq!(app.ralph_loop.as_ref().unwrap().iteration, 2);
-    assert_eq!(app.ralph_loop.as_ref().unwrap().status, RalphStatus::Completed);
+    let goal = app.state.goal.snapshot().unwrap();
+    assert_eq!(goal.status, crate::goal::GoalStatus::Complete, "the model ended it");
+    assert_eq!(goal.iterations, 2, "two turns: the one the goal started with, and one it carried on with");
+    assert!(app.running.is_none(), "a complete goal starts no more turns");
+
     let requests = server.await.unwrap();
-    for (index, request) in requests.iter().enumerate() {
-        let body = request.split("\r\n\r\n").nth(1).unwrap();
-        let value: Value = serde_json::from_str(body).unwrap();
-        let repeats = value["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|message| message["role"] == "user" && message["content"] == "Use @task.md exactly")
-            .count();
-        assert_eq!(repeats, index + 1);
-    }
+    let carried = requests[1].split("\r\n\r\n").nth(1).unwrap();
+    assert!(carried.contains("[goal not done]") && carried.contains("Ship the parser"), "{carried}");
+    assert!(app.entries.iter().any(|entry| entry.kind == EntryKind::System && entry.text == GOAL_CARRIES_ON));
+    assert!(
+        app.entries.iter().all(|entry| !entry.text.contains("[goal not done]")),
+        "the prompt nobody typed is not shown as a message"
+    );
 }
 
 #[tokio::test]

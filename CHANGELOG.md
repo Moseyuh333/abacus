@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **A goal keeps going until it is done.** While a goal is active, every turn
+  that ends by itself starts another, telling the model the goal isn't done
+  yet. It stops when the model marks the goal complete, or pauses it with a
+  note saying what it needs from you; when you pause or clear it; or when you
+  stop the turn. Two turns in a row that call no tool pause it, so a model that
+  only talks can't run up turns forever. Front ends get `continues` on
+  `turn/completed` and show the next turn as from the goal, not from you.
+- **`/loop` is gone; `/goal` replaces it.** `/loop`, `/cancel-loop` and
+  headless `--loop`, `--max-iterations` and `--completion-promise` are removed.
+  Headless `--goal` makes the prompt the goal and runs until it is complete or
+  paused; the JSON result says which in `goal`. A saved loop in an old session
+  is ignored.
+
 ## 0.7.5 — 2026-10-28
 
 What Abacus Desktop 0.1.5 builds on, a fix for its browser, and the reasoning

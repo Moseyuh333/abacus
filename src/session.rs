@@ -12,7 +12,6 @@ use uuid::Uuid;
 use crate::compaction::CompactionState;
 use crate::config::{AbacusPaths, atomic_write};
 use crate::goal::Goal;
-use crate::ralph::RalphLoop;
 use crate::task::Task;
 
 const SESSION_VERSION: u32 = 3;
@@ -91,7 +90,6 @@ pub struct Session {
     pub updated_at: DateTime<Utc>,
     pub messages: Vec<Value>,
     pub goal: Option<Goal>,
-    pub ralph_loop: Option<RalphLoop>,
     #[serde(default)]
     pub tasks: Vec<Task>,
     pub compaction: Option<CompactionState>,
@@ -121,7 +119,6 @@ impl Session {
             updated_at: now,
             messages,
             goal: None,
-            ralph_loop: None,
             tasks: Vec::new(),
             compaction: None,
             tokens_used: 0,
@@ -216,7 +213,6 @@ impl SessionStore {
         let mut fork = Session::new(self.workspace.clone(), profile, model, messages);
         fork.title = format!("(fork) {}", original.title).chars().take(100).collect();
         fork.goal = original.goal.clone();
-        fork.ralph_loop = original.ralph_loop.clone();
         fork.tasks = original.tasks.clone();
         fork.compaction = original.compaction.clone();
         fork.forked_from = Some(original.id);
@@ -553,7 +549,7 @@ mod tests {
             json!({"role":"system","content":"x"}),
             json!({"role":"user","content":"Fix the parser without changing its API"}),
         ]);
-        session.ralph_loop = Some(crate::ralph::RalphLoop::new("Keep fixing".into(), "DONE".into(), Some(5)).unwrap());
+        session.goal = Some(Goal::new("Keep fixing").unwrap());
         session.tokens_used = 12_345;
         session.active_secs = 3_661;
         store.save(&session).unwrap();
@@ -562,7 +558,7 @@ mod tests {
         assert_eq!(loaded.title, "Fix the parser without changing its API");
         assert_eq!(loaded.tokens_used, 12_345);
         assert_eq!(loaded.active_secs, 3_661);
-        assert_eq!(loaded.ralph_loop.unwrap().prompt, "Keep fixing");
+        assert_eq!(loaded.goal.unwrap().objective, "Keep fixing");
         assert_eq!(store.latest().unwrap().id, session.id);
         let usage = store.usage().unwrap();
         assert_eq!(usage.len(), 1);

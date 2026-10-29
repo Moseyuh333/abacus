@@ -15,7 +15,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let columns = app.settings.ui.content_columns();
     let composer_text_width = area.width.min(columns).saturating_sub(6).max(1) as usize;
     app.composer_width = composer_text_width as u16;
-    let task_height = u16::from(app.state.goal.snapshot().is_some() || app.ralph_loop.is_some()) * 2
+    let task_height = u16::from(app.state.goal.snapshot().is_some()) * 2
         + u16::from(!app.state.tasks.is_empty())
         + app.workers.board.strip_rows();
     // The composer grows to its configured height, but never so far that the
@@ -258,7 +258,7 @@ pub(super) fn draw_welcome(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Text::from(lines)), panel);
 }
 
-/// The persistent-work strip between transcript and composer: goal, loop, and
+/// The persistent-work strip between transcript and composer: goal and
 /// task-list state. Filled with the surface colour so it reads as a pinned
 /// band rather than as more transcript.
 pub(super) fn draw_task_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -275,22 +275,6 @@ pub(super) fn draw_task_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
             bold(format!(" {glyph} GOAL  "), color),
             fg(ui::truncate(&goal.objective, 72), text()),
             fg("   /goal pause · edit · clear", rail()),
-        ]));
-    }
-    if let Some(state) = &app.ralph_loop {
-        let color = match state.status {
-            RalphStatus::Active => secondary(),
-            RalphStatus::Paused => warning(),
-            RalphStatus::Completed => success(),
-            RalphStatus::Cancelled | RalphStatus::MaxIterations => muted(),
-        };
-        let limit = state.max_iterations.map(|value| value.to_string()).unwrap_or_else(|| "∞".to_owned());
-        lines.push(Line::from(vec![
-            bold(format!(" {} LOOP  ", ui::glyphs().repeat), color),
-            fg(format!("{} / {limit}", state.iteration), text()),
-            ui::dot(),
-            fg(format!("promise: {}", ui::truncate(&state.completion_promise, 32)), muted()),
-            fg("   /cancel-loop", rail()),
         ]));
     }
     let tasks = app.state.tasks.snapshot();

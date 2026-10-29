@@ -23,8 +23,8 @@ use abacus_agent::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if cli.loop_run && cli.prompt.is_none() {
-        anyhow::bail!("--loop requires a prompt via -p/--prompt");
+    if cli.goal && cli.prompt.is_none() {
+        anyhow::bail!("--goal requires a prompt via -p/--prompt");
     }
     let paths = AbacusPaths::discover()?;
 
@@ -140,37 +140,21 @@ async fn main() -> Result<()> {
     }
     let mut messages =
         session.as_ref().map(|value| value.messages.clone()).unwrap_or_else(|| initial_messages(&config.workspace));
-    if cli.loop_run && !cli.images.is_empty() {
-        anyhow::bail!("--image cannot be combined with --loop");
-    }
-    // A loop replays its own prompt each iteration; a plain run sends it once.
-    let loop_config = if cli.loop_run {
-        let promise = cli
-            .completion_promise
-            .clone()
-            .unwrap_or_else(|| abacus_agent::ralph::DEFAULT_COMPLETION_PROMISE.to_owned());
-        Some(abacus_agent::ralph::RalphLoop::new(prompt, promise, cli.max_iterations)?)
-    } else {
-        let prompt = expand_file_references(&config.workspace, &prompt)?;
-        // `@shot.png` in the prompt and `--image` files both reach the model as
-        // images; a prompt with neither stays a plain string.
-        let images = cli.images.iter().map(|path| context::image_data_url(path)).collect::<Result<Vec<_>>>()?;
-        let content = context::with_images(
-            context::user_content(&config.workspace, &config.paths.attachments_dir, &prompt),
-            images,
-        );
-        messages.push(json!({"role": "user", "content": content}));
-        None
-    };
+    // With --goal the prompt is the goal too, as `/goal <prompt>` makes it.
+    let goal = cli.goal.then(|| prompt.clone());
+    let prompt = expand_file_references(&config.workspace, &prompt)?;
+    // `@shot.png` in the prompt and `--image` files both reach the model as
+    // images; a prompt with neither stays a plain string.
+    let images = cli.images.iter().map(|path| context::image_data_url(path)).collect::<Result<Vec<_>>>()?;
+    let content =
+        context::with_images(context::user_content(&config.workspace, &config.paths.attachments_dir, &prompt), images);
+    messages.push(json!({"role": "user", "content": content}));
     if let (Some(session), Some(store)) = (session.as_mut(), &store) {
         session.update_messages(messages.clone());
-        if loop_config.is_some() {
-            session.ralph_loop.clone_from(&loop_config);
-        }
         store.save(session)?;
     }
     let reporter = ActivityReporter::new(settings.activity.enabled, &settings.activity.endpoint, &config.paths);
-    headless::run(config, cli.output_format, messages, session, store, services, loop_config, reporter).await
+    headless::run(config, cli.output_format, messages, session, store, services, goal, reporter).await
 }
 
 /// The model's limits as the provider reports them, unless the user pinned

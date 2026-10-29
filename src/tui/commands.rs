@@ -39,8 +39,6 @@ impl App {
             "/usage" => self.open_usage(),
             "/tools" | "/skills" | "/plugins" | "/mcps" => self.list_extensions(),
             "/goal" => self.goal_command(argument),
-            "/loop" => self.loop_command(argument),
-            "/cancel-loop" => self.cancel_ralph_loop(),
             "/config" => self.open_config(argument),
             "/theme" => self.theme_command(argument),
             "/feedback" => self.open_feedback(),
@@ -378,11 +376,6 @@ impl App {
             handle.abort();
             self.approval = None;
             self.receiving_delta = false;
-            if let Some(state) = &mut self.ralph_loop
-                && state.is_active()
-            {
-                let _ = state.pause();
-            }
         }
         match reply.said {
             Ok(text) => self.say(text),
@@ -394,92 +387,14 @@ impl App {
         }
     }
 
-    pub(super) fn loop_command(&mut self, argument: &str) {
-        let argument = argument.trim();
-        if argument.is_empty() || argument == "status" {
-            let text = self.ralph_loop.as_ref().map_or_else(
-                || "No Ralph loop is configured.\n\nUsage: /loop \"<prompt>\" --max-iterations 20 --completion-promise \"DONE\"".to_owned(),
-                |state| format!(
-                    "Ralph loop · {:?}\nIteration: {}{}\nCompletion promise: {}\n\n{}",
-                    state.status,
-                    state.iteration,
-                    state.max_iterations.map(|limit| format!(" / {limit}")).unwrap_or_else(|| " / unlimited".to_owned()),
-                    state.completion_promise,
-                    state.prompt
-                ),
-            );
-            self.say(text);
-            return;
-        }
-        if argument == "pause" {
-            let result = self.ralph_loop.as_mut().context("no Ralph loop is configured").and_then(RalphLoop::pause);
-            self.status = result
-                .map(|()| "loop pauses after the current turn".to_owned())
-                .unwrap_or_else(|error| format!("loop pause failed: {error}"));
-            self.persist_session();
-            return;
-        }
-        if argument == "resume" {
-            let result = self.ralph_loop.as_mut().context("no Ralph loop is configured").and_then(RalphLoop::resume);
-            match result {
-                Ok(()) => self.continue_ralph_loop(),
-                Err(error) => self.status = format!("loop resume failed: {error}"),
-            }
-            return;
-        }
-        if argument == "cancel" {
-            return self.cancel_ralph_loop();
-        }
-        match RalphLoop::from_command(argument) {
-            Ok(state) => {
-                self.ralph_loop = Some(state);
-                self.persist_session();
-                self.continue_ralph_loop();
-            }
-            Err(error) => {
-                self.fail(format!("Could not start loop: {error:#}\n\nUsage: /loop \"<prompt>\" --max-iterations 20 --completion-promise \"DONE\""));
-            }
-        }
-    }
-
-    pub(super) fn continue_ralph_loop(&mut self) {
+    /// The last turn ended by itself while the goal is active: start the next
+    /// one (see [`crate::goal::GoalState::after_turn`]).
+    pub(super) fn carry_on_goal(&mut self, prompt: String) {
         if self.running.is_some() {
             return;
         }
-        let Some(state) = &mut self.ralph_loop else {
-            return;
-        };
-        if !state.is_active() {
-            return;
-        }
-        let iteration = match state.begin_iteration() {
-            Ok(iteration) => iteration,
-            Err(error) => {
-                self.status = format!("loop stopped: {error}");
-                self.persist_session();
-                return;
-            }
-        };
-        let prompt = state.prompt.clone();
-        self.say(format!("Ralph loop · iteration {iteration}"));
-        self.persist_session();
-        self.start_turn(prompt.clone(), prompt, false);
-    }
-
-    pub(super) fn cancel_ralph_loop(&mut self) {
-        let Some(state) = &mut self.ralph_loop else {
-            self.status = "no Ralph loop is active".to_owned();
-            return;
-        };
-        state.cancel();
-        if let Some(handle) = self.running.take() {
-            handle.abort();
-            self.approval = None;
-            self.receiving_delta = false;
-        }
-        self.persist_session();
-        self.status = "Ralph loop cancelled".to_owned();
-        self.say("Ralph loop cancelled by user.");
+        self.say(GOAL_CARRIES_ON);
+        self.start_turn(String::new(), prompt, false);
     }
 
     /// `/theme [auto|dark|light]` — switch the palette live and persist it.

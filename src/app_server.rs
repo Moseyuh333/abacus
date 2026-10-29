@@ -184,6 +184,12 @@ struct App {
     /// each change is reported once.
     reported_goal: Value,
     reported_tasks: Value,
+    /// Whether the running turn has called a tool, which tells an active
+    /// goal whether its turns still get anywhere.
+    turn_worked: bool,
+    /// The prompt of the turn an active goal starts once the last one ended
+    /// by itself (see `finish_turn`).
+    goal_turn: Option<String>,
     /// YOLO when set, AUTO otherwise. Shared with the running turn, so a
     /// switch applies from its next tool call.
     yolo: Arc<AtomicBool>,
@@ -266,6 +272,8 @@ pub async fn run(
         reported_context: 0,
         reported_goal: Value::Null,
         reported_tasks: Value::Null,
+        turn_worked: false,
+        goal_turn: None,
         yolo,
         cancel: Arc::new(AtomicBool::new(false)),
         turn_id: None,
@@ -1490,6 +1498,8 @@ impl App {
             self.persist();
         }
         self.mailbox.set_working(true);
+        self.turn_worked = false;
+        self.goal_turn = None;
         let turn = self.next("turn");
         self.turn_id = Some(turn.clone());
         self.cancel = Arc::new(AtomicBool::new(false));
@@ -1648,6 +1658,7 @@ impl App {
                 // A tool call ends whatever text was streaming: the model has
                 // stopped talking and started doing.
                 self.flush_streaming();
+                self.turn_worked = true;
                 // It also means a reply just came back, with the size of the
                 // prompt it answered: the context meter moves during a long
                 // turn instead of only at its end.
@@ -1811,6 +1822,20 @@ impl App {
         if status != "failed" {
             self.idle_due = Some(tokio::time::Instant::now() + crate::compaction::IDLE_AFTER);
         }
+        // A turn that ended by itself carries an active goal on, unless
+        // something waiting starts the next turn anyway: the goal carries on
+        // once that one ends. A turn the person stopped, or that failed, ends
+        // the run of turns.
+        if matches!(status, "completed" | "stepLimit") && !self.thread.state.injections.has_starter() {
+            match self.thread.state.goal.after_turn(self.turn_worked) {
+                Some(crate::goal::Next::Turn(prompt)) => self.goal_turn = Some(prompt),
+                Some(crate::goal::Next::Stalled) => notify(
+                    "warning",
+                    json!({"message": "Goal paused: two turns in a row ended without doing any work."}),
+                ),
+                None => {}
+            }
+        }
         self.persist();
         self.report_diff(&turn);
         if let Some(usage) = &self.usage {
@@ -1827,9 +1852,9 @@ impl App {
                 "status": status,
                 "name": self.thread.session.title,
                 // A steering message this turn did not reach, a background
-                // report or a message starts the next one at once; a client
-                // holding messages for later waits.
-                "continues": self.thread.state.injections.has_starter(),
+                // report, a message or an unfinished goal starts the next one
+                // at once; a client holding messages for later waits.
+                "continues": self.thread.state.injections.has_starter() || self.goal_turn.is_some(),
             }),
         );
     }
@@ -1865,7 +1890,15 @@ impl App {
                 self.begin_turn(Value::String(message.prompt(&self.config.workspace)), item, events);
                 return;
             }
-            Some(Injection::SideNote(_) | Injection::ToolImages { .. }) | None => return,
+            Some(Injection::SideNote(_) | Injection::ToolImages { .. }) | None => {
+                // Nothing else waits: an active goal goes on.
+                if let Some(prompt) = self.goal_turn.take()
+                    && self.thread.state.goal.is_active()
+                {
+                    self.begin_turn(Value::String(prompt), carry_on_item(), events);
+                }
+                return;
+            }
         };
         let item = user_item(&content);
         self.begin_turn(content, item, events);
@@ -2354,6 +2387,18 @@ pub(crate) fn agent_item(from: &str, text: &str) -> Value {
     json!({"type": "userMessage", "text": text, "from": {"title": from, "agent": true}})
 }
 
+/// The turn an unfinished goal started by itself, as a client item: a
+/// `userMessage` from the goal, which a client that predates it shows like
+/// another agent's message.
+fn carry_on_item() -> Value {
+    json!({
+        "type": "userMessage",
+        "text": "The goal is not done yet, so the agent carries on.",
+        "goal": true,
+        "from": {"title": "Goal", "agent": true},
+    })
+}
+
 /// Background subagents' report as a client item, from the workers it covers.
 fn report_item(report: &str) -> Value {
     let workers = crate::subagent::report_workers(report);
@@ -2441,7 +2486,9 @@ fn history_items(messages: &[Value]) -> Vec<Value> {
                 if crate::agent::is_tool_images(&said) {
                     continue;
                 }
-                let mut item = if let Some((title, text)) = crate::inbox::shown(&said) {
+                let mut item = if crate::goal::is_carry_on(&said) {
+                    carry_on_item()
+                } else if let Some((title, text)) = crate::inbox::shown(&said) {
                     peer_item(&title, None, &text)
                 } else {
                     match crate::agent::arrival(&said) {
@@ -2778,6 +2825,22 @@ mod tests {
         ]);
         let types: Vec<&str> = items.iter().map(|item| item["type"].as_str().unwrap()).collect();
         assert_eq!(types, ["userMessage", "functionCall"]);
+    }
+
+    #[test]
+    fn history_marks_the_turns_a_goal_started_by_itself() {
+        let goal = crate::goal::GoalState::default();
+        goal.create("Ship the parser").unwrap();
+        let Some(crate::goal::Next::Turn(prompt)) = goal.after_turn(true) else { panic!("the goal carries on") };
+        let items = history_items(&[
+            json!({"role": "user", "content": "Ship the parser"}),
+            json!({"role": "assistant", "content": "Parsed half of it."}),
+            json!({"role": "user", "content": prompt}),
+        ]);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2]["goal"], true, "not shown as the person's message");
+        assert_eq!(items[2]["from"]["title"], "Goal");
+        assert!(!items[2]["text"].as_str().unwrap().contains("goal_update"), "nor as the prompt");
     }
 
     #[test]

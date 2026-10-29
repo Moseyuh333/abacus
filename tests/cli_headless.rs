@@ -70,35 +70,43 @@ fn headless_json_runs_without_prior_setup() {
     assert!(value["session_id"].is_null());
 }
 
+/// `--goal` keeps a headless run going, turn after turn, until the model marks
+/// the goal complete.
 #[test]
-fn headless_loop_stops_when_promise_appears() {
+fn headless_goal_runs_until_the_model_completes_it() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        // The /models probe lands first; answer 404, then serve two chat turns.
-        let mut served_chat = 0;
-        while served_chat < 2 {
+        // The first turn only talks, so the goal carries it on; the second
+        // marks the goal complete, then answers. A fourth chat request would
+        // find nobody listening and fail the run.
+        let complete = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"goal_update","arguments":"{\"status\":\"complete\"}"}}]}}]}"#;
+        let answers = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"still working \"}}]}\n\ndata: [DONE]\n\n".to_owned(),
+            format!(
+                "data: {complete}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+            ),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"all green\"}}]}\n\ndata: [DONE]\n\n".to_owned(),
+        ];
+        let mut served = Vec::new();
+        while served.len() < answers.len() {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0_u8; 64 * 1024];
-            let read = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request = read_request(&mut stream);
             if request.starts_with("GET /v1/models") {
                 let response = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
                 stream.write_all(response.as_bytes()).unwrap();
                 continue;
             }
-            // First chat turn: no promise yet. Second: emits DONE and ends the loop.
-            let content = if served_chat == 0 { "still working" } else { "all green DONE" };
-            let body =
-                format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\ndata: [DONE]\n\n");
+            let body = &answers[served.len()];
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
             stream.write_all(response.as_bytes()).unwrap();
-            served_chat += 1;
+            served.push(request);
         }
+        served
     });
 
     let directory = tempdir().unwrap();
@@ -116,24 +124,20 @@ fn headless_loop_stops_when_promise_appears() {
             "--no-session",
             "--prompt",
             "finish the task",
-            "--loop",
-            "--completion-promise",
-            "DONE",
-            "--max-iterations",
-            "5",
+            "--goal",
             "--output-format",
             "json",
         ])
         .output()
         .unwrap();
-    server.join().unwrap();
+    let served = server.join().unwrap();
 
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["ok"], true);
-    assert!(value["text"].as_str().unwrap().contains("DONE"));
-    // The server served exactly two chat turns (plus the /models probe); a third
-    // chat turn would have hung the test.
+    assert_eq!(value["goal"], "complete");
+    assert_eq!(value["text"], "still working all green");
+    assert!(served[1].contains("[goal not done]") && served[1].contains("finish the task"), "{}", served[1]);
 }
 
 /// What the scripted model reports for every request, as the provider's final

@@ -11,7 +11,6 @@ use crate::{
     agent::{AgentEvent, ApprovalDecision, TurnOptions, run_turn},
     config::{AbacusPaths, Config, OutputFormat},
     provider::Provider,
-    ralph::{RalphLoop, RalphStatus},
     services::AgentServices,
     session::{Session, SessionState, SessionStore},
     usage::UsageReporter,
@@ -42,7 +41,7 @@ pub async fn run(
     session: Option<Session>,
     store: Option<SessionStore>,
     services: Arc<AgentServices>,
-    loop_config: Option<RalphLoop>,
+    goal: Option<String>,
     reporter: Option<ActivityReporter>,
 ) -> Result<()> {
     let initial_tokens = session.as_ref().map(|session| session.tokens_used).unwrap_or(0);
@@ -65,7 +64,13 @@ pub async fn run(
     // than distinct processes.
     let state = SessionState::open(&config, session.as_ref());
 
-    let mut ralph = loop_config;
+    // A goal run carries on, turn after turn, until the goal is no longer
+    // active; any other run is the one turn.
+    let goal_run = goal.is_some();
+    if let Some(objective) = &goal {
+        state.goal.create(objective)?;
+    }
+    let mut worked = false;
     let mut text = String::new();
     let mut final_messages = messages;
 
@@ -104,21 +109,12 @@ pub async fn run(
 
     let mut failure: Option<String> = None;
 
-    // Loop mode drives its own prompt replay; non-loop mode expects the caller to
-    // have already pushed the user message onto `final_messages`.
-    if let Some(state) = ralph.as_mut()
-        && let Err(error) = state.begin_iteration()
-    {
-        failure = Some(format!("{error:#}"));
-    } else if let Some(state) = ralph.as_ref() {
-        final_messages.push(json!({"role": "user", "content": state.prompt.clone()}));
-    }
-
+    // The caller has already pushed the prompt onto `final_messages`.
     let start = |messages: Vec<Value>| {
         let options = turn_options(&config, &yolo, &services, &state, session_id.clone(), trace.clone());
         tokio::spawn(run_turn(provider.clone(), messages, options, events.clone()))
     };
-    let mut current_task = failure.is_none().then(|| start(final_messages.clone()));
+    let mut current_task = Some(start(final_messages.clone()));
 
     while failure.is_none()
         && let Some(event) = receiver.recv().await
@@ -159,11 +155,14 @@ pub async fn run(
                     json!({"type": "user_question.auto_answered", "header": request.header}),
                 )?;
             }
-            AgentEvent::ToolStarted { name, summary } => announce(
-                format,
-                &format!("{name}: {summary}"),
-                json!({"type": "tool.started", "tool": name, "summary": summary}),
-            )?,
+            AgentEvent::ToolStarted { name, summary } => {
+                worked = true;
+                announce(
+                    format,
+                    &format!("{name}: {summary}"),
+                    json!({"type": "tool.started", "tool": name, "summary": summary}),
+                )?
+            }
             AgentEvent::ToolFinished { name, output, refused } => {
                 if format == OutputFormat::StreamingJson {
                     emit(json!({"type": "tool.finished", "tool": name, "output": output, "refused": refused}))?;
@@ -171,23 +170,23 @@ pub async fn run(
             }
             AgentEvent::Done { messages, .. } => {
                 final_messages = messages;
-                let Some(state) = ralph.as_mut() else { break };
-                if state.observe_output(crate::text::last_reply(&final_messages)) {
-                    aside(format, &format!("loop completed after {} iteration(s)", state.iteration));
-                } else if state.status == RalphStatus::MaxIterations {
-                    aside(format, &format!("loop stopped at {} iteration(s)", state.iteration));
-                }
-                if !state.is_active() {
+                if !goal_run {
                     break;
                 }
-                match state.begin_iteration() {
-                    Ok(iteration) => {
-                        aside(format, &format!("loop · iteration {iteration}"));
-                        final_messages.push(json!({"role": "user", "content": state.prompt.clone()}));
+                match state.goal.after_turn(std::mem::take(&mut worked)) {
+                    Some(crate::goal::Next::Turn(prompt)) => {
+                        aside(format, "goal not done yet, carrying on");
+                        final_messages.push(json!({"role": "user", "content": prompt}));
                         current_task = Some(start(final_messages.clone()));
                     }
-                    Err(error) => {
-                        aside(format, &format!("loop stopped: {error}"));
+                    Some(crate::goal::Next::Stalled) => {
+                        aside(format, "goal paused: two turns in a row ended without doing any work");
+                        break;
+                    }
+                    None => {
+                        if let Some(goal) = state.goal.snapshot() {
+                            aside(format, &format!("goal {:?} after {} turn(s)", goal.status, goal.iterations));
+                        }
                         break;
                     }
                 }
@@ -207,10 +206,6 @@ pub async fn run(
             AgentEvent::Failed { error, messages } => {
                 final_messages = messages;
                 failure = Some(error);
-                if let Some(state) = ralph.as_mut() {
-                    let _ = state.pause();
-                    aside(format, "loop paused after failure");
-                }
             }
         }
     }
@@ -227,7 +222,6 @@ pub async fn run(
         PersistedRun {
             messages: final_messages,
             state: &state,
-            ralph: &ralph,
             profile: &config.profile,
             model: &config.model_ref(),
             tokens_used: provider.tokens_used(),
@@ -295,19 +289,30 @@ pub async fn run(
         bail!(error);
     }
 
+    // A goal run says where its goal ended up: complete, or paused.
+    let goal_status = goal_run.then(|| state.goal.snapshot().map(|goal| goal.status)).flatten();
     match format {
-        OutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
+        OutputFormat::Json => {
+            let mut result = json!({
                 "ok": true,
                 "text": text,
                 "session_id": session_id
-            }))?
-        ),
-        OutputFormat::StreamingJson => emit(json!({
-            "type": "done",
-            "session_id": session_id
-        }))?,
+            });
+            if let Some(status) = goal_status {
+                result["goal"] = json!(status);
+            }
+            println!("{}", serde_json::to_string_pretty(&result)?)
+        }
+        OutputFormat::StreamingJson => {
+            let mut done = json!({
+                "type": "done",
+                "session_id": session_id
+            });
+            if let Some(status) = goal_status {
+                done["goal"] = json!(status);
+            }
+            emit(done)?
+        }
         OutputFormat::Plain => {}
     }
     Ok(())
@@ -316,7 +321,6 @@ pub async fn run(
 struct PersistedRun<'a> {
     messages: Vec<Value>,
     state: &'a SessionState,
-    ralph: &'a Option<RalphLoop>,
     profile: &'a str,
     model: &'a str,
     tokens_used: u64,
@@ -338,7 +342,6 @@ fn persist_session(
     };
     session_value.update_messages(run.messages);
     run.state.save(&mut session_value);
-    session_value.ralph_loop = run.ralph.clone();
     session_value.tokens_used = run.tokens_used;
     session_value.active_secs = session_value.active_secs.saturating_add(run.active_secs);
     store.save(&session_value)?;
@@ -414,7 +417,6 @@ mod tests {
             PersistedRun {
                 messages,
                 state: &SessionState::default(),
-                ralph: &None,
                 profile: "local",
                 model: "model",
                 tokens_used: 150_000_000,
@@ -451,7 +453,6 @@ mod tests {
             PersistedRun {
                 messages: vec![json!({"role":"system","content":"x"}), json!({"role":"user","content":"continue"})],
                 state: &SessionState::default(),
-                ralph: &None,
                 profile: "ignored",
                 model: "ignored",
                 tokens_used: 15_500,
