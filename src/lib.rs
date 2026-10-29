@@ -41,6 +41,7 @@ pub mod subagent;
 pub mod sync;
 pub mod sync_state;
 pub mod task;
+pub mod terminal;
 pub mod text;
 pub mod theme;
 pub mod tool_format;

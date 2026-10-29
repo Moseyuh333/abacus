@@ -22,6 +22,12 @@ use abacus_agent::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything is printed. A Windows console decodes the bytes it is
+    // given with a codepage, not UTF-8, so on a console set to 936 every glyph
+    // in this program would arrive as mojibake (issue #11). Switching it here
+    // covers clap's help, the setup wizard, doctor and the TUI at once; if the
+    // console refuses, the glyph tables fall back to ASCII.
+    abacus_agent::terminal::ensure_utf8_console();
     // The language for anything printed before a settings file is read: the
     // environment's choice, then the operating system's. `setup` and `doctor`
     // refine it once they have the user's setting.

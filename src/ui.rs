@@ -96,6 +96,11 @@ pub struct Glyphs {
     /// Half-block wordmark rows, or `None` where the blocks won't render and
     /// the splash falls back to plain letters.
     pub wordmark: Option<[&'static str; 2]>,
+    /// What a hidden value is drawn with — the API key in the provider editor.
+    /// It comes from the table rather than from a literal at the call site, so
+    /// a terminal that cannot draw the Unicode set masks with `*` instead of
+    /// filling the field with tofu.
+    pub mask: &'static str,
 }
 
 impl Glyphs {
@@ -137,6 +142,7 @@ impl Glyphs {
         corner_bl: "╰",
         corner_br: "╯",
         wordmark: Some(["▄▀█ █▄▄ ▄▀█ █▀▀ █ █ █▀", "█▀█ █▄█ █▀█ █▄▄ █▄█ ▄█"]),
+        mask: "•",
     };
 
     pub const ASCII: Glyphs = Glyphs {
@@ -175,6 +181,7 @@ impl Glyphs {
         corner_bl: "+",
         corner_br: "+",
         wordmark: None,
+        mask: "*",
     };
 
     /// Nerd Font glyphs, for a terminal running a patched font.
@@ -232,6 +239,7 @@ impl Glyphs {
         corner_bl: "╰",
         corner_br: "╯",
         wordmark: Some(["▄▀█ █▄▄ ▄▀█ █▀▀ █ █ █▀", "█▀█ █▄█ █▀█ █▄▄ █▄█ ▄█"]),
+        mask: "•",
     };
 }
 
@@ -274,12 +282,25 @@ impl GlyphChoice {
             GlyphChoice::Unicode => &Glyphs::UNICODE,
             GlyphChoice::Nerd => &Glyphs::NERD,
             GlyphChoice::Ascii => &Glyphs::ASCII,
-            GlyphChoice::Auto => {
-                let bare = std::env::var("TERM").map(|term| matches!(term.trim(), "dumb" | "linux")).unwrap_or(false);
-                if bare { &Glyphs::ASCII } else { &Glyphs::UNICODE }
-            }
+            GlyphChoice::Auto => auto_glyphs(term_is_bare(), crate::terminal::console_can_draw_unicode()),
         }
     }
+}
+
+/// Whether the terminal announces itself as one that cannot draw the Unicode
+/// set at all: `TERM=dumb`, or the Linux console.
+fn term_is_bare() -> bool {
+    std::env::var("TERM").map(|term| matches!(term.trim(), "dumb" | "linux")).unwrap_or(false)
+}
+
+/// What `Auto` resolves to.
+///
+/// `Auto` has no taste of its own: it takes the ASCII table wherever the
+/// terminal cannot draw the Unicode one. That is a bare `TERM`, and it is a
+/// Windows console whose codepage could not be made UTF-8 — see
+/// [`crate::terminal`], where the alternative is mojibake in place of glyphs.
+pub fn auto_glyphs(term_is_bare: bool, console_utf8: bool) -> &'static Glyphs {
+    if term_is_bare || !console_utf8 { &Glyphs::ASCII } else { &Glyphs::UNICODE }
 }
 
 /// The environment's say in the matter, which overrides the setting.
@@ -1617,6 +1638,26 @@ mod tests {
             std::env::remove_var("ABACUS_ASCII");
         }
         set_glyphs(GlyphChoice::Auto);
+    }
+
+    /// A Windows console that could not be switched to UTF-8 decodes output
+    /// bytes with its own codepage, so the Unicode table arrives as mojibake.
+    /// `Auto` must fall back there, and keep the Unicode table everywhere else.
+    #[test]
+    fn auto_falls_back_to_ascii_where_unicode_cannot_be_drawn() {
+        // The mask differs between the two tables, so it identifies which one
+        // `Auto` picked without relying on const-promotion identity.
+        assert_eq!(auto_glyphs(false, false).mask, Glyphs::ASCII.mask, "codepage console");
+        assert_eq!(auto_glyphs(true, true).mask, Glyphs::ASCII.mask, "bare TERM");
+        assert_eq!(auto_glyphs(false, true).mask, Glyphs::UNICODE.mask, "ordinary terminal");
+    }
+
+    /// The API-key mask is drawn from the active table, so a terminal without
+    /// the Unicode set masks with a character it can actually draw.
+    #[test]
+    fn the_mask_follows_the_glyph_table() {
+        assert_eq!(Glyphs::UNICODE.mask, "•");
+        assert_eq!(Glyphs::ASCII.mask, "*");
     }
 
     #[test]
