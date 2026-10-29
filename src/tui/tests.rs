@@ -53,6 +53,8 @@ async fn effort_command_sets_clears_and_reports() {
 /// means it must tolerate being called twice, and out of order.
 #[test]
 fn restoring_the_terminal_is_idempotent_and_claim_gated() {
+    // Shares process-wide shutdown atomics with the lane-B2 tests below.
+    let _guard = lock_shutdown();
     // Never claimed: restoring must not touch a terminal we do not own.
     TERMINAL_CLAIMED.store(false, Ordering::SeqCst);
     KEYBOARD_ENHANCED.store(false, Ordering::SeqCst);
@@ -68,6 +70,29 @@ fn restoring_the_terminal_is_idempotent_and_claim_gated() {
     assert!(!KEYBOARD_ENHANCED.load(Ordering::SeqCst), "flags popped once");
     restore_terminal();
     assert!(!TERMINAL_CLAIMED.load(Ordering::SeqCst), "still released");
+}
+
+/// The kitty protocol is what a terminal left in it misbehaves with, so there
+/// has to be a way out of it that does not involve closing the window.
+#[test]
+fn the_keyboard_protocol_can_be_turned_off_from_the_environment() {
+    static ENV: Mutex<()> = Mutex::new(());
+    let _guard = ENV.lock().unwrap_or_else(|error| error.into_inner());
+    unsafe {
+        std::env::remove_var("ABACUS_KEYBOARD");
+    }
+    assert!(keyboard_flags_enabled(), "on by default");
+    unsafe {
+        std::env::set_var("ABACUS_KEYBOARD", " none ");
+    }
+    assert!(!keyboard_flags_enabled(), "trimmed and case-folded");
+    unsafe {
+        std::env::set_var("ABACUS_KEYBOARD", "kitty");
+    }
+    assert!(keyboard_flags_enabled(), "any other value keeps the default");
+    unsafe {
+        std::env::remove_var("ABACUS_KEYBOARD");
+    }
 }
 
 /// The composer is drawn at the centred content cap, not the frame width.
@@ -3053,4 +3078,165 @@ async fn idle_compaction_skips_local_servers_and_short_sessions() {
     app.quiet_since = Some(long_ago);
     app.maybe_idle_compact();
     assert!(app.idle_compaction.is_none());
+}
+
+/// Lane B2: one shutdown helper for every exit path.
+///
+/// `restore_terminal()` is the single funnel for the normal return
+/// (`TerminalRestore`'s `Drop`), both hard exits (the graceful
+/// `PENDING_SIGNAL` exit and the signal backstop — both through
+/// `exit_after_restore`), and the panic hook. Each test below claims the
+/// terminal the way `run()` leaves it, exercises one path's restore effect,
+/// and asserts the claim atomics are cleared with the pop emitted exactly
+/// once; the closing audit pins the funnel itself in source so a future
+/// exit path that bypasses the helper fails loudly.
+///
+/// The "exactly once" half rests on two legs: at runtime the
+/// `KEYBOARD_ENHANCED` swap gate lets the pop line run at most once (a
+/// second restore sees `false` and skips it), and
+/// `shutdown_helper_emits_the_pop_exactly_once` pins that there is exactly
+/// one such line emitting `ESC [ < 1 u`. On Windows crossterm's WinAPI path
+/// reports the pop command unsupported and that error is swallowed, so there
+/// the gate is the enforcer; the byte check below runs through the
+/// platform-independent ANSI writer and holds everywhere.
+static SHUTDOWN_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_shutdown() -> std::sync::MutexGuard<'static, ()> {
+    SHUTDOWN_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Claim the terminal the way `run()` leaves it: handed over with the kitty
+/// flags pushed, so a restore must clear both atomics and pop once.
+fn claim_terminal_for_shutdown_test(with_keyboard: bool) {
+    TERMINAL_CLAIMED.store(true, Ordering::SeqCst);
+    KEYBOARD_ENHANCED.store(with_keyboard, Ordering::SeqCst);
+}
+
+fn assert_shutdown_released(context: &str) {
+    assert!(!TERMINAL_CLAIMED.load(Ordering::SeqCst), "{context}: claim released");
+    assert!(!KEYBOARD_ENHANCED.load(Ordering::SeqCst), "{context}: flags popped once");
+}
+
+/// The brace-balanced body of the item starting at `marker` in `SOURCE`,
+/// for pinning which shutdown calls each exit path makes.
+fn shutdown_item_body<'a>(source: &'a str, marker: &str) -> &'a str {
+    let start = source.find(marker).unwrap_or_else(|| panic!("{marker} exists in src/tui/mod.rs"));
+    let open = source[start..].find('{').expect("item has a body") + start;
+    let mut depth = 0;
+    for (index, ch) in source[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..open + index + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("{marker} body is balanced");
+}
+
+#[test]
+fn shutdown_helper_emits_the_pop_exactly_once() {
+    let _guard = lock_shutdown();
+    // Runtime half: the command the helper runs really is the kitty pop.
+    // Checked through the platform-independent ANSI writer, so this holds
+    // on Windows too.
+    let mut ansi = String::new();
+    crossterm::Command::write_ansi(&PopKeyboardEnhancementFlags, &mut ansi).expect("pop renders its ANSI form");
+    assert_eq!(ansi, "[<1u", "the pop escape the helper emits");
+    // Source half: exactly one pop site inside the helper — commenting it
+    // out (or adding a second) fails this test.
+    const SOURCE: &str = include_str!("mod.rs");
+    let helper = shutdown_item_body(SOURCE, "fn restore_terminal()");
+    // Strip full-line comments so a commented-out pop counts as absent.
+    let live: String =
+        helper.lines().filter(|line| !line.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    assert_eq!(live.matches("PopKeyboardEnhancementFlags").count(), 1, "exactly one live pop in restore_terminal()");
+    assert!(helper.contains("KEYBOARD_ENHANCED.swap(false"), "pop is flag-gated");
+    assert!(helper.contains("TERMINAL_CLAIMED.swap(false"), "restore is claim-gated");
+}
+
+#[test]
+fn normal_return_drop_clears_atomics_and_pops_once() {
+    let _guard = lock_shutdown();
+    // What `run()` leaves behind after setup: claimed, flags pushed.
+    claim_terminal_for_shutdown_test(true);
+    // The normal return path: `drop(terminal); drop(restore);`.
+    drop(TerminalRestore);
+    assert_shutdown_released("normal return");
+    // A racing second path (signal backstop, panic hook) runs into a
+    // released claim and a spent flag: no second pop.
+    restore_terminal();
+    assert_shutdown_released("normal return, second restore");
+}
+
+#[test]
+fn graceful_signal_exit_clears_atomics_and_pops_once() {
+    let _guard = lock_shutdown();
+    // `exit_after_restore` cannot be called here — it ends the process —
+    // so this exercises exactly what it runs first: `restore_terminal()`.
+    // The source audit below pins that the graceful `PENDING_SIGNAL` site
+    // goes through `exit_after_restore` and nothing else.
+    claim_terminal_for_shutdown_test(true);
+    restore_terminal();
+    assert_shutdown_released("graceful signal exit");
+    // The graceful exit runs after the normal `drop(restore)` already
+    // restored: this second call is that no-op, not a second pop.
+    restore_terminal();
+    assert_shutdown_released("graceful signal exit, second restore");
+}
+
+#[test]
+fn signal_backstop_double_restore_pops_at_most_once() {
+    let _guard = lock_shutdown();
+    // The wedged-loop backstop calls `restore_terminal()` directly and then
+    // `exit_after_restore(code)`, which restores again before exiting.
+    claim_terminal_for_shutdown_test(true);
+    restore_terminal();
+    assert_shutdown_released("backstop first restore");
+    assert!(!KEYBOARD_ENHANCED.load(Ordering::SeqCst), "flag already spent: the second restore cannot pop again");
+    restore_terminal();
+    assert_shutdown_released("backstop second restore");
+}
+
+#[test]
+fn panic_hook_restore_clears_atomics_and_pops_once() {
+    let _guard = lock_shutdown();
+    // The panic hook restores before printing, so the message lands on a
+    // normal screen instead of the raw-mode alternate screen.
+    claim_terminal_for_shutdown_test(true);
+    restore_terminal();
+    assert_shutdown_released("panic hook");
+    restore_terminal();
+    assert_shutdown_released("panic hook, second restore");
+}
+
+#[test]
+fn every_exit_path_funnels_through_the_shutdown_helper() {
+    const SOURCE: &str = include_str!("mod.rs");
+    // One helper definition, four restore call sites: `Drop`,
+    // `exit_after_restore`, the panic hook, and the signal backstop.
+    assert_eq!(SOURCE.matches("fn restore_terminal()").count(), 1, "one shutdown helper");
+    assert_eq!(SOURCE.matches("restore_terminal();").count(), 4, "Drop, hard exit, panic hook, backstop");
+    // Both hard exits go through `exit_after_restore`: the definition plus
+    // the graceful-signal site and the backstop site — and it holds the
+    // only `process::exit` in the module.
+    assert_eq!(SOURCE.matches("fn exit_after_restore").count(), 1, "one hard-exit funnel");
+    assert_eq!(SOURCE.matches("exit_after_restore(").count(), 3, "definition plus two call sites");
+    assert_eq!(SOURCE.matches("std::process::exit(").count(), 1, "no exit bypasses the restore");
+    // Each site's body actually calls the helper.
+    let drop_impl = shutdown_item_body(SOURCE, "impl Drop for TerminalRestore");
+    assert!(drop_impl.contains("restore_terminal()"), "normal return restores through the helper");
+    let hard_exit = shutdown_item_body(SOURCE, "fn exit_after_restore");
+    assert!(hard_exit.contains("restore_terminal()"), "hard exits restore before exiting");
+    assert!(hard_exit.contains("std::process::exit"), "hard exits still exit");
+    let hook = shutdown_item_body(SOURCE, "std::panic::set_hook");
+    assert!(hook.contains("restore_terminal()"), "panic hook restores first");
+    let backstop = shutdown_item_body(SOURCE, "if !GRACEFUL_EXIT.load(Ordering::SeqCst)");
+    assert!(backstop.contains("restore_terminal()"), "backstop restores directly");
+    assert!(backstop.contains("exit_after_restore(code)"), "backstop exits through the funnel");
+    assert!(SOURCE.contains("exit_after_restore(PENDING_SIGNAL"), "graceful-signal exit goes through the funnel");
 }
