@@ -23,6 +23,10 @@ use unicode_width::UnicodeWidthStr;
 /// wide enough for a URL and a note beside it.
 pub const WIDTH: usize = 74;
 
+/// Display columns a label occupies in a [`field`] or [`check`] row, so every
+/// value starts in the same column whatever the label is written in.
+const LABEL_WIDTH: usize = 11;
+
 /// Whether to emit SGR codes at all: only when stdout is a terminal *and* the
 /// resolved colour depth is more than nothing.
 pub fn colored() -> bool {
@@ -108,7 +112,7 @@ pub fn blank() {
 /// A `label   value` row. Indented past the status-glyph column so plain
 /// fields and [`check`] rows share one value column.
 pub fn field(label: &str, value: &str) {
-    println!("    {}  {value}", dim(&format!("{label:<11}")));
+    println!("    {}  {value}", dim(&pad(label, LABEL_WIDTH)));
 }
 
 /// `n thing` / `n things`, for summary lines.
@@ -136,7 +140,7 @@ impl Health {
 
 /// A diagnostic row: glyph, aligned label, then the finding.
 pub fn check(health: Health, label: &str, detail: &str) {
-    println!("  {} {}  {detail}", health.glyph(), dim(&format!("{label:<11}")));
+    println!("  {} {}  {detail}", health.glyph(), dim(&pad(label, LABEL_WIDTH)));
 }
 
 /// A section heading inside `doctor`.
@@ -217,5 +221,15 @@ mod tests {
         assert_eq!(pad("ab", 5), "ab   ");
         assert_eq!(pad("abcdef", 3), "abcdef");
         assert_eq!(UnicodeWidthStr::width(pad("日本", 6).as_str()), 6);
+    }
+
+    /// `field` and `check` pad their label to one value column, and a label in
+    /// a double-width script has to land in the same one: `{label:<11}` counts
+    /// characters, so a Chinese run put its values two cells to the left.
+    #[test]
+    fn labels_of_any_script_share_one_value_column() {
+        for label in ["terminal", "主目录", "工具调用", "home"] {
+            assert_eq!(UnicodeWidthStr::width(pad(label, LABEL_WIDTH).as_str()), LABEL_WIDTH, "{label}");
+        }
     }
 }

@@ -22,6 +22,16 @@ use abacus_agent::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything is printed. A Windows console decodes the bytes it is
+    // given with a codepage, not UTF-8, so on a console set to 936 every glyph
+    // in this program would arrive as mojibake (issue #11). Switching it here
+    // covers clap's help, the setup wizard, doctor and the TUI at once; if the
+    // console refuses, the glyph tables fall back to ASCII.
+    abacus_agent::terminal::ensure_utf8_console();
+    // The language for anything printed before a settings file is read: the
+    // environment's choice, then the operating system's. `setup` and `doctor`
+    // refine it once they have the user's setting.
+    abacus_agent::i18n::init(None);
     let cli = Cli::parse();
     if cli.goal && cli.prompt.is_none() {
         anyhow::bail!("--goal requires a prompt via -p/--prompt");
@@ -599,6 +609,12 @@ fn human_bytes(bytes: u64) -> String {
 /// failure sets the non-zero exit.
 async fn doctor(config: &Config, settings: &Settings) -> Result<()> {
     use abacus_agent::console::{self, Health};
+    use abacus_agent::i18n::{self, Key};
+
+    // `doctor` is the command someone runs when nothing works, so it is read
+    // in their language too. `main` has already set the language from the
+    // environment; this is the settings file's say, which needs `Settings`.
+    i18n::init(settings.ui.language.as_deref());
 
     let mut failures = 0usize;
     let mut warnings = 0usize;
@@ -611,61 +627,69 @@ async fn doctor(config: &Config, settings: &Settings) -> Result<()> {
         console::check(health, label, detail);
     };
 
-    console::banner(&format!("diagnostics · v{}", env!("CARGO_PKG_VERSION")));
+    console::banner(&i18n::t(Key::DoctorBanner).replace("{}", env!("CARGO_PKG_VERSION")));
 
-    console::section("Environment");
-    console::field("home", &config.paths.root.display().to_string());
-    console::field("workspace", &config.workspace.display().to_string());
+    console::section(i18n::t(Key::DoctorSectionEnvironment));
+    console::field(i18n::t(Key::DoctorFieldHome), &config.paths.root.display().to_string());
+    console::field(i18n::t(Key::DoctorFieldWorkspace), &config.workspace.display().to_string());
     console::field(
-        "terminal",
-        &format!(
-            "{} · {} colour · {} glyphs",
-            std::env::var("TERM").unwrap_or_else(|_| "unset".to_owned()),
-            match abacus_agent::theme::ColorDepth::detect() {
-                abacus_agent::theme::ColorDepth::None => "no",
-                abacus_agent::theme::ColorDepth::Ansi16 => "16",
-                abacus_agent::theme::ColorDepth::Ansi256 => "256",
-                abacus_agent::theme::ColorDepth::TrueColor => "true",
-            },
-            if abacus_agent::ui::glyphs().wordmark.is_some() { "unicode" } else { "ascii" }
-        ),
+        i18n::t(Key::DoctorFieldTerminal),
+        &i18n::t(Key::DoctorTerminalDetail)
+            .replacen("{}", &std::env::var("TERM").unwrap_or_else(|_| i18n::t(Key::WordUnset).to_owned()), 1)
+            .replacen(
+                "{}",
+                match abacus_agent::theme::ColorDepth::detect() {
+                    abacus_agent::theme::ColorDepth::None => i18n::t(Key::WordNo),
+                    abacus_agent::theme::ColorDepth::Ansi16 => "16",
+                    abacus_agent::theme::ColorDepth::Ansi256 => "256",
+                    abacus_agent::theme::ColorDepth::TrueColor => "true",
+                },
+                1,
+            )
+            .replacen("{}", if abacus_agent::ui::glyphs().wordmark.is_some() { "unicode" } else { "ascii" }, 1),
     );
 
-    console::section("Provider");
-    console::field("profile", &config.profile);
-    console::field("model", &config.model_ref());
-    console::field("provider", &config.connection.name);
-    console::field("endpoint", &config.connection.request_url());
-    console::field("protocol", &format!("{:?}", config.connection.protocol));
-    console::field("mode", config.permission.label());
+    console::section(i18n::t(Key::DoctorSectionProvider));
+    console::field(i18n::t(Key::DoctorFieldProfile), &config.profile);
+    console::field(i18n::t(Key::DoctorFieldModel), &config.model_ref());
+    console::field(i18n::t(Key::DoctorFieldProvider), &config.connection.name);
+    console::field(i18n::t(Key::DoctorFieldEndpoint), &config.connection.request_url());
+    console::field(i18n::t(Key::DoctorFieldProtocol), &format!("{:?}", config.connection.protocol));
+    console::field(i18n::t(Key::DoctorFieldMode), config.permission.label());
     // A token command or file is run here, so a broken one shows up as the
     // failure it will be on the first request.
+    let credential = i18n::t(Key::DoctorCheckCredential);
     match config.connection.auth() {
-        Ok(Some(_)) => record(Health::Pass, "credential", "available"),
-        Ok(None) if config.connection.is_local() => record(Health::Pass, "credential", "none (local endpoint)"),
-        Ok(None) => record(
-            Health::Fail,
-            "credential",
-            "missing — paste one under /config → Providers, or export the provider's key variable",
-        ),
-        Err(error) => record(Health::Fail, "credential", &format!("{error:#}")),
+        Ok(Some(_)) => record(Health::Pass, credential, i18n::t(Key::DoctorCredentialAvailable)),
+        Ok(None) if config.connection.is_local() => {
+            record(Health::Pass, credential, i18n::t(Key::DoctorCredentialLocal))
+        }
+        Ok(None) => record(Health::Fail, credential, i18n::t(Key::DoctorCredentialMissing)),
+        Err(error) => record(Health::Fail, credential, &format!("{error:#}")),
     }
+    let reachable = i18n::t(Key::DoctorCheckReachable);
     let discovered = abacus_agent::providers::refresh_catalog(&config.paths, &config.connection).await;
     match discovered.map(|catalog| catalog.models.into_iter().map(|card| card.id).collect::<Vec<_>>()) {
-        Ok(models) if models.contains(&config.model) => {
-            record(Health::Pass, "reachable", &format!("{} models, including {}", models.len(), config.model))
-        }
+        Ok(models) if models.contains(&config.model) => record(
+            Health::Pass,
+            reachable,
+            &i18n::t(Key::DoctorReachableFound)
+                .replacen("{}", &models.len().to_string(), 1)
+                .replacen("{}", &config.model, 1),
+        ),
         // The endpoint answered but does not list the configured model. Some
         // gateways omit models they still serve, so this is a warning rather
         // than a failure.
         Ok(models) => record(
             Health::Warn,
-            "reachable",
-            &format!("{} models, but {} is not among them", models.len(), config.model),
+            reachable,
+            &i18n::t(Key::DoctorReachableMissing)
+                .replacen("{}", &models.len().to_string(), 1)
+                .replacen("{}", &config.model, 1),
         ),
         Err(error) => record(
             Health::Fail,
-            "reachable",
+            reachable,
             &abacus_agent::text::clip(&abacus_agent::text::flat(&format!("{error:#}")), 160, "…"),
         ),
     }
@@ -678,97 +702,131 @@ async fn doctor(config: &Config, settings: &Settings) -> Result<()> {
     let output_cap =
         limits.configured_output_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "auto".to_owned());
     console::field(
-        "limits",
-        &format!(
-            "{} context · {} output · {} · compacts near {} chars",
-            limits.context_window,
-            output_cap,
-            match limits.source {
-                model_info::LimitSource::Override => "override",
-                model_info::LimitSource::Detected => "detected",
-                model_info::LimitSource::Heuristic => "heuristic",
-                model_info::LimitSource::Default => "default",
-            },
-            limits.compaction_budget().compact_at_chars,
-        ),
+        i18n::t(Key::DoctorFieldLimits),
+        &i18n::t(Key::DoctorLimitsDetail)
+            .replacen("{}", &limits.context_window.to_string(), 1)
+            .replacen("{}", &output_cap, 1)
+            .replacen(
+                "{}",
+                match limits.source {
+                    model_info::LimitSource::Override => "override",
+                    model_info::LimitSource::Detected => "detected",
+                    model_info::LimitSource::Heuristic => "heuristic",
+                    model_info::LimitSource::Default => "default",
+                },
+                1,
+            )
+            .replacen("{}", &limits.compaction_budget().compact_at_chars.to_string(), 1),
     );
     let tool_fmt = config.tool_format.as_arg();
     console::field(
-        "tool calls",
-        &if tool_fmt == "none" { "native only".to_owned() } else { format!("{tool_fmt} (text fallback enabled)") },
+        i18n::t(Key::DoctorFieldToolCalls),
+        &if tool_fmt == "none" {
+            i18n::t(Key::DoctorToolCallsNative).to_owned()
+        } else {
+            i18n::t(Key::DoctorToolCallsFallback).replace("{}", tool_fmt)
+        },
     );
 
-    console::section("Local state");
+    console::section(i18n::t(Key::DoctorSectionLocalState));
     if config.paths.config_file.exists() {
-        record(Health::Pass, "settings", &config.paths.config_file.display().to_string());
+        record(Health::Pass, i18n::t(Key::DoctorCheckSettings), &config.paths.config_file.display().to_string());
     } else {
-        record(Health::Warn, "settings", "not written yet — run `abacus setup`");
+        record(Health::Warn, i18n::t(Key::DoctorCheckSettings), i18n::t(Key::DoctorSettingsMissing));
     }
     record(
         Health::Pass,
-        "providers",
-        &format!(
-            "{} · {}",
-            console::count(settings.providers.len(), "provider"),
-            console::count(settings.profiles.len(), "profile")
-        ),
+        i18n::t(Key::DoctorCheckProviders),
+        &i18n::t(Key::DoctorProvidersDetail)
+            .replacen("{}", &i18n::count(settings.providers.len(), Key::WordProvider, Key::WordProviders), 1)
+            .replacen("{}", &i18n::count(settings.profiles.len(), Key::WordProfile, Key::WordProfiles), 1),
     );
     let store = SessionStore::new(&config.paths, config.workspace.clone());
     match store.list().context("could not inspect sessions") {
-        Ok(sessions) => record(Health::Pass, "sessions", &format!("{} for this workspace", sessions.len())),
-        Err(error) => record(Health::Fail, "sessions", &format!("{error:#}")),
+        Ok(sessions) => record(
+            Health::Pass,
+            i18n::t(Key::DoctorCheckSessions),
+            &i18n::t(Key::DoctorSessionsDetail)
+                .replace("{}", &i18n::count(sessions.len(), Key::WordSession, Key::WordSessions)),
+        ),
+        Err(error) => record(Health::Fail, i18n::t(Key::DoctorCheckSessions), &format!("{error:#}")),
     }
     if config.trace_enabled {
         let count = std::fs::read_dir(&config.paths.traces_dir).map(|entries| entries.flatten().count()).unwrap_or(0);
         record(
             Health::Pass,
-            "traces",
-            &format!("on · {} in {}", console::count(count, "session"), config.paths.traces_dir.display()),
+            i18n::t(Key::DoctorCheckTraces),
+            &i18n::t(Key::DoctorTracesOn)
+                .replacen("{}", &i18n::count(count, Key::WordSession, Key::WordSessions), 1)
+                .replacen("{}", &config.paths.traces_dir.display().to_string(), 1),
         );
     } else {
-        record(Health::Pass, "traces", "off");
+        record(Health::Pass, i18n::t(Key::DoctorCheckTraces), i18n::t(Key::DoctorTracesOff));
     }
     match cron::CronStore::new(&config.paths).list() {
-        Ok(jobs) if jobs.is_empty() => record(Health::Pass, "cron", "no scheduled jobs"),
-        Ok(jobs) => record(Health::Pass, "cron", &format!("{} scheduled", jobs.len())),
-        Err(error) => record(Health::Fail, "cron", &format!("{error:#}")),
+        Ok(jobs) if jobs.is_empty() => {
+            record(Health::Pass, i18n::t(Key::DoctorCheckCron), i18n::t(Key::DoctorCronNone))
+        }
+        Ok(jobs) => record(
+            Health::Pass,
+            i18n::t(Key::DoctorCheckCron),
+            &i18n::t(Key::DoctorCronScheduled).replace("{}", &jobs.len().to_string()),
+        ),
+        Err(error) => record(Health::Fail, i18n::t(Key::DoctorCheckCron), &format!("{error:#}")),
     }
     match AgentServices::discover(&config.workspace, &config.paths, settings).await {
-        Ok(services) if services.diagnostics().is_empty() => record(Health::Pass, "extensions", "no problems"),
+        Ok(services) if services.diagnostics().is_empty() => {
+            record(Health::Pass, i18n::t(Key::DoctorCheckExtensions), i18n::t(Key::DoctorExtensionsClean))
+        }
         Ok(services) => {
-            record(Health::Warn, "extensions", &console::count(services.diagnostics().len(), "warning"));
+            record(
+                Health::Warn,
+                i18n::t(Key::DoctorCheckExtensions),
+                &i18n::count(services.diagnostics().len(), Key::WordWarning, Key::WordWarnings),
+            );
             for diagnostic in services.diagnostics() {
                 println!("               {}", console::dim(&diagnostic));
             }
         }
-        Err(error) => record(Health::Fail, "extensions", &format!("{error:#}")),
+        Err(error) => record(Health::Fail, i18n::t(Key::DoctorCheckExtensions), &format!("{error:#}")),
     }
     #[cfg(unix)]
     if config.paths.credentials_file.exists() {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&config.paths.credentials_file)?.permissions().mode() & 0o777;
         if mode & 0o077 == 0 {
-            record(Health::Pass, "key perms", &format!("{mode:o}"));
+            record(Health::Pass, i18n::t(Key::DoctorCheckKeyPerms), &format!("{mode:o}"));
         } else {
-            record(Health::Fail, "key perms", &format!("{mode:o} — readable by others; expected 600"));
+            record(
+                Health::Fail,
+                i18n::t(Key::DoctorCheckKeyPerms),
+                &i18n::t(Key::DoctorKeyPermsInsecure).replace("{}", &format!("{mode:o}")),
+            );
         }
     }
 
     console::blank();
     println!("  {}", console::dim(&console::marks().rule.repeat(console::WIDTH)));
     let summary = match (failures, warnings) {
-        (0, 0) => console::ok(&format!("{} All checks passed", console::marks().pass)),
-        (0, warnings) => console::warn(&format!(
-            "{} {}, nothing blocking",
-            console::marks().warn,
-            console::count(warnings, "warning")
-        )),
+        (0, 0) => console::ok(&i18n::t(Key::DoctorSummaryPassed).replace("{}", console::marks().pass)),
+        (0, warnings) => {
+            console::warn(&i18n::t(Key::DoctorSummaryWarnings).replacen("{}", console::marks().warn, 1).replacen(
+                "{}",
+                &i18n::count(warnings, Key::WordWarning, Key::WordWarnings),
+                1,
+            ))
+        }
         (failures, _) => {
-            console::err(&format!("{} {} found", console::marks().fail, console::count(failures, "problem")))
+            console::err(&i18n::t(Key::DoctorSummaryFailures).replacen("{}", console::marks().fail, 1).replacen(
+                "{}",
+                &i18n::count(failures, Key::WordProblem, Key::WordProblems),
+                1,
+            ))
         }
     };
     println!("  {summary}");
     console::blank();
 
-    if failures == 0 { Ok(()) } else { anyhow::bail!("doctor found one or more problems") }
+    // The last line a failing run prints, so it is in the reader's language too.
+    if failures == 0 { Ok(()) } else { anyhow::bail!(i18n::t(Key::DoctorProblemsFound)) }
 }
