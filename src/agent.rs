@@ -1241,6 +1241,7 @@ pub fn tool_reads_only(name: &str) -> bool {
             | "list_files"
             | "glob"
             | "grep"
+            | "outline"
             | "tool_search"
             | "git_status"
             | "git_diff"
@@ -2077,7 +2078,7 @@ mod tests {
     #[test]
     fn inspection_is_read_only() {
         for name in [
-            "read_file", "read_files", "list_files", "glob", "grep", "git_status", "git_diff", "git_log",
+            "read_file", "read_files", "list_files", "glob", "grep", "outline", "git_status", "git_diff", "git_log",
             "tool_search", "web_search", "read_page", "skill_load", "skill_read",
         ] {
             assert!(is_read_only(&call(name)), "{name} should be read-only");
