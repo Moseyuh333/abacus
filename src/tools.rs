@@ -1219,7 +1219,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "outline",
-            "List code symbols (functions, structs, enums, traits, modules) in Rust files without reading full contents. Use this before read_file to locate where to look.",
+            "First step when exploring unfamiliar code or hunting a definition: list the functions, structs, enums, traits and modules in a file or directory, optionally filtered by name, without reading file contents. Cheaper than read_file and more precise than grep for finding where a symbol is defined — reach for this before grep when you know a name but not its file.",
             [
                 req("path", string("Workspace-relative file or directory; a directory scans Rust files recursively")),
                 opt("query", string("Optional case-insensitive substring to filter symbol names")),
@@ -1605,7 +1605,7 @@ fn tool_catalog() -> Vec<(&'static str, &'static str)> {
         ("list_files", "shallow directory overview"),
         ("glob", "find paths by wildcard pattern"),
         ("grep", "regex content search with optional file globs"),
-        ("outline", "list code symbols in Rust files without reading full contents"),
+        ("outline", "map code structure or locate a symbol definition without reading files; try before grep"),
         ("read_file", "read a bounded line range with line numbers"),
         ("read_files", "read up to 20 files in one call with line numbers"),
         ("edit_file", "replace one exact occurrence in an existing file"),
