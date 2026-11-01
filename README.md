@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/kojo-art.png" alt="Woodcut-style night print: a moon over a misted valley, a treeline of bare branches along the far bank, and a river of broken amber light running from the foreground to the moon; the near shore is dense with reeds and small glowing embers" width="100%" />
+  <img src="assets/kojo-art.png" alt="Woodcut-style night print: a moon over a misted valley, a treeline of bare branches along the far bank, and a river of broken amber light running from the foreground to the moon. In the dark water at the lower left the word abacus is drawn out of the same thin amber scanlines, so it reads as light on the surface rather than as a caption" width="100%" />
 </p>
 
 <h1 align="center">Abacus</h1>
