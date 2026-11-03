@@ -2717,6 +2717,16 @@ impl App {
         // One bridge per session: following it from the phone and from the
         // relay at once would send every frame twice.
         self.stop_remote("The terminal switched to the phone link.");
+        self.attach_bridge(server.connector());
+        self.mobile = Some(server);
+        self.qr_overlay = Some(QrOverlay::Local { url, rows });
+        self.status = "phone link ready — scan the code".to_owned();
+        Ok(())
+    }
+
+    /// Put a bridge on `connector`: the frames for whoever is watching, and
+    /// whatever the session already has under way in its first snapshot.
+    fn attach_bridge<C: crate::remote::link::Connector>(&mut self, connector: C) {
         self.remote_generation += 1;
         let generation = self.remote_generation;
         let events = self.background_tx.clone();
@@ -2724,8 +2734,7 @@ impl App {
             let _ = events.send(Background::Remote { generation, event });
         });
         let session_id = self.session.as_ref().map(|session| session.id.to_string()).unwrap_or_default();
-        let mut bridge =
-            Bridge::launch(session_id, server.connector(), notify, crate::remote::link::LinkConfig::default());
+        let mut bridge = Bridge::launch(session_id, connector, notify, crate::remote::link::LinkConfig::default());
         // Whatever is already under way becomes part of the first snapshot.
         if self.running.is_some() {
             bridge.turn_started();
@@ -2740,10 +2749,17 @@ impl App {
         }
         bridge.workers_changed(&self.workers.board.snapshot());
         self.remote = Some(bridge);
-        self.mobile = Some(server);
-        self.qr_overlay = Some(QrOverlay::Local { url, rows });
-        self.status = "phone link ready — scan the code".to_owned();
-        Ok(())
+    }
+
+    /// The phone link outlives a session switch: it is served by this process,
+    /// so only its bridge has to be pointed at the new session.
+    fn rebind_mobile(&mut self) {
+        let Some(connector) = self.mobile.as_ref().map(|server| server.connector()) else {
+            return;
+        };
+        self.stop_remote("The terminal switched to another session.");
+        self.attach_bridge(connector);
+        self.send_remote_snapshot(SnapshotReason::Requested);
     }
 
     /// Stop serving the phone page. The session stays open in the terminal.
@@ -2774,6 +2790,10 @@ impl App {
     /// device). Sharing follows the user to the new session; the old one stops
     /// being controllable. The same session just gets a fresh snapshot.
     fn rebind_remote(&mut self) {
+        if self.mobile.is_some() {
+            self.rebind_mobile();
+            return;
+        }
         let current = self.session.as_ref().map(|session| session.id.to_string());
         if self.sharing() && self.remote.as_ref().map(Bridge::session_id) == current.as_deref() {
             self.send_remote_snapshot(SnapshotReason::Requested);
