@@ -359,6 +359,16 @@
 </div>
 
 <!-- workers -->
+<div class="sheet-wrap" id="sessions-sheet">
+  <div class="scrim" data-close></div>
+  <div class="sheet">
+    <div class="handle"></div>
+    <h2>Sessions</h2>
+    <div class="sub" id="sessions-sub">Saved in this workspace. Tap one to open it.</div>
+    <div id="sessions-list"></div>
+  </div>
+</div>
+
 <div class="sheet-wrap" id="workers-sheet">
   <div class="scrim" data-close></div>
   <div class="sheet">
@@ -408,6 +418,7 @@ const S = {
   pages: new Map(),
   snapshotId: null,
   models: [],
+  sessions: [],
   follow: true,
   pendingRefs: new Set(),
 };
@@ -489,6 +500,10 @@ function handle(frame) {
       break;
     case "ping": send("pong", { ts: p.ts }); break;
     case "snapshot": onSnapshot(p); break;
+    case "sessions":
+      S.sessions = (p && p.sessions) || [];
+      renderSessions(S.sessions);
+      break;
     case "entry": onEntry(p); break;
     case "delta": onDelta(p); break;
     case "tool": onTool(p); break;
@@ -761,6 +776,35 @@ function renderComposer() {
   $("send").disabled = !input.value.trim();
 }
 
+function requestSessions() {
+  $("sessions-list").innerHTML = "";
+  $("sessions-list").appendChild(el("div", "empty", "Loading…"));
+  openSheet("sessions-sheet");
+  send("command", { name: "sessions", args: "" });
+}
+
+function renderSessions(rows) {
+  const list = $("sessions-list");
+  list.innerHTML = "";
+  if (!rows.length) {
+    list.appendChild(el("div", "empty", "No saved sessions in this workspace yet."));
+    return;
+  }
+  for (const session of rows) {
+    const node = el("button", "worker");
+    node.innerHTML =
+      `<div style="flex:1;min-width:0">` +
+      `<div class="whead"><span class="name">${esc(session.title || "Untitled")}</span></div>` +
+      `<div class="tok">${esc(session.updated)} · ${esc(session.id.slice(0, 8))}</div>` +
+      `</div>`;
+    node.onclick = () => {
+      closeSheet("sessions-sheet");
+      send("command", { name: "resume", args: session.id });
+    };
+    list.appendChild(node);
+  }
+}
+
 function renderWorkers() {
   const running = S.workers.filter((w) => w.state === "running").length;
   const chip = $("workers-chip");
@@ -964,6 +1008,13 @@ function openActions() {
     }
     list.appendChild(models);
   }
+
+  const open = el("div", "rows");
+  open.appendChild(row(
+    { label: "Sessions", note: "Open another conversation", icon: "compact" },
+    { onClick: () => { closeSheet("actions-sheet"); requestSessions(); } },
+  ));
+  list.appendChild(open);
 
   list.appendChild(groupTitle("Subagents"));
   const workers = el("div", "rows");

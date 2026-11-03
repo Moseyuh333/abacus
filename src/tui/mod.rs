@@ -498,6 +498,7 @@ struct App {
     /// The phone front end served on the LAN, when `/mobile` or `--mobile` is
     /// on. It talks to the same [`Bridge`] a shared session uses.
     mobile: Option<crate::mobile::MobileServer>,
+    mobile_lan: bool,
     /// Bumped for every bridge started; events carry it.
     remote_generation: u64,
     /// `/remote off` for this session: auto-share leaves it alone until the
@@ -631,7 +632,8 @@ pub async fn run(
     session: Option<Session>,
     session_store: Option<SessionStore>,
     services: Arc<AgentServices>,
-    mobile: Option<u16>,
+    // The phone link: its port, and whether phones on the network may reach it.
+    mobile: Option<(u16, bool)>,
 ) -> Result<()> {
     // Resolve dark/light (auto-detecting the terminal/OS appearance) before the
     // first frame so the palette matches the surrounding terminal. A named
@@ -696,7 +698,9 @@ pub async fn run(
     let mut terminal = Terminal::new(backend)?;
 
     let workspace = config.workspace.clone();
-    let mut app = App::new(config, settings, credentials, session, session_store, services.clone())?;
+    let mobile_lan = mobile.is_some_and(|(_, lan)| lan);
+    let mobile_port = mobile.map(|(port, _)| port);
+    let mut app = App::new(config, settings, credentials, session, session_store, services.clone(), mobile_lan)?;
     if let Some(error) = theme_error {
         app.fail(format!("{error}\nFalling back to the built-in theme."));
     }
@@ -707,7 +711,7 @@ pub async fn run(
     app.maybe_auto_share();
     // `--mobile` serves the phone front end from the first frame; `/mobile`
     // starts it later.
-    if let Some(port) = mobile
+    if let Some(port) = mobile_port
         && let Err(reason) = app.start_mobile(port)
     {
         app.fail(reason);
@@ -1194,6 +1198,7 @@ impl App {
         session: Option<Session>,
         session_store: Option<SessionStore>,
         services: Arc<AgentServices>,
+        mobile_lan: bool,
     ) -> Result<Self> {
         // `--profile` picks the session's profile; a switch in /profile also
         // makes the one switched to the default.
@@ -1324,6 +1329,7 @@ impl App {
             pointer: None,
             remote: None,
             mobile: None,
+            mobile_lan,
             remote_generation: 0,
             remote_muted: false,
             remote_announce: false,
@@ -2705,7 +2711,7 @@ impl App {
         if self.mobile.is_some() {
             return Err("the phone link is already on — /mobile off stops it".into());
         }
-        let server = crate::mobile::MobileServer::start(port).map_err(|error| format!("{error:#}"))?;
+        let server = crate::mobile::MobileServer::start(port, self.mobile_lan).map_err(|error| format!("{error:#}"))?;
         let url = server.url().to_owned();
         let rows = crate::remote::qr::rows(&url);
         // One bridge per session: following it from the phone and from the
@@ -2932,6 +2938,18 @@ impl App {
                 self.rename_session(title);
                 applied(self);
             }
+            "sessions" => {
+                self.send_sessions_to_phone();
+                applied(self);
+            }
+            "resume" => {
+                let id = args.trim();
+                if id.is_empty() {
+                    return rejected(self, "resume needs a session id");
+                }
+                self.resume_session(id);
+                applied(self);
+            }
             other => rejected(self, &format!("`{other}` is not an action the phone can run")),
         }
         // The session's mode, model and profile are only in a snapshot, and the
@@ -2939,6 +2957,28 @@ impl App {
         // with what the terminal now runs.
         if took {
             self.send_remote_snapshot(SnapshotReason::Requested);
+        }
+    }
+
+    /// The workspace's saved sessions, for the phone's session list.
+    fn send_sessions_to_phone(&mut self) {
+        let Some(store) = &self.session_store else {
+            return;
+        };
+        let rows = match store.list() {
+            Ok(sessions) => sessions
+                .into_iter()
+                .take(50)
+                .map(|session| crate::remote::SessionRow {
+                    id: session.id.to_string(),
+                    title: session.title,
+                    updated: session.updated_at.with_timezone(&Local).format("%m-%d %H:%M").to_string(),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        if let Some(bridge) = &mut self.remote {
+            bridge.sessions(rows);
         }
     }
 

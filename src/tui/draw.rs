@@ -764,7 +764,7 @@ pub(super) fn draw_qr(frame: &mut Frame<'_>, area: Rect, app: &App) {
         QrOverlay::Local { url, rows } => (
             url,
             rows,
-            "On your local network · this link is the only credential".to_owned(),
+            "This link can run commands here · /mobile off ends it".to_owned(),
             "this session",
             "PHONE LINK",
         ),

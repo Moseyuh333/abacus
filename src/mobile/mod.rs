@@ -82,19 +82,20 @@ pub struct MobileServer {
 }
 
 impl MobileServer {
-    /// Listen on `port` (0 picks a free one) on every interface. The token in
-    /// the returned URLs is the only credential the page needs. Called on the
-    /// terminal's thread, inside its runtime.
-    pub fn start(port: u16) -> Result<Self> {
+    /// Listen on `port` (0 picks a free one). Loopback by default: a phone
+    /// link is remote control of the machine, so opening it to the network is
+    /// a decision the person makes with `--mobile-lan`, not the default. The
+    /// token in the returned URLs is the only credential the page needs.
+    /// Called on the terminal's thread, inside its runtime.
+    pub fn start(port: u16, lan: bool) -> Result<Self> {
         // A listener without SO_REUSEADDR cannot come back on a port whose
         // last connections are still in TIME_WAIT, which is every restart
         // right after a phone closed the page.
         let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
             .context("could not create a listening socket")?;
         socket.set_reuse_address(true).context("could not set SO_REUSEADDR")?;
-        socket
-            .bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port).into())
-            .with_context(|| format!("could not listen on port {port}"))?;
+        let bind = if lan { IpAddr::V4(Ipv4Addr::UNSPECIFIED) } else { IpAddr::V4(Ipv4Addr::LOCALHOST) };
+        socket.bind(&SocketAddr::new(bind, port).into()).with_context(|| format!("could not listen on port {port}"))?;
         socket.listen(128).context("could not listen")?;
         socket.set_nonblocking(true)?;
         let listener: std::net::TcpListener = socket.into();
@@ -104,7 +105,11 @@ impl MobileServer {
         let hub = Arc::new(Mutex::new(Hub { token: token.clone(), clients: Vec::new(), agent: None }));
         let (stop, stopped) = mpsc::channel(1);
         tokio::spawn(accept_loop(listener, hub, stopped));
-        let host = lan_address().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let host = if lan {
+            lan_address().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        };
         Ok(Self {
             url: format!("http://{host}:{port}/?t={token}"),
             agent_url: format!("ws://127.0.0.1:{port}/ws?t={token}&role=agent"),
@@ -594,7 +599,7 @@ mod tests {
     // runtime would stall the server that has to answer it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_page_answers_only_with_the_link_token() {
-        let server = MobileServer::start(0).expect("start");
+        let server = MobileServer::start(0, false).expect("start");
         let port = server.port();
         let token = token_of(&server);
 
@@ -613,7 +618,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_icon_and_manifest_need_no_token() {
-        let server = MobileServer::start(0).expect("start");
+        let server = MobileServer::start(0, false).expect("start");
         let port = server.port();
 
         let (status, body) = get(port, "/icon.svg");
@@ -631,7 +636,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_websocket_url_carries_the_agent_role() {
-        let server = MobileServer::start(0).expect("start");
+        let server = MobileServer::start(0, false).expect("start");
         assert!(server.connector().url.contains("role=agent"), "the bridge is the agent end");
         assert!(server.url().starts_with("http://"), "the phone gets a page, not a socket");
     }

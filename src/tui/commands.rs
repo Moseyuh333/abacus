@@ -131,8 +131,10 @@ impl App {
                 Some(server) => {
                     let url = server.url().to_owned();
                     self.say(format!(
-                        "Open this on a phone on the same network — it controls this session:\n{url}\n\
-                         The link carries the only credential, so keep it to yourself. /mobile off stops it."
+                        "Open this on a phone:\n{url}\n\
+                         The link is the only credential and it can run commands here, so\
+                         keep it to yourself. It listens on this machine only unless\
+                         Abacus was started with --mobile-lan. /mobile off stops it."
                     ));
                 }
                 None => self.fail("The phone link is off — /mobile starts it."),

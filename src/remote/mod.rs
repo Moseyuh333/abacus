@@ -46,6 +46,7 @@ use protocol::{
     EntryKind, ErrorFrame, Level, ModeFrame, NoticeFrame, Outbound, Pending, Phase, QuestionFrame, QuestionResolved,
     SnapshotHead, State, Status, ToolFrame, ToolInfo, ToolPhase, ToolState, WorkersFrame,
 };
+pub use protocol::{SessionRow, SessionsFrame};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -495,6 +496,13 @@ impl Bridge {
         self.workers_sent = Some(frame.clone());
         self.push(Outbound::Workers(frame));
         true
+    }
+
+    /// The saved sessions, sent when a phone asks for them. Not cached: the
+    /// list changes as sessions are created, renamed and resumed, and a phone
+    /// only asks when it opens the list.
+    pub fn sessions(&mut self, rows: Vec<SessionRow>) {
+        self.push(Outbound::Sessions(SessionsFrame { sessions: rows }));
     }
 
     /// An approval dialog opened; returns its id for the terminal to keep.

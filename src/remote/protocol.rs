@@ -534,6 +534,21 @@ pub struct Ping {
     pub ts: Value,
 }
 
+/// One saved session, as the phone's session list shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRow {
+    pub id: String,
+    pub title: String,
+    /// `2026-11-03 09:12`, already local to the terminal.
+    pub updated: String,
+}
+
+/// The saved sessions of the terminal's workspace, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionsFrame {
+    pub sessions: Vec<SessionRow>,
+}
+
 /// Every frame the agent sends. Serialises as `{"type":…,"payload":…}`; the
 /// link adds `v`, `id` and `seq` when it puts the frame on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -557,6 +572,8 @@ pub enum Outbound {
     Accepted(Accepted),
     /// The session's subagent board, whenever it changes.
     Workers(WorkersFrame),
+    /// The saved sessions, in answer to a phone's `sessions` command.
+    Sessions(SessionsFrame),
     /// Answer to a browser's `ping`.
     Pong(Ping),
     /// The agent's own heartbeat; the relay answers it.
