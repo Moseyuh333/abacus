@@ -2795,8 +2795,15 @@ impl App {
             return;
         };
         let session = self.session.as_ref();
+        // The relay names the session itself; on the local phone link there is no
+        // relay, and an empty id leaves the phone unable to tell which session
+        // it is looking at.
+        let id = match bridge.session_id() {
+            "" => session.map(|session| session.id.to_string()).unwrap_or_default(),
+            relay => relay.to_owned(),
+        };
         let info = crate::remote::SessionInfo {
-            id: bridge.session_id().to_owned(),
+            id,
             title: session.map(|session| session.title.clone()).unwrap_or_default(),
             workspace: self.config.workspace.display().to_string(),
             model: self.config.model_ref(),

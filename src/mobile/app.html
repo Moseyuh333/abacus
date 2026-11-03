@@ -74,6 +74,7 @@
     display: flex; flex-direction: column; gap: 10px;
     scroll-behavior: auto;
   }
+  #log.bulk .entry { animation: none; }
   .entry { animation: rise .18s ease-out; }
   @keyframes rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
   .who { font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); margin-bottom: 3px; }
@@ -419,6 +420,8 @@ const S = {
   snapshotId: null,
   models: [],
   sessions: [],
+  scrollQueued: false,
+  lastFrame: 0,
   follow: true,
   pendingRefs: new Set(),
 };
@@ -445,6 +448,9 @@ function socketHost() {
 }
 
 function connect() {
+  // One socket at a time: a connect while one is already opening or open is
+  // what made reconnects multiply.
+  if (S.ws && (S.ws.readyState === 0 || S.ws.readyState === 1)) return;
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${scheme}://${socketHost()}/ws?t=${encodeURIComponent(token())}`);
   S.ws = ws;
@@ -461,15 +467,20 @@ function connect() {
     clearTimeout(deadline);
     S.attempts = 0;
     setConn("live");
-    send("request_snapshot", {});
+    // The terminal sends a snapshot of its own the moment a phone attaches;
+    // asking for a second one rebuilt the whole transcript twice.
   };
   ws.onmessage = (event) => {
+    S.lastFrame = Date.now();
     let frame;
     try { frame = JSON.parse(event.data); } catch { return; }
     handle(frame);
   };
   ws.onclose = () => {
     clearTimeout(deadline);
+    // A socket that was replaced (a newer one is open) must not schedule its
+    // own reconnect: that is how a stale close turned into a socket storm.
+    if (S.ws !== ws) return;
     setConn("dead");
     const wait = Math.min(8000, 500 * Math.pow(1.6, S.attempts++));
     $("status-text").textContent = "reconnecting…";
@@ -540,8 +551,11 @@ function onSnapshot(p) {
   S.question = (head.pending && head.pending.question) || null;
   S.entries.clear();
   S.order = [];
-  log.innerHTML = "";
-  for (const page of pages) for (const entry of page.entries || []) push(entry, false);
+  const fragment = document.createDocumentFragment();
+  log.classList.add("bulk");
+  for (const page of pages) for (const entry of page.entries || []) push(entry, false, fragment);
+  log.replaceChildren(fragment);
+  log.classList.remove("bulk");
   renderMeta();
   renderStatus();
   renderWorkers();
@@ -556,7 +570,7 @@ function onEntry(p) {
     push(p.entry, true);
   } else {
     const known = S.entries.get(p.entry.id);
-    if (known) { Object.assign(known, p.entry); paint(p.entry.id); }
+    if (known) { known.streaming = false; Object.assign(known, p.entry); paint(p.entry.id); }
     else push(p.entry, true);
   }
 }
@@ -568,6 +582,7 @@ function onDelta(p) {
     return;
   }
   known.text = (known.text || "") + p.text;
+  known.streaming = true;
   paint(p.entry_id);
 }
 
@@ -712,19 +727,31 @@ function statusWord(tool) {
   return ms != null ? `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s` : "done";
 }
 
-function push(entry, autoscroll) {
+// How many entries the page keeps on screen. A snapshot may carry thousands;
+// laying all of them out is what froze the WebView, and nobody scrolls that far
+// back on a phone.
+const KEEP = 300;
+
+function push(entry, autoscroll, target) {
   if (S.entries.has(entry.id)) { Object.assign(S.entries.get(entry.id), entry); paint(entry.id); return; }
   S.entries.set(entry.id, entry);
   S.order.push(entry.id);
   const node = entryNode(entry);
   node.dataset.id = entry.id;
-  log.appendChild(node);
+  entry._node = node;
+  (target || log).appendChild(node);
+  while (S.order.length > KEEP) {
+    const gone = S.order.shift();
+    const old = S.entries.get(gone);
+    if (old && old._node && old._node.parentNode) old._node.parentNode.removeChild(old._node);
+    S.entries.delete(gone);
+  }
   if (autoscroll && S.follow) scrollBottom();
 }
 
 function paint(id) {
   const entry = S.entries.get(id);
-  const node = log.querySelector(`[data-id="${CSS.escape(id)}"]`);
+  const node = (entry && entry._node) || log.querySelector(`[data-id="${CSS.escape(id)}"]`);
   if (!entry || !node) return;
   if (entry.kind === "tool") {
     const tool = entry.tool || {};
@@ -741,7 +768,28 @@ function paint(id) {
     if (body) body.textContent = entry.text || "";
     return;
   }
-  if (entry.kind === "assistant") { node.innerHTML = markdown(entry.text); return; }
+  if (entry.kind === "assistant") {
+    const text = entry.text || "";
+    const painted = entry._painted || 0;
+    // While the answer streams, append only the new text: re-running markdown
+    // over the whole message on every frame is quadratic, and that is what
+    // stalled the page during long answers.
+    if (entry.streaming && node.firstChild && node.firstChild.nodeName === "#text" && text.length > painted) {
+      node.firstChild.appendData(text.slice(painted));
+      entry._painted = text.length;
+      if (S.follow) scrollBottom();
+      return;
+    }
+    if (entry.streaming) {
+      node.textContent = text;
+      entry._painted = text.length;
+      if (S.follow) scrollBottom();
+      return;
+    }
+    node.innerHTML = markdown(text);
+    entry._painted = text.length;
+    return;
+  }
   node.textContent = entry.text || "";
   if (S.follow) scrollBottom();
 }
@@ -830,7 +878,12 @@ function renderWorkers() {
 }
 
 function scrollBottom() {
-  requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
+  if (S.scrollQueued) return;
+  S.scrollQueued = true;
+  requestAnimationFrame(() => {
+    S.scrollQueued = false;
+    log.scrollTop = log.scrollHeight;
+  });
 }
 
 log.addEventListener("scroll", () => {
@@ -1130,7 +1183,16 @@ renderMeta();
 renderStatus();
 renderWorkers();
 connect();
-setInterval(() => { if (S.ws && S.ws.readyState === 1) send("ping", { ts: new Date().toISOString() }); }, 25000);
+setInterval(() => {
+  if (!S.ws || S.ws.readyState !== 1) return;
+  // A socket that died without a close (phone slept, network changed) still
+  // reads as open; three missed heartbeats mean it is gone.
+  if (S.lastFrame && Date.now() - S.lastFrame > 60000) {
+    try { S.ws.close(); } catch (error) { /* already gone */ }
+    return;
+  }
+  send("ping", { ts: new Date().toISOString() });
+}, 25000);
 </script>
 </body>
 </html>
