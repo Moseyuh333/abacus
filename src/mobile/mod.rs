@@ -95,7 +95,23 @@ impl MobileServer {
             .context("could not create a listening socket")?;
         socket.set_reuse_address(true).context("could not set SO_REUSEADDR")?;
         let bind = if lan { IpAddr::V4(Ipv4Addr::UNSPECIFIED) } else { IpAddr::V4(Ipv4Addr::LOCALHOST) };
-        socket.bind(&SocketAddr::new(bind, port).into()).with_context(|| format!("could not listen on port {port}"))?;
+        // A terminal restarted while the last one is still closing finds its own
+        // port taken for a moment. That is not a reason to lose the phone link,
+        // so wait it out rather than failing the start.
+        let mut attempt = 0;
+        loop {
+            match socket.bind(&SocketAddr::new(bind, port).into()) {
+                Ok(()) => break,
+                Err(error) if attempt < 40 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if attempt == 40 {
+                        return Err(error).with_context(|| format!("could not listen on port {port}"));
+                    }
+                }
+                Err(error) => return Err(error).with_context(|| format!("could not listen on port {port}")),
+            }
+        }
         socket.listen(128).context("could not listen")?;
         socket.set_nonblocking(true)?;
         let listener: std::net::TcpListener = socket.into();
