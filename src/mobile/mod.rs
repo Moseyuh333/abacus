@@ -719,7 +719,7 @@ mod tests {
 
         let (status, body) = get(port, "/icon.svg");
         assert_eq!(status, 200);
-        assert!(body.contains("<svg") && body.contains("#7dd3a0"), "an abacus, not a placeholder");
+        assert!(body.contains("<svg") && body.contains("#b66bff"), "an abacus, not a placeholder");
 
         let (status, body) = get(port, "/manifest.webmanifest");
         assert_eq!(status, 200);
