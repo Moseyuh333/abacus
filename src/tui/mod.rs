@@ -499,6 +499,10 @@ struct App {
     /// on. It talks to the same [`Bridge`] a shared session uses.
     mobile: Option<crate::mobile::MobileServer>,
     mobile_lan: bool,
+    /// Publish the phone link through cloudflared when it starts.
+    mobile_tunnel: bool,
+    /// The public link, once the tunnel has printed it.
+    mobile_public: Option<String>,
     /// Bumped for every bridge started; events carry it.
     remote_generation: u64,
     /// `/remote off` for this session: auto-share leaves it alone until the
@@ -632,8 +636,9 @@ pub async fn run(
     session: Option<Session>,
     session_store: Option<SessionStore>,
     services: Arc<AgentServices>,
-    // The phone link: its port, and whether phones on the network may reach it.
-    mobile: Option<(u16, bool)>,
+    // The phone link: its port, whether phones on the network may reach it,
+    // and whether it is published outside the network.
+    mobile: Option<(u16, bool, bool)>,
 ) -> Result<()> {
     // Resolve dark/light (auto-detecting the terminal/OS appearance) before the
     // first frame so the palette matches the surrounding terminal. A named
@@ -698,9 +703,8 @@ pub async fn run(
     let mut terminal = Terminal::new(backend)?;
 
     let workspace = config.workspace.clone();
-    let mobile_lan = mobile.is_some_and(|(_, lan)| lan);
-    let mobile_port = mobile.map(|(port, _)| port);
-    let mut app = App::new(config, settings, credentials, session, session_store, services.clone(), mobile_lan)?;
+    let mobile_port = mobile.map(|(port, _, _)| port);
+    let mut app = App::new(config, settings, credentials, session, session_store, services.clone(), mobile)?;
     if let Some(error) = theme_error {
         app.fail(format!("{error}\nFalling back to the built-in theme."));
     }
@@ -926,6 +930,7 @@ async fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut
         dirty |= app.drain_agent_events();
         dirty |= app.drain_background();
         app.tick_remote();
+        app.tick_mobile();
         app.maybe_idle_sync();
         app.maybe_idle_compact();
         // A worker that finished after its turn ended delivers here.
@@ -1198,8 +1203,10 @@ impl App {
         session: Option<Session>,
         session_store: Option<SessionStore>,
         services: Arc<AgentServices>,
-        mobile_lan: bool,
+        mobile: Option<(u16, bool, bool)>,
     ) -> Result<Self> {
+        let mobile_lan = mobile.is_some_and(|(_, lan, _)| lan);
+        let mobile_tunnel = mobile.is_some_and(|(_, _, tunnel)| tunnel);
         // `--profile` picks the session's profile; a switch in /profile also
         // makes the one switched to the default.
         let follows_profile = settings.profiles.contains_key(&config.profile);
@@ -1330,6 +1337,8 @@ impl App {
             remote: None,
             mobile: None,
             mobile_lan,
+            mobile_tunnel,
+            mobile_public: None,
             remote_generation: 0,
             remote_muted: false,
             remote_announce: false,
@@ -2711,16 +2720,20 @@ impl App {
         if self.mobile.is_some() {
             return Err("the phone link is already on — /mobile off stops it".into());
         }
-        let server = crate::mobile::MobileServer::start(port, self.mobile_lan).map_err(|error| format!("{error:#}"))?;
+        let server = crate::mobile::MobileServer::start(port, self.mobile_lan, self.mobile_tunnel)
+            .map_err(|error| format!("{error:#}"))?;
         let url = server.url().to_owned();
         let rows = crate::remote::qr::rows(&url);
         // One bridge per session: following it from the phone and from the
         // relay at once would send every frame twice.
         self.stop_remote("The terminal switched to the phone link.");
         self.attach_bridge(server.connector());
+        let tunnel = server.tunnel_pending();
         self.mobile = Some(server);
         self.qr_overlay = Some(QrOverlay::Local { url, rows });
-        self.status = "phone link ready — scan the code".to_owned();
+        self.status =
+            if tunnel { "phone link ready — opening a public link" } else { "phone link ready — scan the code" }
+                .to_owned();
         Ok(())
     }
 
@@ -2769,7 +2782,28 @@ impl App {
         }
         self.stop_remote("The phone link was turned off in the terminal.");
         self.qr_overlay = None;
+        self.mobile_public = None;
         self.status = "phone link off".to_owned();
+    }
+
+    /// The tunnel prints its address a few seconds after it starts; pick it
+    /// up on a tick so the command that opened it does not block.
+    fn tick_mobile(&mut self) {
+        let link = self.mobile.as_ref().and_then(|server| server.public_url());
+        let Some(link) = link else {
+            return;
+        };
+        if self.mobile_public.as_deref() == Some(link.as_str()) {
+            return;
+        }
+        self.mobile_public = Some(link.clone());
+        self.qr_overlay = Some(QrOverlay::Local { rows: crate::remote::qr::rows(&link), url: link.clone() });
+        self.say(format!(
+            "Public link ready (cloudflared):\n{link}\n\
+             It reaches this terminal from any network. The link is the only\
+             credential — anyone who has it can drive this session. /mobile off closes\
+             both links."
+        ));
     }
 
     /// Whether the session is being shared (or trying to be).

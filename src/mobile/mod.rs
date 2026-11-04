@@ -44,22 +44,24 @@ use crate::remote::link::{Connector, LinkError};
 
 /// The app icon: an abacus, mint on ink, at any size.
 const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Abacus">
-<rect width="512" height="512" rx="112" fill="#0a0b0d"/>
-<rect x="96" y="108" width="320" height="296" rx="30" fill="none" stroke="#7dd3a0" stroke-width="18"/>
-<g stroke="#7dd3a0" stroke-width="13" stroke-linecap="round" opacity="0.85">
+<rect width="512" height="512" rx="112" fill="#0e0b14"/>
+<rect x="96" y="108" width="320" height="296" rx="30" fill="none" stroke="#b66bff" stroke-width="18"/>
+<g stroke="#b66bff" stroke-width="13" stroke-linecap="round" opacity="0.55">
 <line x1="176" y1="146" x2="176" y2="366"/><line x1="256" y1="146" x2="256" y2="366"/>
 <line x1="336" y1="146" x2="336" y2="366"/>
 </g>
-<g fill="#7dd3a0">
+<g fill="#b66bff">
 <circle cx="176" cy="194" r="21"/><circle cx="176" cy="252" r="21"/>
 <circle cx="256" cy="220" r="21"/><circle cx="256" cy="300" r="21"/>
+</g>
+<g fill="#e58fc6">
 <circle cx="336" cy="176" r="21"/><circle cx="336" cy="262" r="21"/>
 </g>
-<line x1="146" y1="336" x2="366" y2="336" stroke="#7dd3a0" stroke-width="10" opacity="0.45"/>
+<line x1="146" y1="336" x2="366" y2="336" stroke="#e58fc6" stroke-width="10" opacity="0.45"/>
 </svg>"##;
 
 /// What a phone needs to add the page to its home screen.
-const MANIFEST: &str = r##"{"name":"Abacus","short_name":"Abacus","description":"Drive an Abacus session from your phone.","start_url":"/","scope":"/","display":"standalone","orientation":"portrait","background_color":"#0a0b0d","theme_color":"#0a0b0d","icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]}"##;
+const MANIFEST: &str = r##"{"name":"Abacus","short_name":"Abacus","description":"Drive an Abacus session from your phone.","start_url":"/","scope":"/","display":"standalone","orientation":"portrait","background_color":"#0e0b14","theme_color":"#0e0b14","icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]}"##;
 
 /// The phone page, compiled in: one file, no assets, so the binary stays the
 /// only thing to ship.
@@ -79,6 +81,60 @@ pub struct MobileServer {
     agent_url: String,
     port: u16,
     stop: mpsc::Sender<()>,
+    /// The public link, when `--mobile-tunnel` asked for one.
+    tunnel: Option<Tunnel>,
+}
+
+/// A cloudflared quick tunnel in front of this server: an https address that
+/// reaches the loopback listener from any network, with no account and no
+/// router port.
+struct Tunnel {
+    child: std::process::Child,
+    public: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl Tunnel {
+    fn spawn(port: u16, token: &str) -> Result<Self> {
+        let mut command = std::process::Command::new("cloudflared");
+        command
+            .args(["tunnel", "--no-autoupdate", "--url", &format!("http://127.0.0.1:{port}")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        // A console window flashing up on Windows looks like a crash.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = command.spawn().with_context(
+            || "could not run cloudflared — install it, or start the phone link without --mobile-tunnel",
+        )?;
+        let public = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&public);
+        let query = format!("/?t={token}");
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                use std::io::BufRead as _;
+                for line in std::io::BufReader::new(stderr).lines() {
+                    let Ok(line) = line else { break };
+                    let Some(start) = line.find("https://") else {
+                        continue;
+                    };
+                    let rest = &line[start..];
+                    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                    let address = &rest[..end];
+                    if address.contains("trycloudflare.com")
+                        && let Ok(mut slot) = sink.lock()
+                    {
+                        *slot = Some(format!("{address}{query}"));
+                        break;
+                    }
+                }
+            });
+        }
+        Ok(Self { child, public })
+    }
 }
 
 impl MobileServer {
@@ -87,7 +143,7 @@ impl MobileServer {
     /// a decision the person makes with `--mobile-lan`, not the default. The
     /// token in the returned URLs is the only credential the page needs.
     /// Called on the terminal's thread, inside its runtime.
-    pub fn start(port: u16, lan: bool) -> Result<Self> {
+    pub fn start(port: u16, lan: bool, tunnel: bool) -> Result<Self> {
         // A listener without SO_REUSEADDR cannot come back on a port whose
         // last connections are still in TIME_WAIT, which is every restart
         // right after a phone closed the page.
@@ -121,6 +177,7 @@ impl MobileServer {
         let hub = Arc::new(Mutex::new(Hub { token: token.clone(), clients: Vec::new(), agent: None }));
         let (stop, stopped) = mpsc::channel(1);
         tokio::spawn(accept_loop(listener, hub, stopped));
+        let tunnel = if tunnel { Some(Tunnel::spawn(port, &token)?) } else { None };
         let host = if lan {
             lan_address().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
         } else {
@@ -131,6 +188,7 @@ impl MobileServer {
             agent_url: format!("ws://127.0.0.1:{port}/ws?t={token}&role=agent"),
             port,
             stop,
+            tunnel,
         })
     }
 
@@ -144,6 +202,24 @@ impl MobileServer {
         self.port
     }
 
+    /// The public link once cloudflared has printed it.
+    pub fn public_url(&self) -> Option<String> {
+        let tunnel = self.tunnel.as_ref()?;
+        let slot = tunnel.public.lock().ok()?;
+        slot.clone()
+    }
+
+    /// What to put on a phone: the public link when there is one, the direct
+    /// one otherwise.
+    pub fn link(&self) -> String {
+        self.public_url().unwrap_or_else(|| self.url.clone())
+    }
+
+    /// Whether a tunnel was asked for, even before it has an address.
+    pub fn tunnel_pending(&self) -> bool {
+        self.tunnel.is_some()
+    }
+
     /// The [`Connector`] the terminal's bridge uses to reach this server. It
     /// never fails and never retries a connection that dropped for good: the
     /// socket is on loopback and the server outlives the session.
@@ -155,6 +231,10 @@ impl MobileServer {
 impl Drop for MobileServer {
     fn drop(&mut self) {
         let _ = self.stop.try_send(());
+        if let Some(tunnel) = &mut self.tunnel {
+            let _ = tunnel.child.kill();
+            let _ = tunnel.child.wait();
+        }
     }
 }
 
@@ -615,7 +695,7 @@ mod tests {
     // runtime would stall the server that has to answer it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_page_answers_only_with_the_link_token() {
-        let server = MobileServer::start(0, false).expect("start");
+        let server = MobileServer::start(0, false, false).expect("start");
         let port = server.port();
         let token = token_of(&server);
 
@@ -634,7 +714,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_icon_and_manifest_need_no_token() {
-        let server = MobileServer::start(0, false).expect("start");
+        let server = MobileServer::start(0, false, false).expect("start");
         let port = server.port();
 
         let (status, body) = get(port, "/icon.svg");
@@ -652,7 +732,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_websocket_url_carries_the_agent_role() {
-        let server = MobileServer::start(0, false).expect("start");
+        let server = MobileServer::start(0, false, false).expect("start");
         assert!(server.connector().url.contains("role=agent"), "the bridge is the agent end");
         assert!(server.url().starts_with("http://"), "the phone gets a page, not a socket");
     }

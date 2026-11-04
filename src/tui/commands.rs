@@ -114,7 +114,7 @@ impl App {
         match argument.trim().to_ascii_lowercase().as_str() {
             "" | "on" => match &self.mobile {
                 Some(server) => {
-                    let url = server.url().to_owned();
+                    let url = server.link();
                     self.qr_overlay = Some(QrOverlay::Local { rows: crate::remote::qr::rows(&url), url });
                 }
                 None => self.mobile_on(8787),
@@ -124,12 +124,12 @@ impl App {
                 let Some(server) = &self.mobile else {
                     return self.fail("The phone link is off — /mobile starts it.");
                 };
-                let url = server.url().to_owned();
+                let url = server.link();
                 self.qr_overlay = Some(QrOverlay::Local { rows: crate::remote::qr::rows(&url), url });
             }
             "url" | "link" => match &self.mobile {
                 Some(server) => {
-                    let url = server.url().to_owned();
+                    let url = server.link();
                     self.say(format!(
                         "Open this on a phone:\n{url}\n\
                          The link is the only credential and it can run commands here, so\

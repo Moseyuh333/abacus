@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
                 session,
                 store,
                 services,
-                cli.mobile.map(|port| (port, cli.mobile_lan)),
+                cli.mobile.map(|port| (port, cli.mobile_lan, cli.mobile_tunnel)),
             )
             .await
         };

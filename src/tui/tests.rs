@@ -2850,16 +2850,9 @@ fn test_app(base_url: &str) -> (TempDir, App) {
         connection: crate::providers::Connection::resolve("test", &provider, &Credentials::default()),
         ..Config::for_endpoint(workspace.clone(), base_url.into(), "test-model".into(), paths)
     };
-    let app = App::new(
-        config,
-        settings,
-        Credentials::default(),
-        None,
-        None,
-        Arc::new(AgentServices::empty(workspace)),
-        false,
-    )
-    .unwrap();
+    let app =
+        App::new(config, settings, Credentials::default(), None, None, Arc::new(AgentServices::empty(workspace)), None)
+            .unwrap();
     (directory, app)
 }
 
