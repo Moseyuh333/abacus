@@ -22,6 +22,15 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Links the terminal hands out (sync server's pair page, cloudflared
+                 quick tunnel): scanning their QR opens this app. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="abacus.empero.org" />
+                <data android:scheme="https" android:host="*.trycloudflare.com" />
+            </intent-filter>
         </activity>
     </application>
 </manifest>

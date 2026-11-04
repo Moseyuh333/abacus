@@ -38,12 +38,13 @@ import java.net.URI;
  * JavaScript bridge.
  */
 public class MainActivity extends Activity {
-    private static final String INK = "#0a0b0d";
-    private static final String PANEL = "#14171c";
-    private static final String LINE = "#23262e";
-    private static final String TEXT = "#e9ebef";
-    private static final String MUTED = "#9aa3af";
-    private static final String MINT = "#7dd3a0";
+    private static final String INK = "#0E0B14";
+    private static final String PANEL = "#161220";
+    private static final String LINE = "#3E3850";
+    private static final String TEXT = "#E9E4F0";
+    private static final String MUTED = "#8D8794";
+    private static final String ACCENT = "#B66BFF";
+    private static final String CLOUD = "https://abacus.empero.org/";
 
     private SharedPreferences prefs;
     private FrameLayout root;
@@ -53,6 +54,9 @@ public class MainActivity extends Activity {
     private String host = "";
     private String port = "";
     private String token = "";
+    /** The page itself, when the link is not ours (the sync server). */
+    private String page = "";
+
 
     @Override
     protected void onCreate(Bundle state) {
@@ -69,21 +73,70 @@ public class MainActivity extends Activity {
 
         // A link opened from anywhere (`am start -d …`, a QR reader) wins over
         // the remembered one: it is what the person just asked for.
-        if (getIntent() != null && getIntent().getData() != null) {
-            String opened = getIntent().getData().toString();
-            if (parse(opened)) {
-                prefs.edit().putString("link", opened).apply();
-                showWeb();
-                return;
-            }
+        String opened = getIntent() != null && getIntent().getData() != null
+                ? getIntent().getData().toString()
+                : "";
+        if (!opened.isEmpty() && openLink(opened)) {
+            prefs.edit().putString("link", opened).apply();
+            showWeb();
+            return;
         }
         String saved = prefs.getString("link", "");
         if (saved.isEmpty()) {
             showConnect("");
-        } else if (parse(saved)) {
+        } else if (openLink(saved)) {
             showWeb();
         } else {
             showConnect("That link did not parse.");
+        }
+    }
+
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (intent == null || intent.getData() == null) {
+            return;
+        }
+        String opened = intent.getData().toString();
+        if (openLink(opened)) {
+            prefs.edit().putString("link", opened).apply();
+            showWeb();
+        }
+    }
+
+    /**
+     * A link is either this app's own page (`?t=` in the query, so the host and
+     * token can be rebuilt) or somebody else's page, opened exactly as given —
+     * the sync server hands out `/pair#t=…`, which must not be rewritten.
+     */
+    private boolean openLink(String raw) {
+        String text = raw.trim();
+        if (text.isEmpty()) {
+            return false;
+        }
+        if (!text.contains("://")) {
+            text = "http://" + text;
+        }
+        try {
+            URI uri = URI.create(text);
+            if (uri.getHost() == null) {
+                return false;
+            }
+            boolean ours = uri.getRawQuery() != null
+                    && (uri.getPath() == null || uri.getPath().isEmpty() || uri.getPath().equals("/"));
+            if (ours && parse(text)) {
+                page = "";
+                return true;
+            }
+            String kind = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(java.util.Locale.ROOT);
+            if (!kind.equals("https") && !kind.equals("http")) {
+                return false;
+            }
+            page = text;
+            return true;
+        } catch (RuntimeException error) {
+            return false;
         }
     }
 
@@ -142,6 +195,7 @@ public class MainActivity extends Activity {
             settings.setBuiltInZoomControls(false);
             settings.setTextZoom(100);
             settings.setMediaPlaybackRequiresUserGesture(false);
+            android.webkit.CookieManager.getInstance().setAcceptCookie(true);
             web.setWebViewClient(new WebViewClient());
             web.addJavascriptInterface(this, "AbacusApp");
             root.addView(web, new FrameLayout.LayoutParams(
@@ -151,7 +205,7 @@ public class MainActivity extends Activity {
         if (connect != null) {
             connect.setVisibility(View.GONE);
         }
-        web.loadUrl(base() + "/?t=" + token);
+        web.loadUrl(page.isEmpty() ? base() + "/?t=" + token : page);
     }
 
     private void showConnect(String problem) {
@@ -180,8 +234,8 @@ public class MainActivity extends Activity {
                 // First run: the link is almost certainly still on the
                 // clipboard, so offer it rather than making them hunt for it.
                 String clip = clipboard();
-                if (parse(clip)) {
-                    saved = clip;
+                if (openLink(clip)) {
+                    saved = clip.trim();
                 }
             }
             field.setText(saved);
@@ -200,17 +254,33 @@ public class MainActivity extends Activity {
 
         TextView mark = new TextView(this);
         mark.setText("Abacus");
-        mark.setTextColor(Color.parseColor(MINT));
+        mark.setTextColor(Color.parseColor(ACCENT));
         mark.setTextSize(TypedValue.COMPLEX_UNIT_SP, 30);
         mark.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
         box.addView(mark);
 
         TextView lead = new TextView(this);
-        lead.setText("Run /mobile in the terminal, then paste the link it prints.");
+        lead.setText("Paste the link the terminal prints. No terminal to hand? Open Abacus Cloud — that is the same account the desktop signs in to.");
         lead.setTextColor(Color.parseColor(MUTED));
         lead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        lead.setPadding(0, dp(8), 0, dp(22));
+        lead.setPadding(0, dp(8), 0, dp(12));
         box.addView(lead);
+
+        Button cloud = new Button(this);
+        cloud.setText("Abacus Cloud");
+        cloud.setAllCaps(false);
+        cloud.setTextColor(Color.parseColor(TEXT));
+        cloud.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        cloud.setBackground(rounded(PANEL, ACCENT, 14));
+        LinearLayout.LayoutParams cloudParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(46));
+        cloudParams.bottomMargin = dp(18);
+        cloud.setOnClickListener(view -> {
+            page = CLOUD;
+            prefs.edit().putString("link", CLOUD).apply();
+            showWeb();
+        });
+        box.addView(cloud, cloudParams);
 
         EditText field = new EditText(this);
         field.setTag("link");
@@ -236,18 +306,18 @@ public class MainActivity extends Activity {
         Button go = new Button(this);
         go.setText("Connect");
         go.setAllCaps(false);
-        go.setTextColor(Color.parseColor("#06251a"));
+        go.setTextColor(Color.parseColor("#14081F"));
         go.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         go.setTypeface(Typeface.DEFAULT_BOLD);
-        go.setBackground(rounded(MINT, MINT, 14));
+        go.setBackground(rounded(ACCENT, ACCENT, 14));
         LinearLayout.LayoutParams goParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(50));
         goParams.topMargin = dp(16);
         go.setOnClickListener(view -> {
             String raw = field.getText().toString();
-            if (!parse(raw)) {
+            if (!openLink(raw)) {
                 TextView problem = connect.findViewWithTag("note");
-                problem.setText("Paste the whole link, including ?t=…");
+                problem.setText("That is neither a terminal link (?t=…) nor a page address.");
                 problem.setVisibility(View.VISIBLE);
                 return;
             }
