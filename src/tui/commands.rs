@@ -130,8 +130,15 @@ impl App {
             "url" | "link" => match &self.mobile {
                 Some(server) => {
                     let url = server.link();
+                    let tunnel = if !server.tunnel_pending() || server.public_url().is_some() {
+                        String::new()
+                    } else if let Some(error) = server.tunnel_error() {
+                        format!("\nThe tunnel stopped: {error}")
+                    } else {
+                        "\nThe tunnel is still opening — /mobile url again in a moment.".to_owned()
+                    };
                     self.say(format!(
-                        "Open this on a phone:\n{url}\n\
+                        "Open this on a phone:\n{url}{tunnel}\n\
                          The link is the only credential and it can run commands here, so\
                          keep it to yourself. It listens on this machine only unless\
                          Abacus was started with --mobile-lan. /mobile off stops it."

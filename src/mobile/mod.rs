@@ -91,6 +91,8 @@ pub struct MobileServer {
 struct Tunnel {
     child: std::process::Child,
     public: Arc<std::sync::Mutex<Option<String>>>,
+    /// Why there is no address, when cloudflared gave up.
+    failure: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Tunnel {
@@ -112,12 +114,18 @@ impl Tunnel {
         )?;
         let public = Arc::new(std::sync::Mutex::new(None));
         let sink = Arc::clone(&public);
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        let reason = Arc::clone(&failure);
         let query = format!("/?t={token}");
         if let Some(stderr) = child.stderr.take() {
             std::thread::spawn(move || {
                 use std::io::BufRead as _;
+                let mut last = String::new();
                 for line in std::io::BufReader::new(stderr).lines() {
                     let Ok(line) = line else { break };
+                    if !line.trim().is_empty() {
+                        last = line.clone();
+                    }
                     let Some(start) = line.find("https://") else {
                         continue;
                     };
@@ -131,9 +139,15 @@ impl Tunnel {
                         break;
                     }
                 }
+                // The pipe closed: cloudflared is gone. If it never printed an
+                // address, its last line is the only explanation there is.
+                let published = sink.lock().map(|slot| slot.is_some()).unwrap_or(false);
+                if !published && let Ok(mut slot) = reason.lock() {
+                    *slot = Some(last);
+                }
             });
         }
-        Ok(Self { child, public })
+        Ok(Self { child, public, failure })
     }
 }
 
@@ -213,6 +227,13 @@ impl MobileServer {
     /// one otherwise.
     pub fn link(&self) -> String {
         self.public_url().unwrap_or_else(|| self.url.clone())
+    }
+
+    /// Why cloudflared produced no address: its last line, once it exits.
+    pub fn tunnel_error(&self) -> Option<String> {
+        let tunnel = self.tunnel.as_ref()?;
+        let slot = tunnel.failure.lock().ok()?;
+        slot.clone()
     }
 
     /// Whether a tunnel was asked for, even before it has an address.
