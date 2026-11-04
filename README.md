@@ -562,6 +562,24 @@ The phone cannot run slash commands, because a message that starts with `/` is
 sent as plain text. It cannot change the model, mode, workspace or any setting,
 and the agent's tools still ask for approval the way they always do.
 
+### The Android app
+
+`android/` wraps the same two pages in an APK:
+
+- **Abacus Cloud** opens `https://abacus.empero.org` with the phone's own
+  session: sign in there with the emailed magic link, and every session the
+  account holds is listed and readable, with or without the terminal running.
+- A terminal link — the `abacus sync pair` link, or the one `/mobile` prints —
+  makes the same app show that page instead. The app claims `https://` links on
+  `abacus.empero.org` and on `*.trycloudflare.com`, so a scanned QR can open the
+  app rather than a browser; links to any other host are left  alone. Whether the
+  phone opens the app or the browser once is Android's choice, and "Always" on
+  that chooser makes it stick.
+
+Sessions are uploaded by `abacus sync login` (see above), not by the app: the app
+reads what the account already holds. Live control of a running session still
+comes from `/remote`, which needs the phone to be signed in to the account.
+
 ### The phone on your own network
 
 The relay needs an account and passes your transcript through a server. If the
